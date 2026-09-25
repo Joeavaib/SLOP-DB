@@ -1,0 +1,558 @@
+// Copyright 2026 dbengine contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "dbengine/storage/pager.h"
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <utility>
+
+namespace dbengine::storage {
+namespace {
+
+constexpr char kMagic[8] = {'D', 'B', 'E', 'N', 'P', 'G', '0', '1'};
+constexpr std::size_t kHeaderSize = 24;  // magic(8) + version(4) + page_count(4) + entries(4) + reserved(4)
+
+void encode_u32_le(std::uint8_t* p, std::uint32_t v) {
+  p[0] = static_cast<std::uint8_t>(v);
+  p[1] = static_cast<std::uint8_t>(v >> 8);
+  p[2] = static_cast<std::uint8_t>(v >> 16);
+  p[3] = static_cast<std::uint8_t>(v >> 24);
+}
+
+void encode_u64_le(std::uint8_t* p, std::uint64_t v) {
+  for (int i = 0; i < 8; ++i) p[i] = static_cast<std::uint8_t>(v >> (8 * i));
+}
+
+std::uint32_t decode_u32_le(const std::uint8_t* p) {
+  return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
+         (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
+}
+
+std::uint64_t decode_u64_le(const std::uint8_t* p) {
+  std::uint64_t v = 0;
+  for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(p[i]) << (8 * i);
+  return v;
+}
+
+}  // namespace
+
+Pager::Pager(std::string path, std::size_t cache_capacity)
+    : path_(std::move(path)), cache_capacity_(cache_capacity == 0 ? 1 : cache_capacity) {}
+
+Pager::~Pager() { close(); }
+
+bool Pager::open() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (open_) return true;
+
+  fd_ = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
+  if (fd_ < 0) return false;
+
+  struct stat st {};
+  if (::fstat(fd_, &st) != 0) {
+    ::close(fd_);
+    fd_ = -1;
+    return false;
+  }
+
+  if (st.st_size == 0) {
+    // Format fresh single-file image: exactly one header page.
+    page_count_ = 1;
+    PageBuffer hdr{};
+    std::memcpy(hdr.data(), kMagic, 8);
+    encode_u32_le(hdr.data() + 8, kPagerFormatVersion);
+    encode_u32_le(hdr.data() + 12, page_count_);
+    encode_u32_le(hdr.data() + 16, 0);
+    encode_u32_le(hdr.data() + 20, 0);
+    if (::ftruncate(fd_, static_cast<off_t>(kPageSize)) != 0) {
+      ::close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    if (!write_exact(0, hdr.data(), kPageSize)) {
+      ::close(fd_);
+      fd_ = -1;
+      return false;
+    }
+    ::fsync(fd_);
+    entries_.clear();
+    image_dirty_ = false;
+    cache_.clear();
+    lru_.clear();
+    open_ = true;
+    ensure_mmap();
+    return true;
+  }
+
+  if (st.st_size % static_cast<off_t>(kPageSize) != 0 || st.st_size < static_cast<off_t>(kPageSize)) {
+    ::close(fd_);
+    fd_ = -1;
+    return false;
+  }
+  page_count_ = static_cast<PageId>(st.st_size / static_cast<off_t>(kPageSize));
+  cache_.clear();
+  lru_.clear();
+  open_ = true;
+
+  // Validate header + load KV image while holding the lock.
+  PageBuffer hdr{};
+  if (!read_exact(0, hdr.data(), kPageSize)) {
+    open_ = false;
+    ::close(fd_);
+    fd_ = -1;
+    return false;
+  }
+  if (std::memcmp(hdr.data(), kMagic, 8) != 0 || decode_u32_le(hdr.data() + 8) != kPagerFormatVersion) {
+    open_ = false;
+    ::close(fd_);
+    fd_ = -1;
+    return false;
+  }
+  const std::uint32_t header_pages = decode_u32_le(hdr.data() + 12);
+  if (header_pages != 0 && header_pages != page_count_) {
+    // Tolerate trailing preallocated pages: trust actual file size.
+    page_count_ = static_cast<PageId>(st.st_size / static_cast<off_t>(kPageSize));
+  }
+  if (!load_image()) {
+    open_ = false;
+    ::close(fd_);
+    fd_ = -1;
+    return false;
+  }
+  ensure_mmap();
+  return true;
+}
+
+void Pager::close() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_) return;
+  // Best-effort persist; ignore errors on destructor path.
+  store_image();
+  flush_raw_pages();
+  drop_mmap();
+  ::close(fd_);
+  fd_ = -1;
+  open_ = false;
+}
+
+bool Pager::is_open() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return open_;
+}
+
+bool Pager::uses_mmap() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return use_mmap_;
+}
+
+PageId Pager::page_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return page_count_;
+}
+
+bool Pager::read_page(PageId id, std::span<std::uint8_t, kPageSize> out) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_ || id >= page_count_) return false;
+  PageBuffer buf{};
+  if (cache_get(id, buf)) {
+    std::memcpy(out.data(), buf.data(), kPageSize);
+    return true;
+  }
+  if (use_mmap_ && mmap_base_ != nullptr) {
+    const auto* base = static_cast<const std::uint8_t*>(mmap_base_);
+    std::memcpy(out.data(), base + static_cast<std::size_t>(id) * kPageSize, kPageSize);
+  } else {
+    if (!read_exact(static_cast<std::int64_t>(id) * static_cast<std::int64_t>(kPageSize), buf.data(),
+                    kPageSize)) {
+      return false;
+    }
+    std::memcpy(out.data(), buf.data(), kPageSize);
+  }
+  cache_put(id, buf, false);
+  // cache_put stored a copy; serve from caller's copy already done.
+  // Re-fetch to promote LRU consistently (cache_get above missed).
+  return true;
+}
+
+bool Pager::write_page(PageId id, std::span<const std::uint8_t, kPageSize> data) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_ || id >= page_count_) return false;
+  PageBuffer buf{};
+  std::memcpy(buf.data(), data.data(), kPageSize);
+  // Staged write invalidates mmap view lazily on flush; drop now so
+  // concurrent zero-copy readers never see torn old+mmap mix.
+  drop_mmap();
+  image_dirty_ = true;  // raw + KV share page_count; reconcile on flush
+  cache_put(id, buf, true);
+  return true;
+}
+
+PageId Pager::allocate_page() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_) return 0;
+  const PageId id = page_count_++;
+  PageBuffer zero{};
+  zero.fill(0);
+  drop_mmap();
+  image_dirty_ = true;
+  cache_put(id, zero, true);
+  return id;
+}
+
+std::span<const std::uint8_t> Pager::read_zero_copy(PageId id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_ || id >= page_count_) return {};
+  if (use_mmap_ && mmap_base_ != nullptr) {
+    const auto* base = static_cast<const std::uint8_t*>(mmap_base_);
+    return {base + static_cast<std::size_t>(id) * kPageSize, kPageSize};
+  }
+  // Fallback: serve from LRU entry (single copy from pread at most).
+  PageBuffer buf{};
+  if (cache_get(id, buf)) {
+    auto it = cache_.find(id);
+    return {it->second.second.data.data(), kPageSize};
+  }
+  if (!read_exact(static_cast<std::int64_t>(id) * static_cast<std::int64_t>(kPageSize), buf.data(),
+                  kPageSize)) {
+    return {};
+  }
+  cache_put(id, buf, false);
+  auto it = cache_.find(id);
+  if (it == cache_.end()) return {};
+  return {it->second.second.data.data(), kPageSize};
+}
+
+bool Pager::flush() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_) return false;
+  if (!store_image()) return false;
+  if (!flush_raw_pages()) return false;
+  ::fsync(fd_);
+  ensure_mmap();
+  return true;
+}
+
+bool Pager::insert(std::uint64_t key, std::string_view value) {
+  return insert(key, std::span<const std::uint8_t>(
+                         reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+}
+
+bool Pager::insert(std::uint64_t key, std::span<const std::uint8_t> value) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_ || value.size() > kMaxValueBytes) return false;
+  entries_[key] = std::vector<std::uint8_t>(value.begin(), value.end());
+  image_dirty_ = true;
+  // Write-through for MVP durability: every insert is flushed so a
+  // restart (or Kill -9 after return) sees it. Later steps (WAL) will
+  // replace this with group-commit.
+  return store_image() && flush_raw_pages() && ([this] { ::fsync(fd_); return ensure_mmap(); }());
+}
+
+bool Pager::find(std::uint64_t key, std::string& out) const {
+  std::vector<std::uint8_t> raw;
+  if (!find(key, raw)) return false;
+  out.assign(reinterpret_cast<const char*>(raw.data()), raw.size());
+  return true;
+}
+
+bool Pager::find(std::uint64_t key, std::vector<std::uint8_t>& out) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_) return false;
+  auto it = entries_.find(key);
+  if (it == entries_.end()) return false;
+  out = it->second;
+  return true;
+}
+
+bool Pager::erase(std::uint64_t key) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_) return false;
+  auto it = entries_.find(key);
+  if (it == entries_.end()) return false;
+  entries_.erase(it);
+  image_dirty_ = true;
+  return store_image() && flush_raw_pages() && ([this] { ::fsync(fd_); return ensure_mmap(); }());
+}
+
+std::size_t Pager::entry_count() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return entries_.size();
+}
+
+bool Pager::contains(std::uint64_t key) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return open_ && entries_.find(key) != entries_.end();
+}
+
+// --- internals (caller holds mutex_) ---------------------------------
+
+bool Pager::load_image() {
+  entries_.clear();
+  // Linear scan of the record stream starting at page 1.
+  std::vector<std::uint8_t> stream;
+  stream.reserve(static_cast<std::size_t>(page_count_ > 1 ? page_count_ - 1 : 0) * kPageSize);
+  PageBuffer page{};
+  for (PageId p = 1; p < page_count_; ++p) {
+    if (!read_exact(static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize), page.data(),
+                    kPageSize)) {
+      return false;
+    }
+    stream.insert(stream.end(), page.begin(), page.end());
+  }
+  std::size_t off = 0;
+  // First 4 bytes of stream can hold a record count hint; accept both
+  // hinted and unhinted images: try hinted, fall back to raw scan.
+  // MVP writer below writes raw records without hint, so scan raw.
+  while (off + 12 <= stream.size()) {
+    const std::uint64_t key = decode_u64_le(stream.data() + off);
+    const std::uint32_t len = decode_u32_le(stream.data() + off + 8);
+    off += 12;
+    if (len > kMaxValueBytes) break;  // padding / zero tail
+    if (off + len > stream.size()) break;
+    // Zero-tail detection: a (0,0) record followed by all zeros ends stream.
+    if (len == 0 && key == 0) {
+      bool rest_zero = true;
+      for (std::size_t i = off; i < stream.size(); ++i) {
+        if (stream[i] != 0) {
+          rest_zero = false;
+          break;
+        }
+      }
+      if (rest_zero) break;
+    }
+    entries_[key] = std::vector<std::uint8_t>(stream.begin() + static_cast<std::ptrdiff_t>(off),
+                                              stream.begin() + static_cast<std::ptrdiff_t>(off + len));
+    off += len;
+  }
+  image_dirty_ = false;
+  return true;
+}
+
+bool Pager::store_image() {
+  if (!image_dirty_) {
+    // Still need to reconcile header page_count with raw allocations.
+    PageBuffer hdr{};
+    if (!read_exact(0, hdr.data(), kPageSize)) return false;
+    if (std::memcmp(hdr.data(), kMagic, 8) != 0) return false;
+    encode_u32_le(hdr.data() + 12, page_count_);
+    encode_u32_le(hdr.data() + 16, static_cast<std::uint32_t>(entries_.size()));
+    if (!write_exact(0, hdr.data(), kPageSize)) return false;
+    return true;
+  }
+  // Serialize sorted entries (std::map iteration is sorted => clustered).
+  std::size_t need = 0;
+  for (const auto& [k, v] : entries_) need += 12 + v.size();
+
+  PageId data_pages = static_cast<PageId>((need + kPageSize - 1) / kPageSize);
+  PageId total = data_pages + 1;  // + header
+  if (total < page_count_) {
+    // Keep raw-allocated tail pages (mixed use); never shrink below
+    // current count, zero the freed region instead.
+    total = page_count_;
+  }
+  const std::int64_t total_bytes = static_cast<std::int64_t>(total) * static_cast<std::int64_t>(kPageSize);
+  if (::ftruncate(fd_, total_bytes) != 0) return false;
+
+  std::vector<std::uint8_t> stream(static_cast<std::size_t>(data_pages) * kPageSize, 0);
+  std::size_t off = 0;
+  for (const auto& [k, v] : entries_) {
+    encode_u64_le(stream.data() + off, k);
+    encode_u32_le(stream.data() + off + 8, static_cast<std::uint32_t>(v.size()));
+    off += 12;
+    if (!v.empty()) {
+      std::memcpy(stream.data() + off, v.data(), v.size());
+      off += v.size();
+    }
+  }
+  for (PageId p = 1; p <= data_pages; ++p) {
+    if (!write_exact(static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize),
+                     stream.data() + static_cast<std::size_t>(p - 1) * kPageSize, kPageSize)) {
+      return false;
+    }
+    // Keep LRU coherent: staged raw pages in the data region are
+    // superseded by the KV image.
+    cache_.erase(p);
+    for (auto it = lru_.begin(); it != lru_.end();) {
+      if (*it == p)
+        it = lru_.erase(it);
+      else
+        ++it;
+    }
+  }
+  if (total > data_pages + 1) {
+    // Zero tail pages beyond the image so a later load stops cleanly.
+    PageBuffer zero{};
+    zero.fill(0);
+    for (PageId p = data_pages + 1; p < total; ++p) {
+      auto it = cache_.find(p);
+      if (it != cache_.end() && it->second.second.dirty) continue;  // keep staged raw write
+      if (!write_exact(static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize), zero.data(),
+                       kPageSize)) {
+        return false;
+      }
+    }
+  }
+
+  page_count_ = total;
+  PageBuffer hdr{};
+  std::memcpy(hdr.data(), kMagic, 8);
+  encode_u32_le(hdr.data() + 8, kPagerFormatVersion);
+  encode_u32_le(hdr.data() + 12, page_count_);
+  encode_u32_le(hdr.data() + 16, static_cast<std::uint32_t>(entries_.size()));
+  encode_u32_le(hdr.data() + 20, 0);
+  if (!write_exact(0, hdr.data(), kPageSize)) return false;
+
+  // Header is authoritative; drop cached page 0 copy.
+  cache_.erase(0);
+  for (auto it = lru_.begin(); it != lru_.end();) {
+    if (*it == 0)
+      it = lru_.erase(it);
+    else
+      ++it;
+  }
+  image_dirty_ = false;
+  return true;
+}
+
+bool Pager::ensure_mmap() {
+  drop_mmap();
+  const std::int64_t len = static_cast<std::int64_t>(page_count_) * static_cast<std::int64_t>(kPageSize);
+  if (len <= 0) {
+    use_mmap_ = false;
+    return false;
+  }
+  void* base = ::mmap(nullptr, static_cast<std::size_t>(len), PROT_READ, MAP_SHARED, fd_, 0);
+  if (base == MAP_FAILED) {
+    mmap_base_ = nullptr;
+    mmap_len_ = 0;
+    use_mmap_ = false;
+    return false;  // pread fallback stays active
+  }
+  mmap_base_ = base;
+  mmap_len_ = static_cast<std::size_t>(len);
+  use_mmap_ = true;
+  return true;
+}
+
+void Pager::drop_mmap() {
+  if (mmap_base_ != nullptr && mmap_base_ != MAP_FAILED) {
+    ::munmap(mmap_base_, mmap_len_);
+  }
+  mmap_base_ = nullptr;
+  mmap_len_ = 0;
+  use_mmap_ = false;
+}
+
+bool Pager::file_size(std::int64_t& out) const {
+  struct stat st {};
+  if (::fstat(fd_, &st) != 0) return false;
+  out = st.st_size;
+  return true;
+}
+
+bool Pager::read_exact(std::int64_t offset, void* buf, std::size_t n) const {
+  auto* p = static_cast<std::uint8_t*>(buf);
+  std::size_t done = 0;
+  while (done < n) {
+    ssize_t r = ::pread(fd_, p + done, n - done, offset + static_cast<off_t>(done));
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if (r == 0) return false;
+    done += static_cast<std::size_t>(r);
+  }
+  return true;
+}
+
+bool Pager::write_exact(std::int64_t offset, const void* buf, std::size_t n) {
+  const auto* p = static_cast<const std::uint8_t*>(buf);
+  std::size_t done = 0;
+  while (done < n) {
+    ssize_t w = ::pwrite(fd_, p + done, n - done, offset + static_cast<off_t>(done));
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    done += static_cast<std::size_t>(w);
+  }
+  return true;
+}
+
+void Pager::cache_put(PageId id, const PageBuffer& data, bool dirty) {
+  auto it = cache_.find(id);
+  if (it != cache_.end()) {
+    it->second.second.data = data;
+    it->second.second.dirty = it->second.second.dirty || dirty;
+    lru_.erase(it->second.first);
+    lru_.push_front(id);
+    it->second.first = lru_.begin();
+    return;
+  }
+  evict_if_needed();
+  lru_.push_front(id);
+  CachedPage cp;
+  cp.data = data;
+  cp.dirty = dirty;
+  cache_.emplace(id, std::make_pair(lru_.begin(), std::move(cp)));
+}
+
+bool Pager::cache_get(PageId id, PageBuffer& out) {
+  auto it = cache_.find(id);
+  if (it == cache_.end()) return false;
+  out = it->second.second.data;
+  lru_.erase(it->second.first);
+  lru_.push_front(id);
+  it->second.first = lru_.begin();
+  return true;
+}
+
+bool Pager::evict_if_needed() {
+  while (cache_.size() >= cache_capacity_ && !lru_.empty()) {
+    const PageId victim = lru_.back();
+    lru_.pop_back();
+    auto it = cache_.find(victim);
+    if (it == cache_.end()) continue;
+    if (it->second.second.dirty) {
+      if (!write_exact(static_cast<std::int64_t>(victim) * static_cast<std::int64_t>(kPageSize),
+                       it->second.second.data.data(), kPageSize)) {
+        return false;
+      }
+    }
+    cache_.erase(it);
+  }
+  return true;
+}
+
+bool Pager::flush_raw_pages() {
+  for (auto& [id, node] : cache_) {
+    if (!node.second.dirty) continue;
+    // Pages inside the KV image region were already reconciled by
+    // store_image(); only tail/raw pages need write-back here.
+    if (!write_exact(static_cast<std::int64_t>(id) * static_cast<std::int64_t>(kPageSize),
+                     node.second.data.data(), kPageSize)) {
+      return false;
+    }
+    node.second.dirty = false;
+  }
+  return true;
+}
+
+}  // namespace dbengine::storage

@@ -1,0 +1,37 @@
+{
+  "applied": [
+    "s07-index",
+    "s09-hybrid",
+    "s03-wal",
+    "s02-pager",
+    "s06-sql",
+    "s08-vector",
+    "s04-mvcc",
+    "s10-columnar",
+    "s01-scaffold",
+    "s05-kv"
+  ],
+  "verified": [
+    "s07-index",
+    "s09-hybrid",
+    "s03-wal",
+    "s06-sql",
+    "s08-vector",
+    "s04-mvcc",
+    "s10-columnar",
+    "s02-pager",
+    "s01-scaffold",
+    "s05-kv"
+  ],
+  "failed": [],
+  "worktree": "/home/joe/Dokumente/test/dbengine",
+  "last_checkpoint": null,
+  "checkpoints": [],
+  "claim_step": "",
+  "claim_agent": "",
+  "applies_used": 0,
+  "started": [
+    "s10-columnar"
+  ],
+  "claims": {}
+}

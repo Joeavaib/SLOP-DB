@@ -1,0 +1,6 @@
+build/
+.rfg/worktree/
+*.o
+*.a
+*.so
+.DS_Store

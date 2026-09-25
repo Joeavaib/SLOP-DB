@@ -1,0 +1,93 @@
+version: 3
+id: roadmap-1
+hypothesis:
+  id: h1
+  statement: ""
+goal:
+  id: g1
+  statement: "C++ DB Engine V1 (embedded-first): Postgres-kompatibler Row-Kern (B+Tree, WAL, MVCC Snapshot), filterbarer Vektor-Index (HNSW-basic + BM25 Hybrid-vorbereitet), Columnar Parquet-Tiering vorbereitet, Single-Binary Zero-Ops, Apache-2.0. Kein Distributed Global in V1."
+  profile: feature
+oracles:
+  - kind: test
+  - kind: perf
+  - kind: debug
+  - kind: security
+steps:
+  - id: s01-scaffold
+    title: s01-scaffold
+    paths:
+      - CMakeLists.txt
+      - src/
+      - include/dbengine/
+      - tests/
+      - LICENSE
+      - README.md
+    verify: cmake -S . -B build && cmake --build build -j4 && ctest --test-dir build
+    engine: implement
+    want: "C++20 CMake Repo-Scaffold: src/include/tests Layout, Apache-2.0 LICENSE, README Quickstart, Smoke-Test gruen"
+    extras:
+      - ANFORDERUNGEN.md
+  - id: s02-pager
+    title: s02-pager
+    paths:
+      - src/storage/pager.cpp
+      - include/dbengine/storage/pager.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R pager --output-on-failure
+    engine: implement
+    want: "Pager+Storage: 16KB Seiten-Datei, B+Tree clustered, mmap Zero-Copy Reads, Single-File"
+  - id: s03-wal
+    title: s03-wal
+    paths:
+      - src/storage/wal.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R wal --output-on-failure
+    engine: implement
+    want: "WAL+Checkpoint+Recovery: REDO-Log, Checkpoint, Kill-9 Replay ohne Verlust"
+  - id: s04-mvcc
+    title: s04-mvcc
+    paths:
+      - src/txn/mvcc.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R mvcc --output-on-failure
+    engine: implement
+    want: "MVCC+Txn: Undo-Log, Snapshot-Isolation default, Single-Shard ACID"
+  - id: s05-kv
+    title: s05-kv
+    paths:
+      - src/kv/kv.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R kv --output-on-failure
+    engine: implement
+    want: "KV-API nativ: Get/Put/Delete/Scan/Iterator, WriteBatch atomar"
+  - id: s06-sql
+    title: s06-sql
+    paths:
+      - src/sql/parser.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R sql --output-on-failure
+    engine: implement
+    want: "SQL+PGWire Subset: CREATE/INSERT/SELECT mit Filter, JSONB-Stub, libpq-Handshake"
+  - id: s07-index
+    title: s07-index
+    paths:
+      - src/index/btree.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R index --output-on-failure
+    engine: implement
+    want: "Sekundaer-Indexe: B-Tree secondary, ART/GIN-Stub, TTL-Stub"
+  - id: s08-vector
+    title: s08-vector
+    paths:
+      - src/vector/hnsw.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R vector --output-on-failure
+    engine: implement
+    want: "Vektor first-class: VECTOR Typ, filterbarer HNSW-basic, ef runtime-tunbar, Recall@10>0.9 Bench"
+  - id: s09-hybrid
+    title: s09-hybrid
+    paths:
+      - src/search/hybrid.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R hybrid --output-on-failure
+    engine: implement
+    want: "Hybrid Search: BM25+dense Fusion mit RRF, Filter+ANN gemeinsam evaluiert"
+  - id: s10-columnar
+    title: s10-columnar
+    paths:
+      - src/columnar/store.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R columnar --output-on-failure
+    engine: implement
+    want: "Columnar-Tiering: Immutable Parts Parquet-like, Dict/RLE Stub, Arrow-Export, S3-Tier Stub"
