@@ -119,3 +119,119 @@ target_include_directories(test_mvcc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_compile_options(test_mvcc PRIVATE -Wall -Wextra -Wpedantic)
 
 add_test(NAME mvcc COMMAND test_mvcc)
+
+# s13-raft: Shard/Tablet + RaftGroup-Sim (3 Nodes in-process, kein Netzwerk)
+add_library(dbengine_raft STATIC src/raft/shard.cpp)
+target_include_directories(dbengine_raft PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(dbengine_raft PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_raft tests/test_raft.cpp)
+target_link_libraries(test_raft PRIVATE dbengine_raft)
+target_include_directories(test_raft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_raft PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME raft COMMAND test_raft)
+
+# s12-pgserver: TCPServer (POSIX, 127.0.0.1 ephemeral) + pgwire codec
+add_library(pgserver STATIC src/server/pgserver.cpp)
+target_include_directories(pgserver PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(pgserver PUBLIC sql)
+target_compile_options(pgserver PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_pgserver tests/test_pgserver.cpp)
+target_link_libraries(test_pgserver PRIVATE pgserver)
+target_include_directories(test_pgserver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_pgserver PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME pgserver COMMAND test_pgserver)
+
+# s14-clock: TSO/HLC + Commit-Wait + monoton Snapshots
+add_library(dbengine_clock STATIC src/txn/clock.cpp)
+target_include_directories(dbengine_clock PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(dbengine_clock PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_clock tests/test_clock.cpp)
+target_link_libraries(test_clock PRIVATE dbengine_clock)
+target_include_directories(test_clock PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_clock PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME clock COMMAND test_clock)
+
+# s15-jsonb: Binaer-JSON Typ, GIN-Inverted-Index, Operatoren ->/->>/@>
+add_library(dbengine_jsonb STATIC src/sql/jsonb.cpp)
+target_include_directories(dbengine_jsonb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(dbengine_jsonb PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_jsonb tests/test_jsonb.cpp)
+target_link_libraries(test_jsonb PRIVATE dbengine_jsonb)
+target_include_directories(test_jsonb PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_jsonb PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME jsonb COMMAND test_jsonb)
+
+# s11-executor: SQL-Executor auf KV+MVCC+WAL (Parser, TableRegistry, Snapshot-Reads)
+add_library(executor STATIC src/sql/executor.cpp)
+target_include_directories(executor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(executor PUBLIC sql dbengine_kv dbengine_mvcc dbengine_wal)
+target_compile_options(executor PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_executor tests/test_executor.cpp)
+target_link_libraries(test_executor PRIVATE executor)
+target_include_directories(test_executor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_executor PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME executor COMMAND test_executor)
+
+# s18-bench: Bench-Harness (KV-Throughput, SQL Q1, ANN Recall/Latenz, CSV)
+add_executable(dbbench tools/bench.cpp)
+target_include_directories(dbbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dbbench PRIVATE dbengine_kv dbengine_vector columnar)
+target_compile_options(dbbench PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_bench tests/test_bench.cpp)
+target_include_directories(test_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_bench PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME bench COMMAND dbbench --smoke)
+add_test(NAME bench_csv COMMAND test_bench)
+
+# s19-chaos: deterministischer Crash-Fuzz (Seed 42, 10k Ops, WAL-torn-inject).
+# ASAN/UBSAN nur fuer dieses Target (kein globaler Sanitizer).
+add_executable(test_chaos tests/test_chaos.cpp)
+target_link_libraries(test_chaos PRIVATE dbengine_kv dbengine_wal)
+target_include_directories(test_chaos PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_chaos PRIVATE -Wall -Wextra -Wpedantic -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+target_link_options(test_chaos PRIVATE -fsanitize=address,undefined)
+
+add_test(NAME chaos COMMAND test_chaos)
+
+# s17-ts: Hypertable-Chunks + Retention + Continuous-Agg + ASOF-Join-Stub
+add_library(dbengine_ts STATIC src/ts/chunks.cpp)
+target_include_directories(dbengine_ts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(dbengine_ts PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_chunks tests/test_chunks.cpp)
+target_link_libraries(test_chunks PRIVATE dbengine_ts)
+target_include_directories(test_chunks PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_chunks PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME chunks COMMAND test_chunks)
+
+# s16-quant: SQ8 echt + PQ-Stub(2) + DiskSpill(mmap) + ef-Autotune
+add_library(dbengine_quant STATIC src/vector/quant.cpp)
+target_include_directories(dbengine_quant PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dbengine_quant PUBLIC dbengine_vector)
+target_compile_options(dbengine_quant PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_quant tests/test_quant.cpp)
+target_link_libraries(test_quant PRIVATE dbengine_quant dbengine_vector)
+target_include_directories(test_quant PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_quant PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME quant COMMAND test_quant)
+
+# s20-docs: Doku-Guard (Existenz + Nicht-Leer + Markdown-Titel, STL-only).
+add_executable(test_docs tests/test_docs.cpp)
+target_compile_definitions(test_docs PRIVATE DBENGINE_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(test_docs PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME docs COMMAND test_docs)

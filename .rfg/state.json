@@ -9,7 +9,17 @@
     "s04-mvcc",
     "s10-columnar",
     "s01-scaffold",
-    "s05-kv"
+    "s05-kv",
+    "s13-raft",
+    "s12-pgserver",
+    "s14-clock",
+    "s15-jsonb",
+    "s11-executor",
+    "s18-bench",
+    "s16-quant",
+    "s17-ts",
+    "s19-chaos",
+    "s20-docs"
   ],
   "verified": [
     "s07-index",
@@ -21,12 +31,99 @@
     "s10-columnar",
     "s02-pager",
     "s01-scaffold",
-    "s05-kv"
+    "s05-kv",
+    "s13-raft",
+    "s12-pgserver",
+    "s14-clock",
+    "s15-jsonb",
+    "s11-executor",
+    "s18-bench",
+    "s16-quant",
+    "s17-ts",
+    "s19-chaos",
+    "s20-docs"
   ],
   "failed": [],
-  "worktree": "/home/joe/Dokumente/test/dbengine",
-  "last_checkpoint": null,
-  "checkpoints": [],
+  "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+  "last_checkpoint": {
+    "id": "cp-s20-docs-1790374628",
+    "step_id": "s20-docs",
+    "commit": "615b62e744fb2d31067e73d38ff9e3f07aa80f8f",
+    "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+    "created_at": "2026-09-25T22:17:08.739128+00:00"
+  },
+  "checkpoints": [
+    {
+      "id": "cp-s13-raft-1790374309",
+      "step_id": "s13-raft",
+      "commit": "d228072d33d6b343dc3fc495aea9a3725d3b148f",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:11:49.539734+00:00"
+    },
+    {
+      "id": "cp-s12-pgserver-1790374319",
+      "step_id": "s12-pgserver",
+      "commit": "5f21f486c8bf9d165bd7ff8371fc2a7175af49f7",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:11:59.648496+00:00"
+    },
+    {
+      "id": "cp-s14-clock-1790374343",
+      "step_id": "s14-clock",
+      "commit": "52f58775dbba6fc468c28d3ef15c9fedf22319f4",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:12:23.981096+00:00"
+    },
+    {
+      "id": "cp-s15-jsonb-1790374352",
+      "step_id": "s15-jsonb",
+      "commit": "d64fe4797647079a8ff91d93cdea49c4b98e0f1e",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:12:32.051722+00:00"
+    },
+    {
+      "id": "cp-s11-executor-1790374433",
+      "step_id": "s11-executor",
+      "commit": "bfad73e8f244956646e03bab1a9fb1e3785682e3",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:13:53.624288+00:00"
+    },
+    {
+      "id": "cp-s18-bench-1790374569",
+      "step_id": "s18-bench",
+      "commit": "2b606820b4daa2bd646b34312b5475eaaf2bf09a",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:16:09.592904+00:00"
+    },
+    {
+      "id": "cp-s16-quant-1790374576",
+      "step_id": "s16-quant",
+      "commit": "b8a882e9227222471f6e40a9b8b4604f30e11cd5",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:16:16.380307+00:00"
+    },
+    {
+      "id": "cp-s17-ts-1790374583",
+      "step_id": "s17-ts",
+      "commit": "f506bcce34b6fd0eecf8aa7fbadb295560f4d331",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:16:23.907612+00:00"
+    },
+    {
+      "id": "cp-s19-chaos-1790374626",
+      "step_id": "s19-chaos",
+      "commit": "d73f4622508294ecf84c7cc2901ae9edc90f065d",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:17:06.302755+00:00"
+    },
+    {
+      "id": "cp-s20-docs-1790374628",
+      "step_id": "s20-docs",
+      "commit": "615b62e744fb2d31067e73d38ff9e3f07aa80f8f",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-25T22:17:08.739128+00:00"
+    }
+  ],
   "claim_step": "",
   "claim_agent": "",
   "applies_used": 0,

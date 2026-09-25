@@ -91,3 +91,85 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R columnar --output-on-failure
     engine: implement
     want: "Columnar-Tiering: Immutable Parts Parquet-like, Dict/RLE Stub, Arrow-Export, S3-Tier Stub"
+  - id: s11-executor
+    title: s11-executor
+    paths:
+      - src/sql/executor.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R executor --output-on-failure
+    engine: implement
+    want: "Integration: SQL-Executor auf KV+MVCC+WAL verdrahtet, INSERT persistent, SELECT snapshot-konsistent"
+  - id: s12-pgserver
+    title: s12-pgserver
+    paths:
+      - src/server/pgserver.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
+    engine: implement
+    want: "PG-Server live: TCP accept, Startup/Q-Flow über Socket, psql-kompatibler Smoke (SELECT 1)"
+  - id: s13-raft
+    title: s13-raft
+    paths:
+      - src/raft/shard.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R raft --output-on-failure
+    engine: implement
+    want: "Raft-Shard Stub: Range/Tablet (96MB logisch), Leader-Election, Log-Replikation 3er-Gruppe simuliert, Failover-Test"
+  - id: s14-clock
+    title: s14-clock
+    paths:
+      - src/txn/clock.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R clock --output-on-failure
+    engine: implement
+    want: "TSO/HLC: Timestamp-Oracle + Hybrid-Logical-Clock, Commit-Wait, globale Snapshot-Reads monoton"
+  - id: s15-jsonb
+    title: s15-jsonb
+    paths:
+      - src/sql/jsonb.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R jsonb --output-on-failure
+    engine: implement
+    want: "JSONB: Binär-JSON Typ, GIN-Inverted-Index, Operatoren ->/->>/@>, SELECT mit JSON-Filter"
+  - id: s16-quant
+    title: s16-quant
+    paths:
+      - src/vector/quant.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R quant --output-on-failure
+    engine: implement
+    want: "Vektor-Scale: SQ8/PQ-Quant echt, Disk-Spill, ef-Autotune, 1M-Bench Recall>0.9 dokumentiert"
+  - id: s17-ts
+    title: s17-ts
+    paths:
+      - src/ts/chunks.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R chunks --output-on-failure
+    engine: implement
+    want: "Time-Series: Hypertable-Chunks, Retention-Drop, Downsampling Continuous-Agg, ASOF-Join Stub"
+  - id: s18-bench
+    title: s18-bench
+    paths:
+      - tools/bench.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R bench --output-on-failure
+    engine: implement
+    want: "Bench-Harness: CLI dbbench mit KV-Throughput, SQL TPC-H-like Q1, ANN Recall/Latenz, CSV-Report"
+  - id: s19-chaos
+    title: s19-chaos
+    paths:
+      - tests/test_chaos.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R chaos --output-on-failure
+    engine: implement
+    want: "Fuzz/Chaos: deterministischer Crash-Fuzz (Seed), WAL-Torn-Write, ASAN/UBSAN-clean, 10k Ops kein Verlust"
+    extras:
+      - CMakeLists.txt
+      - SBOM.md
+      - docs/ARCH.md
+      - docs/RUNBOOK.md
+      - docs/SBOM.md
+  - id: s20-docs
+    title: s20-docs
+    paths:
+      - docs/ARCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "Docs/Ops: ARCH.md (Schichten, WAL, MVCC, Shard), Runbook, k8s-manifest Stub, SBOM-Liste, API-Doku"
+    extras:
+      - CMakeLists.txt
+      - SBOM.md
+      - docs/RUNBOOK.md
+      - docs/SBOM.md
+      - k8s/statefulset.yaml

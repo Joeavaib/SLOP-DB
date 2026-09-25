@@ -1,0 +1,49 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dbengine
+  labels:
+    app: dbengine
+spec:
+  serviceName: dbengine
+  replicas: 1  # s20-Doku-Stub: Single-Node, kein HA in V1
+  selector:
+    matchLabels:
+      app: dbengine
+  template:
+    metadata:
+      labels:
+        app: dbengine
+    spec:
+      containers:
+        - name: dbengine
+          image: dbengine:0.1.0  # Platzhalter, s18+ baut echtes Image
+          ports:
+            - name: pgwire
+              containerPort: 5432
+          env:
+            - name: DBENGINE_DATA_DIR
+              value: /data
+            - name: DBENGINE_WAL_PATH
+              value: /data/wal.log
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 5432
+            initialDelaySeconds: 15
+            periodSeconds: 20
+  volumeClaimTemplates:
+    - metadata:
+        name: data  # PVC-Template für Single-Replica-Daten
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
