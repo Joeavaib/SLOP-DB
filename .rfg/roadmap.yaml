@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 14 (SQL-Speed): Executor-Streaming ohne Temp-DB-Kopie + Projektions-Pushdown, MVCC-Fast-Path bei Single-Version, Q1/Q6-Luecke zu SQLite/DuckDB deutlich kleiner. Alles verifiziert."
+  statement: "C++ DB Engine Phase 0 MVP (embedded vs SQLite): EIN Datendatei-Container mit open(foo.db) (Header+Regionen+Recovery), pager-gestuetztes persistentes B-Tree-KV statt std::map, dbengine-Binary oeffnet echte DB + SQL, Duell persistent 1M vs SQLite."
   profile: feature
 oracles:
   - kind: test
@@ -590,3 +590,13 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
     engine: implement
     want: "ANN-Skala: ef-Autotune per Default (N-abhaengig), IVF als Gross-Pfad verdrahtet + dokumentiert, Recall bei 100k uniform >= 0.8, Tests gruene"
+  - id: s72-dbfile
+    title: s72-dbfile
+    paths:
+      - src/db.cpp
+      - include/dbengine/db.h
+      - tests/test_db.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ctest --test-dir build -R dbfile --output-on-failure
+    engine: implement
+    want: "Single-File-Container: Db::open(foo.db) mit Header+Regionen+Recovery (create/open, Magic/Version, tmp+rename-Init), eigene Test-Suite dbfile"
