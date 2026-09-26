@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -136,12 +137,25 @@ class Part {
   // Sorted-Merge zweier Parts (nach int, stabil): neuer versiegelter Part.
   static Part Merge(const Part& a, const Part& b, uint64_t new_id = 0);
 
+  // ---- HTAP: In-Memory Commit-TS-Range (Scan-Replika) ----------------------
+  // Nur in-memory: Save/Load (COL1/COL2) ignorieren Tags (kein File-Format-
+  // Bruch). Parts OHNE Tags gelten als immer sichtbar (Legacy-Verhalten).
+  void TagCommitRange(uint64_t min_ts, uint64_t max_ts);
+  bool HasCommitTags() const { return has_commit_tags_; }
+  // 0 ohne Tags (= immer sichtbar, s.o.); sonst exakte Range.
+  uint64_t MinCommitTs() const { return has_commit_tags_ ? commit_min_ : 0; }
+  uint64_t MaxCommitTs() const { return has_commit_tags_ ? commit_max_ : 0; }
+
  private:
   uint64_t id_ = 0;
   std::string name_;
   IntColumnChunk ints_;
   StringDictChunk strs_;
   bool sealed_ = false;
+  // HTAP-Tags (in-memory only, kein Persistenz-Format).
+  uint64_t commit_min_ = 0;
+  uint64_t commit_max_ = 0;
+  bool has_commit_tags_ = false;
 };
 
 // ---- ColumnarStore: Tiering aus Immutable Parts --------------------------
@@ -197,10 +211,55 @@ class ColumnarStore {
   std::string StageToS3(const std::string& bucket,
                         const std::string& prefix) const;
 
+  // ---- HTAP Scan-Replika (generisch, in-memory only) -----------------------
+  // Design-Wahl: Row-TS-Vektor statt Part-pro-Commit-Sealing. Jede Replika-Row
+  // traegt begin_ts (Commit-TS der Erzeugung, inklusiv) + end_ts (Abloese-TS,
+  // exklusiv, INF = live). Sichtbarkeits-Regel pro Snapshot S (identisch zu
+  // txn::IsVisible): begin_ts <= S && S < end_ts.
+  // Begruendung: Part-pro-Commit wuerde bei Single-Row-Commits zu Small-Part-
+  // Explosion fuehren (1M TPC-H-Rows -> 1M Parts); der Vektor kostet O(1)
+  // amortisiert pro Write und linear im Scan, bleibt exakt SI-korrekt.
+  // Store-Level min/max-begin (in-memory) erlaubt Whole-Replica-Pruning
+  // (minBegin > S -> leer). Legacy Int/Str-Parts, Append/SealActive,
+  // Zonemaps und COL1/COL2-Save/Load bleiben unberuehrt (Save/Load
+  // persistieren die Replika NICHT; Wiederaufbau via WAL-Replay im Executor).
+  // Threadsicherheit wie Legacy-Scans: keine internen Locks, Aufrufer-seitig
+  // serialisieren (Executor ist Single-Writer, Tests sequentiell).
+  struct ReplicaRow {
+    std::string key;  // KV-Key ("sql/<t>/<pk>[#rowid]")
+    std::string enc;  // Executor Row-Codec (dekodiert der Executor)
+    uint64_t begin_ts = 0;
+    uint64_t end_ts = UINT64_MAX;  // INF = live
+  };
+  // Upsert: schliesst ggf. die live Version desselben Keys (end_ts =
+  // commit_ts) und haengt die neue Version an (INSERT + UPDATE + WAL-Replay).
+  void ReplicaAppend(std::string key, std::string enc, uint64_t commit_ts);
+  // Tombstone: schliesst die live Version (enc bleibt fuer alte Snapshots).
+  void ReplicaErase(const std::string& key, uint64_t commit_ts);
+  void ReplicaClear();  // DROP TABLE
+  size_t ReplicaSize() const { return replica_.size(); }  // alle Versionen
+  const std::vector<ReplicaRow>& ReplicaRows() const { return replica_; }
+  // Store-Level Tags (in-memory): ohne Rows keine Tags -> immer sichtbar.
+  bool ReplicaHasTags() const { return replica_has_tags_; }
+  uint64_t ReplicaMinBegin() const {
+    return replica_has_tags_ ? replica_min_begin_ : 0;
+  }
+  uint64_t ReplicaMaxBegin() const {
+    return replica_has_tags_ ? replica_max_begin_ : 0;
+  }
+  // Indizes sichtbarer Rows (Store-Prune + Row-Filter, s. Regel oben).
+  std::vector<size_t> ReplicaVisible(uint64_t snapshot) const;
+
  private:
   std::vector<Part> parts_;  // sealed, immutable
   Part active_;              // einziger mutabler Part
   uint64_t next_id_ = 0;
+  // HTAP-Replika (generisch): Versionskette als Row-TS-Vektor.
+  std::vector<ReplicaRow> replica_;
+  std::unordered_map<std::string, size_t> replica_live_;  // key -> live-Index
+  uint64_t replica_min_begin_ = 0;
+  uint64_t replica_max_begin_ = 0;
+  bool replica_has_tags_ = false;
 };
 
 }  // namespace dbengine::columnar

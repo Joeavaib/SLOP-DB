@@ -255,9 +255,16 @@ class Database {
 
   Result execute(const std::string& sql);
 
-  Result execCreate(const CreateTableStmt& s);
-  Result execInsert(const InsertStmt& s);
-  Result execSelect(const SelectStmt& s);
+   Result execCreate(const CreateTableStmt& s);
+   Result execInsert(const InsertStmt& s);
+   Result execSelect(const SelectStmt& s);
+   // Snapshot-Ausfuehrung fuer den KV/MVCC-Executor: fuehrt `s` direkt auf den
+   // uebergebenen Snapshot-Tabellen aus (genau ein Durchlauf, ohne
+   // execCreate/execInsert/Coerce). Semantik exakt wie execSelect (Filter,
+   // NULL, LIKE, JOIN/GROUP/ORDER/Subqueries, Fehlermeldungen identisch);
+   // stellt die eigenen Tabellen danach wieder her (auch bei SqlError).
+   Result execSelectSnapshot(const SelectStmt& s,
+                             std::map<std::string, Table> snapshot);
   Result execUpdate(const UpdateStmt& s);
   Result execDelete(const DeleteStmt& s);
   Result execDrop(const DropTableStmt& s);

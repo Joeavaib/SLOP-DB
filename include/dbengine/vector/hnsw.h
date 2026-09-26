@@ -147,6 +147,24 @@ class HnswIndex {
   [[nodiscard]] DistanceMetric metric() const;
   void set_ef_default(int ef);
   [[nodiscard]] int ef_default() const;
+  // --- ef-Autotune (N-abhaengiger Default-Beam, deterministisch) ---
+  // Formel: ef_auto = ceil(k * sqrt(N) / 10);
+  //   effektiv: ef = min(max(max(ef_default, k), ef_auto), 1024, N).
+  // Begruendung: quant::autotune_ef (= ceil(k/sel*2), [32,1024]) ist
+  // N-unabhaengig (bei sel=1 konstant 2k) und erklaert den gemessenen
+  // Recall-Kollaps uniform (0,94@2k -> 0,78@8k -> 0,34@100k bei fixem ef).
+  // Der Beam muss mit N wachsen (sqrt: Graphdurchmesser/Suchraum); die
+  // Konstante /10 ist auf N~=1k,k=10 kalibriert (10*sqrt(1000)/10 ~= 32 =
+  // ef_default -> kein Overhead an der Test-Baseline), linear in k wie
+  // autotune_ef, Cap 1024 wie dort ef_max. ef_default bleibt Untergrenze
+  // (set_ef_default = Override; explizites ef>0 gewinnt immer). Filter
+  // (sel<1) kennt search() ohne Scan nicht: bei Filter explizites ef via
+  // quant::autotune_ef_for_filter waehlen. Erwartung (uniform, k=10):
+  // 2k->ef~45 Recall~0,94+, 8k->ef~90 Recall~0,9, 100k->ef~317 Recall>=0,8.
+  // Gross-Pfad: ab N>=50k IvfPqIndex mit autotune(n) bevorzugen, s.
+  // quant::prefer_ivf_over_hnsw (Latenz/Speicher; HNSW-Autotune haelt
+  // Recall, kostet aber Beam-Latenz ~proportional zu ef).
+  [[nodiscard]] static int auto_ef(size_t n, int k, int ef_default) noexcept;
   void set_m(int m);
   [[nodiscard]] int m() const;
   void set_ef_construction(int ef);
@@ -194,8 +212,11 @@ class HnswIndex {
   [[nodiscard]] const Vector& get(int id) const;
   [[nodiscard]] size_t neighbor_count(int id) const;
 
-  // ANN-Suche (Beam, Breite ef). ef<=0 => ef_default_. Gibt bis zu k Hits
-  // (aufsteigend nach Distanz). Filter wird GEMEINSAM evaluiert (s.o.).
+  // ANN-Suche (Beam, Breite ef). ef<=0 => N-abhaengiger Autotune-Default
+  // via auto_ef(size(), k, ef_default_) (Floor = ef_default_, s.o.).
+  // Gibt bis zu k Hits (aufsteigend nach Distanz). Filter wird GEMEINSAM
+  // evaluiert (s.o.). Ab N>=50k Gross-Pfad bevorzugen: quant::IvfPqIndex
+  // mit IvfPqIndex::autotune(N) (s. quant::prefer_ivf_over_hnsw).
   [[nodiscard]] std::vector<SearchHit> search(const Vector& query, int k,
                                              int ef = -1,
                                              FilterFn filter = nullptr) const;
@@ -275,7 +296,7 @@ class HnswIndex {
 
   int dim_;
   int m_;           // max. Nachbarn nominal (obere Layer)
-  int ef_default_;  // Default-Beam-Breite, runtime-tunbar pro Query via ef
+  int ef_default_;  // Untergrenze des Autotune-Defaults (Override via setter)
   int ef_construction_ = 64;
   DistanceMetric metric_;
   double ml_ = 0.36;  // 1/ln(M), bei set_m neu berechnet

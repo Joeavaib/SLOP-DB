@@ -238,6 +238,32 @@ void HnswIndex::set_ef_default(int ef) {
 }
 int HnswIndex::ef_default() const { return ef_default_; }
 
+// ef-Autotune-Default (s. hnsw.h Doku): ef_auto = ceil(k*sqrt(N)/10),
+// effektiv min(max(max(ef_default,k),ef_auto),1024,N). Rein arithmetisch,
+// deterministisch (kein RNG/Scan), O(1). /10 kalibriert auf N~=1k,k=10
+// (=>32 = alter Default, kein Overhead klein); sqrt-Skalierung gegen den
+// gemessenen Recall-Kollaps (0,94@2k->0,78@8k->0,34@100k fix); Cap 1024
+// wie quant::autotune_ef ef_max; ef_default als Floor = set_ef_default-
+// Override (dadurch bleibt search(q,k)==search(q,k,ef_default) exakt, solange
+// ef_auto <= ef_default, d.h. kleine N bit-identisch zum alten Verhalten).
+int HnswIndex::auto_ef(size_t n, int k, int ef_default) noexcept {
+  if (k <= 0) k = 1;
+  if (ef_default <= 0) ef_default = 32;
+  if (n == 0) return ef_default;
+  const double auto_d =
+      (static_cast<double>(k) * std::sqrt(static_cast<double>(n))) / 10.0;
+  long ea = static_cast<long>(std::ceil(auto_d));
+  if (ea < 1) ea = 1;
+  long eff = (ea > static_cast<long>(ef_default))
+                 ? ea
+                 : static_cast<long>(ef_default);
+  if (eff < static_cast<long>(k)) eff = static_cast<long>(k);
+  if (eff > 1024) eff = 1024;
+  if (eff > static_cast<long>(n)) eff = static_cast<long>(n);
+  if (eff < 1) eff = 1;
+  return static_cast<int>(eff);
+}
+
 void HnswIndex::set_m(int m) {
   if (m <= 0) throw std::invalid_argument("m must be > 0");
   if (m == m_) return;
@@ -1155,7 +1181,15 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
   // auf dem flachen Buffer (kein Vector-Umweg).
   const float* qptr = query.data();
 
-  int ef_search = (ef <= 0) ? ef_default_ : ef;
+  // Default ef<=0 => N-abhaengiger Autotune (auto_ef, Floor=ef_default_):
+  // kleine N bit-identisch zum alten Fix-Default (ef_auto<=ef_default),
+  // grosse N skaliert mit sqrt(N) (s. Doku in hnsw.h). Explizites ef>0
+  // unveraendert (Override). Filter-Selektivitaet bleibt Aufrufersache
+  // (quant::autotune_ef_for_filter), da ohne O(N)-Scan unbekannt.
+  int ef_search =
+      (ef <= 0)
+          ? HnswIndex::auto_ef(static_cast<size_t>(n), k, ef_default_)
+          : ef;
   if (ef_search < k) ef_search = k;
   if (ef_search > n) ef_search = n;
 

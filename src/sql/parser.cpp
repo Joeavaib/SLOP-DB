@@ -1095,6 +1095,18 @@ class Parser {
   int subdepth_ = 0;  // Verschachtelungstiefe von WHERE-Subqueries (max 8)
 };
 
+struct LikeKey {
+  std::string rx;
+  bool ci = false;
+  bool operator==(const LikeKey& o) const { return ci == o.ci && rx == o.rx; }
+};
+struct LikeKeyHash {
+  std::size_t operator()(const LikeKey& k) const noexcept {
+    std::size_t h = std::hash<std::string>{}(k.rx);
+    return k.ci ? (h ^ 0x9e3779b9u) : h;
+  }
+};
+
 bool likeMatch(const std::string& s, const std::string& pat, bool ci) {
   // SQL LIKE -> Regex: % -> .*, _ -> ., Rest escapen
   std::string rx;
@@ -1113,9 +1125,23 @@ bool likeMatch(const std::string& s, const std::string& pat, bool ci) {
     }
   }
   rx += "$";
-  std::regex::flag_type f = std::regex::ECMAScript;
-  if (ci) f |= std::regex::icase;
-  return std::regex_match(s, std::regex(rx, f));
+  // Kompilierte Regexe pro (Muster, Case-Flag) wiederverwenden: gleiche
+  // Semantik wie ein frisches std::regex pro Aufruf, aber kein Recompile pro
+  // Row (der heisse Pfad wertet LIKE je Zeile aus). Thread-lokal (kein Lock),
+  // gedeckelt (Speicher beschraenkt, Korrektheit unabhaengig vom
+  // Cache-Inhalt). Fehlgeschlagene Kompilierung wirft wie bisher und wird
+  // nicht gecacht.
+  thread_local std::unordered_map<LikeKey, std::regex, LikeKeyHash> cache;
+  LikeKey key{rx, ci};
+  auto it = cache.find(key);
+  if (it == cache.end()) {
+    if (cache.size() >= 256) cache.clear();
+    std::regex::flag_type f = std::regex::ECMAScript;
+    if (ci) f |= std::regex::icase;
+    std::regex re(rx, f);  // wirft ggf. wie bisher (regex_error)
+    it = cache.emplace(std::move(key), std::move(re)).first;
+  }
+  return std::regex_match(s, it->second);
 }
 
 int compareValues(const Value& a, const Value& b) {
@@ -3170,6 +3196,24 @@ Result Database::execSelect(const SelectStmt& s) {
   }
   applyLimitOffset(r, s);
   return r;
+}
+
+// Snapshot-Ausfuehrung (s. parser.h): Snapshot-Tabellen temporär als eigene
+// einsetzen, exakt denselben execSelect-Pfad nutzen, danach wieder
+// herstellen (auch bei Exception, damit der Database-Zustand stabil bleibt).
+// Subqueries loesen sich rekursiv gegen dieselben Snapshot-Tabellen auf.
+Result Database::execSelectSnapshot(const SelectStmt& s,
+                                    std::map<std::string, Table> snapshot) {
+  std::map<std::string, Table> saved = std::move(tables_);
+  tables_ = std::move(snapshot);
+  try {
+    Result r = execSelect(s);
+    tables_ = std::move(saved);
+    return r;
+  } catch (...) {
+    tables_ = std::move(saved);
+    throw;
+  }
 }
 
 Result Database::execute(const std::string& sql) {

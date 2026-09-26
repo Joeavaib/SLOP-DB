@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "dbengine/columnar/store.h"
 #include "dbengine/kv.h"
 #include "dbengine/sql/parser.h"
 #include "dbengine/storage/wal.h"
@@ -71,10 +72,28 @@ class Executor {
   bool applyInsertRecord(const std::string& table, const std::string& key,
                          const std::string& rowEnc);
 
+  // ---- HTAP Scan-Replika (ein ColumnarStore pro Tabelle) -------------------
+  // KV/MVCC bleibt einzige Wahrheit fuer Writes/Point-Reads. INSERT/UPDATE-
+  // Commits spiegeln Rows in die Replika (Commit-TS aus der MVCC-Kette, exakt
+  // ein TS pro Writer-Commit -> Statement atomar sichtbar). SELECT-Full-Scans
+  // lesen die Replika (kein KV-Snapshot, kein MVCC-Read pro Zeile) mit Regel
+  // begin_ts <= snapshot < end_ts; Store-Prune via minBegin. UPDATE = Upsert
+  // mit Versionskette, DELETE = Tombstone (end_ts), DROP = erase. Replika ist
+  // in-memory only; recover()/WAL-Replay baut sie wieder auf. Ohne Tags (leere
+  // Replika) gilt immer-sichtbar.
+  std::uint64_t commitTsOf(const std::string& key);
+  void mirrorUpsertOne(const std::string& norm, const std::string& key,
+                       const std::string& enc, std::uint64_t commit_ts);
+  void mirrorEraseOne(const std::string& norm, const std::string& key,
+                      std::uint64_t commit_ts);
+  // Selbstheilung: Latest-State aus KV-Keymenge + neuesten MVCC-Versionen.
+  void rebuildReplicaForTable(const std::string& norm);
+
   kv::KVStore& kv_;
   txn::MvccStore& mvcc_;
   storage::Wal* wal_ = nullptr;
   std::map<std::string, TableSchema> tables_;  // norm-name -> schema
+  std::map<std::string, columnar::ColumnarStore> replica_;  // norm-name -> Scan-Replika
   std::size_t recover_skipped_ = 0;  // Skips des letzten recover()-Laufs
   std::size_t recover_applied_ = 0;  // erfolgreich angewendete Records
 };

@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -61,7 +62,12 @@ struct Transaction {
   bool read_only = false;
   // Ungeschriebene (uncommittete) Writes: Undo-/Redo-Puffer.
   // nullopt = Delete-Tombstone im Puffer.
-  std::map<std::string, std::optional<std::string>> write_set;
+  // HINWEIS (Fast-Path, semantikerhaltend): transparenter Komparator
+  // std::less<> statt std::less<std::string>, damit Read per
+  // write_set.find(string_view) heterogen suchen kann OHNE temporaeren
+  // std::string zu allokieren. Ordnung ist identisch (lexikographisch ueber
+  // string_view-Konversion, keine Allokation), Iteration/Semantik unveraendert.
+  std::map<std::string, std::optional<std::string>, std::less<>> write_set;
 
   bool IsActive() const { return state == TxnState::Active; }
 };
@@ -81,6 +87,29 @@ class MvccStore {
   // ---- Datenoperationen (nur mit aktiver Txn) ---------------------------
   // Read sieht zuerst eigene Buffered-Writes (read-own-writes), dann die
   // Snapshot-sichtbare Ketten-Version. nullopt = nicht vorhanden/geloescht.
+  //
+  // FAST-PATHS (semantikerhaltend, s. mvcc.cpp):
+  //  (a) Single-Version-Shortcut: Kette der Laenge 1 + v.trx_end == kInfTs
+  //      (committed/neueste, per Konstruktion nur via Commit installiert) +
+  //      kein fremder aktiver Writer (active_writer_ leer oder == txn.id,
+  //      d.h. Single-Writer-Invariant: niemand sonst kann die Kette
+  //      concurrently erweitern) -> direkter IsVisible(v, snap)-Check auf dem
+  //      einzigen Element statt Rueckwaerts-Scan.
+  //  (b) Allokationsfreiheit: heterogene Lookups mit string_view (transparenter
+  //      Komparator), Skip des write_set-Lookups bei leerem Puffer (der
+  //      Normalfall fuer Read-Only-Txns), keine temporaeren Vektoren/Strings/
+  //      Maps. Einzige Allokation ist die Rueckgabe-Kopie (API: owning string).
+  //  AEQUIVALENZ (Beweisidee): Vollsuche auf Kette der Laenge 1 evaluiert exakt
+  //  IsVisible(sole, snap) und mappt deleted->nullopt, sonst Kopie. Der Shortcut
+  //  evaluiert EXAKT dasselbe Praedikat (derselbe Funktionsaufruf IsVisible, kein
+  //  Reimplementat mit <=) auf demselben Element unter demselben Lock und
+  //  derselben snap-Berechnung. Guards (Laenge, INF-Ende, kein Fremd-Writer)
+  //  waehlen nur Shortcut vs. Fallback; bei Guard-Miss laeuft die alte Schleife.
+  //  Da uncommittete Writes nie in chains_ stehen (nur im Txn-Puffer), aendert
+  //  ein fremder Writer ohnedies nichts an chains_ bis Commit — der Guard ist
+  //  bewusst konservativ, damit die Stabilitaet der Ein-Element-Kette unter mu_
+  //  trivial aus der Single-Writer-Invariant folgt. Tombstone-/Purge-Semantik
+  //  unberuehrt (Purge fasst Ketten der Laenge 1 nie an: `size <= 1 continue`).
   std::optional<std::string> Read(Transaction& txn, std::string_view key);
 
   // Buffered Write (Undo-Puffer). false wenn txn nicht (mehr) schreibfaehig.
@@ -121,7 +150,9 @@ class MvccStore {
   mutable std::mutex mu_;               // schuetzt chains_ + active_ + Writer-Owner
   std::mutex writer_mu_;                // Single-Writer-Lock pro Shard
   std::optional<std::uint64_t> active_writer_;  // unter mu_
-  std::map<std::string, std::vector<Version>> chains_;  // unter mu_, oldest->newest
+  // Transparenter Komparator (s. write_set): erlaubt chains_.find(string_view)
+  // ohne temporaeren std::string. Ordnung/Semantik identisch.
+  std::map<std::string, std::vector<Version>, std::less<>> chains_;  // unter mu_, oldest->newest
   std::map<std::uint64_t, Timestamp> active_;           // txn-id -> snapshot
 };
 

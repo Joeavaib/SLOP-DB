@@ -241,10 +241,30 @@ class DiskSpill {
   float* payload_ = nullptr;
 };
 
+// --- Gross-Pfad-Empfehlung (HNSW vs. IVF, skaliert Recall/Latenz) --------
+// Gemessen (uniform, k=10, HNSW Default-ef fix): Recall@10 0,94 (2k) ->
+// 0,78 (8k) -> 0,34 (100k). HnswIndex::search() nutzt daher seitdem einen
+// N-abhaengigen Autotune-Default (auto_ef: ceil(k*sqrt(N)/10), Floor
+// ef_default, Cap 1024; kalibriert auf N~=1k ohne Overhead; 100k->ef~317,
+// Recall-Erwartung >=0,8 bei ~10x Beam-Latenz). Fuer Latenz/Speicher bei
+// grossen N trotzdem IVF bevorzugen:
+//   ab N >= kHnswToIvfThreshold (50k): IvfPqIndex mit IvfPqIndex::autotune(N)
+//   (nlist ~= 4*sqrt(N), nprobe = nlist/8) statt HNSW.
+// Helper prefer_ivf_over_hnsw(n) verdrahtet genau diese Schwelle (deterministisch,
+// O(1)); kein API-Bruch (rein additiv, keine Aenderung an HnswIndex-Signaturen).
+constexpr size_t kHnswToIvfThreshold = 50000;
+inline bool prefer_ivf_over_hnsw(size_t n) noexcept {
+  return n >= kHnswToIvfThreshold;
+}
+
 // --- ef-Autotune ------------------------------------------------------------
 // Waehlt ef nach k und Selektivitaet (Anteil passender Filter).
 // Formel: ef = ceil(k / sel * kOverprovision=2.0), mindestens max(k, ef_min),
 // gedeckelt auf ef_max bzw. n (falls n>=0). sel wird auf [1e-4, 1.0] geclampt.
+// Hinweis: N-unabhaengig (bei sel=1 konstant 2k) — fuer UNGEFILTERTE HNSW-
+// Suche skaliert HnswIndex::auto_ef zusaetzlich mit sqrt(N) (s. Gross-Pfad
+// oben); bei FILTER selektivitaetsbedingt hiermit explizites ef waehlen
+// (autotune_ef_for_filter) und an search(q,k,ef,filter) uebergeben.
 int autotune_ef(int k, double selectivity, int n = -1, int ef_min = 32,
                 int ef_max = 1024);
 // Komfort: Selektivitaet aus matched/total ableiten.

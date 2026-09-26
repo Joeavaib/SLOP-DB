@@ -190,7 +190,7 @@ add_test(NAME jsonb COMMAND test_jsonb)
 # s11-executor: SQL-Executor auf KV+MVCC+WAL (Parser, TableRegistry, Snapshot-Reads)
 add_library(executor STATIC src/sql/executor.cpp)
 target_include_directories(executor PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(executor PUBLIC sql dbengine_kv dbengine_mvcc dbengine_wal)
+target_link_libraries(executor PUBLIC sql dbengine_kv dbengine_mvcc dbengine_wal columnar)
 target_compile_options(executor PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(test_executor tests/test_executor.cpp)

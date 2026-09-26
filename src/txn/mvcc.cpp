@@ -40,6 +40,10 @@ Transaction MvccStore::BeginRead(Isolation iso) {
   txn.snapshot = begin;  // SI: fix; ReadCommitted: wird je Read aufgefrischt
   txn.isolation = iso;
   txn.read_only = true;
+  // HINWEIS (Setup billig): write_set bleibt leer konstruiert (leere std::map
+  // allokiert keinen Knoten), einziger Map-Knoten ist active_.emplace unten —
+  // unvermeidbar als Purge-Watermark (Purge-Semantik unantastbar). Read spart
+  // sich bei leerem Puffer den Lookup komplett (s. Read).
   RegisterActive(txn.id, txn.snapshot);
   return txn;
 }
@@ -96,18 +100,43 @@ Timestamp MvccStore::EffectiveSnapshot(const Transaction& txn) const {
 std::optional<std::string> MvccStore::Read(Transaction& txn,
                                            std::string_view key) {
   if (txn.state != TxnState::Active) return std::nullopt;
-  std::string k(key);
   // 1) Read-own-writes aus dem Undo-/Redo-Puffer.
-  auto itw = txn.write_set.find(k);
-  if (itw != txn.write_set.end()) {
-    return itw->second;  // kann nullopt (Delete-Tombstone) sein
+  //    Allokationsfrei: leerer Puffer (Normalfall Read-Only) -> kein Lookup;
+  //    sonst heterogener find(string_view) via less<> ohne temporaeren string.
+  //    Rueckgabe-Kopie ist Resultat, kein Temporar.
+  if (!txn.write_set.empty()) {
+    auto itw = txn.write_set.find(key);
+    if (itw != txn.write_set.end()) {
+      return itw->second;  // kann nullopt (Delete-Tombstone) sein
+    }
   }
   // 2) Snapshot-sichtbare Ketten-Version (neueste zuerst).
+  //    snap-Berechnung UNVERAENDERT vor Lock (gleiche RC/SI-Semantik wie bisher).
   Timestamp snap = EffectiveSnapshot(txn);
   std::lock_guard<std::mutex> g(mu_);
-  auto itc = chains_.find(k);
+  // Heterogener Lookup ohne std::string-Temporaer (less<>).
+  auto itc = chains_.find(key);
   if (itc == chains_.end()) return std::nullopt;
   const auto& chain = itc->second;
+  // 2a) Single-Version-Shortcut (semantikerhaltend, s. Header-Beweisidee):
+  //     Bedingung = chain.size() == 1 && v.trx_end == kInfTs (committed/neueste,
+  //     nur via Commit installierbar) && kein fremder Writer
+  //     (!active_writer_ || *active_writer_ == txn.id). Eigener Writer ist ok:
+  //     dessen Puffer enthaelt `key` nicht (oben per Miss bewiesen), und per
+  //     Single-Writer-Invariant kann sonst niemand chains_ erweitern.
+  //     Check ist EXAKT IsVisible (derselbe Aufruf wie in der Schleife).
+  //     Aequivalenz: Vollsuche der Laenge 1 == IsVisible(sole) + Tombstone-Map;
+  //     Shortcut macht exakt das; Guards waehlen nur Pfad, Fallback = Altcode.
+  if (chain.size() == 1) {
+    const bool no_foreign_writer =
+        !active_writer_.has_value() || *active_writer_ == txn.id;
+    if (no_foreign_writer && chain.front().trx_end == kInfTs) {
+      const Version& v = chain.front();
+      if (!IsVisible(v, snap)) return std::nullopt;
+      if (v.deleted) return std::nullopt;
+      return v.value;  // einzige Allokation: owning Resultat-Kopie
+    }
+  }
   for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
     if (IsVisible(*it, snap)) {
       if (it->deleted) return std::nullopt;

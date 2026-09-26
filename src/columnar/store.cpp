@@ -887,4 +887,73 @@ std::string ColumnarStore::StageToS3(const std::string& bucket,
          std::to_string(parts_.size()) + "parts/";
 }
 
+// ---- HTAP Scan-Replika (s. store.h Design-Doku) ----------------------------
+// Bestehende Methoden (Append/SealActive/Scans/Save/Load/Compact) unberuehrt.
+
+void Part::TagCommitRange(uint64_t min_ts, uint64_t max_ts) {
+  commit_min_ = min_ts;
+  commit_max_ = max_ts;
+  has_commit_tags_ = true;
+}
+
+void ColumnarStore::ReplicaAppend(std::string key, std::string enc,
+                                  uint64_t commit_ts) {
+  auto it = replica_live_.find(key);
+  if (it != replica_live_.end()) {
+    const size_t idx = it->second;
+    if (idx < replica_.size() &&
+        replica_[idx].end_ts == UINT64_MAX) {
+      replica_[idx].end_ts = commit_ts;  // alte live Version schliessen
+    }
+  }
+  ReplicaRow r;
+  r.begin_ts = commit_ts;
+  r.end_ts = UINT64_MAX;
+  r.enc = std::move(enc);
+  r.key = key;  // Kopie; zweite Kopie als Index-Schluessel unten
+  replica_live_[key] = replica_.size();
+  replica_.push_back(std::move(r));
+  if (!replica_has_tags_) {
+    replica_min_begin_ = commit_ts;
+    replica_max_begin_ = commit_ts;
+    replica_has_tags_ = true;
+  } else {
+    if (commit_ts < replica_min_begin_) replica_min_begin_ = commit_ts;
+    if (commit_ts > replica_max_begin_) replica_max_begin_ = commit_ts;
+  }
+}
+
+void ColumnarStore::ReplicaErase(const std::string& key, uint64_t commit_ts) {
+  auto it = replica_live_.find(key);
+  if (it == replica_live_.end()) return;
+  const size_t idx = it->second;
+  if (idx < replica_.size() &&
+      replica_[idx].end_ts == UINT64_MAX) {
+    replica_[idx].end_ts = commit_ts;
+  }
+  replica_live_.erase(it);
+}
+
+void ColumnarStore::ReplicaClear() {
+  replica_.clear();
+  replica_live_.clear();
+  replica_min_begin_ = 0;
+  replica_max_begin_ = 0;
+  replica_has_tags_ = false;
+}
+
+std::vector<size_t> ColumnarStore::ReplicaVisible(
+    uint64_t snapshot) const {
+  std::vector<size_t> out;
+  // Store-Level-Prune: minBegin > snapshot -> nichts sichtbar (Regel aus
+  // store.h; ohne Tags immer sichtbar -> kein Prune, Row-Filter laeuft).
+  if (replica_has_tags_ && replica_min_begin_ > snapshot) return out;
+  out.reserve(replica_live_.size());
+  for (size_t i = 0; i < replica_.size(); ++i) {
+    const ReplicaRow& r = replica_[i];
+    if (r.begin_ts <= snapshot && snapshot < r.end_ts) out.push_back(i);
+  }
+  return out;
+}
+
 }  // namespace dbengine::columnar

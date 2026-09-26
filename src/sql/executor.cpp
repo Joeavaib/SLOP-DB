@@ -8,6 +8,8 @@
 #include <map>
 #include <set>
 #include <sstream>
+#include <string_view>
+#include <utility>
 
 namespace dbengine::sql {
 namespace {
@@ -253,6 +255,329 @@ void collectWhereTables(const std::vector<Condition>& where,
       for (auto& c : gr)
         if (c.subquery) stack.push_back(c.subquery.get());
   }
+}
+
+// ---- Projektions-Pushdown: Bedarfsanalyse ----------------------------------
+// need[tnorm][i] == 1 -> Spalte i von Tabelle tnorm wird gelesen (Projektion,
+// WHERE, GROUP BY, ORDER BY, JOIN-ON, Aggregat-Argumente, inkl. aller
+// genesteter Subqueries). Alles andere darf beim Dekodieren uebersprungen
+// werden. Unbekannte/ambiguous Referenzen -> konservativ alles markieren:
+// Table.columns bleibt immer vollstaendig, daher wirft die Database-Schicht
+// bei solchen Queries exakt wie bisher (Fehlerpfade unveraendert); ein zu
+// grosses need kostet nur Performance, nie Korrektheit.
+using NeededMap = std::map<std::string, std::vector<char>>;
+
+// Scope-Sicht EINES Select-Knotens (aeusseres Statement oder Subquery).
+struct ScopeSchemas {
+  std::string lNorm;
+  const TableSchema* lSch = nullptr;
+  std::string lAlias;
+  bool hasRight = false;
+  std::string rNorm;
+  const TableSchema* rSch = nullptr;
+  std::string rAlias;
+};
+
+void needMarkAll(NeededMap& need, const std::string& tnorm,
+                 const TableSchema& sc) {
+  need[tnorm].assign(sc.columns.size(), 1);
+}
+
+// Eine Spaltenreferenz ("c" / "t.c") im gegebenen Scope als benoetigt
+// markieren. Aufloesung spiegelt Table::colIndex (single) bzw.
+// resolveJoinCol (JOIN): unqualifiziert sucht links dann rechts (beidseitig
+// vorhanden = ambiguous), qualifiziert matcht Tabellenname oder Alias je
+// Seite. Zweifelsfaelle -> alles markieren (Database wirft dann exakt wie
+// bisher).
+void needAddRef(NeededMap& need, const ScopeSchemas& scope,
+                const std::string& ref) {
+  std::string pre, col;
+  const std::string::size_type dot = ref.find('.');
+  if (dot == std::string::npos) {
+    pre.clear();
+    col = ref;
+  } else {
+    pre = ref.substr(0, dot);
+    col = ref.substr(dot + 1);
+  }
+  if (!pre.empty()) {
+    const std::string f = toLower(pre);
+    const bool lm =
+        scope.lSch != nullptr &&
+        (f == scope.lNorm ||
+         (!scope.lAlias.empty() && f == toLower(scope.lAlias)));
+    const bool rm =
+        scope.hasRight && scope.rSch != nullptr &&
+        (f == scope.rNorm ||
+         (!scope.rAlias.empty() && f == toLower(scope.rAlias)));
+    if (lm && !rm && scope.lSch != nullptr) {
+      int idx = schemaColIndex(scope.lSch->columns, col);
+      if (idx < 0) {
+        needMarkAll(need, scope.lNorm, *scope.lSch);
+      } else {
+        auto& m = need[scope.lNorm];
+        if (m.size() != scope.lSch->columns.size())
+          m.assign(scope.lSch->columns.size(), 0);
+        m[static_cast<std::size_t>(idx)] = 1;
+      }
+      return;
+    }
+    if (rm && !lm && scope.rSch != nullptr) {
+      int idx = schemaColIndex(scope.rSch->columns, col);
+      if (idx < 0) {
+        needMarkAll(need, scope.rNorm, *scope.rSch);
+      } else {
+        auto& m = need[scope.rNorm];
+        if (m.size() != scope.rSch->columns.size())
+          m.assign(scope.rSch->columns.size(), 0);
+        m[static_cast<std::size_t>(idx)] = 1;
+      }
+      return;
+    }
+    // Unbekannter Prefix oder beidseitiger Match (ambiguous): Database wirft;
+    // Scope-Seiten voll markieren (harmlos, Query scheitert dort ohnehin).
+    if (scope.lSch != nullptr) needMarkAll(need, scope.lNorm, *scope.lSch);
+    if (scope.hasRight && scope.rSch != nullptr)
+      needMarkAll(need, scope.rNorm, *scope.rSch);
+    return;
+  }
+  const int li =
+      scope.lSch != nullptr ? schemaColIndex(scope.lSch->columns, col) : -1;
+  const int ri = (scope.hasRight && scope.rSch != nullptr)
+                     ? schemaColIndex(scope.rSch->columns, col)
+                     : -1;
+  if (li >= 0 && ri < 0 && scope.lSch != nullptr) {
+    auto& m = need[scope.lNorm];
+    if (m.size() != scope.lSch->columns.size())
+      m.assign(scope.lSch->columns.size(), 0);
+    m[static_cast<std::size_t>(li)] = 1;
+    return;
+  }
+  if (ri >= 0 && li < 0 && scope.rSch != nullptr) {
+    auto& m = need[scope.rNorm];
+    if (m.size() != scope.rSch->columns.size())
+      m.assign(scope.rSch->columns.size(), 0);
+    m[static_cast<std::size_t>(ri)] = 1;
+    return;
+  }
+  // Ambiguous (JOIN, beidseitig) oder unbekannt: Database wirft exakt wie
+  // bisher; Scope-Seiten voll markieren.
+  if (scope.lSch != nullptr) needMarkAll(need, scope.lNorm, *scope.lSch);
+  if (scope.hasRight && scope.rSch != nullptr)
+    needMarkAll(need, scope.rNorm, *scope.rSch);
+}
+
+void needAggArg(NeededMap& need, const ScopeSchemas& scope,
+                const std::shared_ptr<AggExpr>& e) {
+  if (!e) return;
+  if (e->kind == AggExpr::Kind::Column) {
+    needAddRef(need, scope, e->column);
+    return;
+  }
+  if (e->kind == AggExpr::Kind::Binary) {
+    needAggArg(need, scope, e->left);
+    needAggArg(need, scope, e->right);
+  }
+}
+
+// Direkte Referenzen EINES Select-Knotens sammeln (ohne den Inhalt
+// genesteter Subqueries; der wird per Rekursion mit eigenem Scope
+// behandelt). ORDER BY auf Ausgabe-Alias/Projektion braucht nichts extra
+// (Projektion ist bereits markiert); Ordinalia ebenfalls nicht.
+void collectNodeRefs(NeededMap& need,
+                     const std::map<std::string, const TableSchema*>& schemas,
+                     const SelectStmt& q) {
+  ScopeSchemas scope;
+  scope.lNorm = Executor::normalizeTable(q.table);
+  auto lit = schemas.find(scope.lNorm);
+  scope.lSch = (lit != schemas.end()) ? lit->second : nullptr;
+  scope.lAlias = q.table_alias;
+  scope.hasRight = q.has_join;
+  if (q.has_join) {
+    scope.rNorm = Executor::normalizeTable(q.join_table);
+    auto rit = schemas.find(scope.rNorm);
+    scope.rSch = (rit != schemas.end()) ? rit->second : nullptr;
+    scope.rAlias = q.join_alias;
+  }
+  if (scope.lSch == nullptr ||
+      (scope.hasRight && scope.rSch == nullptr)) {
+    // Unbekannte Tabelle: Database wirft "Tabelle unbekannt"; alle bekannten
+    // als benoetigt markieren (reine Absicherung).
+    for (const auto& [tn, sc] : schemas) needMarkAll(need, tn, *sc);
+  } else if (q.select_all) {
+    needMarkAll(need, scope.lNorm, *scope.lSch);
+    if (scope.hasRight && scope.rSch != nullptr)
+      needMarkAll(need, scope.rNorm, *scope.rSch);
+  } else {
+    for (const auto& c : q.columns) needAddRef(need, scope, c);
+    for (const auto& a : q.aggregates) needAggArg(need, scope, a.arg);
+    for (const auto& c : q.where) needAddRef(need, scope, c.column);
+    for (const auto& gr : q.where_groups)
+      for (const auto& c : gr) needAddRef(need, scope, c.column);
+    for (const auto& g : q.group_by) needAddRef(need, scope, g);
+    std::vector<std::string> outNames;
+    outNames.reserve(q.columns.size() + q.aggregates.size());
+    for (std::size_t i = 0; i < q.columns.size(); ++i) {
+      std::string al =
+          (i < q.column_aliases.size()) ? q.column_aliases[i] : "";
+      outNames.push_back(al.empty() ? q.columns[i] : al);
+    }
+    for (const auto& a : q.aggregates)
+      outNames.push_back(a.alias.empty() ? a.display : a.alias);
+    for (const auto& o : q.order_by) {
+      if (o.is_ordinal) continue;
+      if (o.is_agg) {
+        needAggArg(need, scope, o.agg.arg);
+        continue;
+      }
+      bool proj = false;
+      for (const auto& nm : outNames) {
+        if (toLower(nm) == toLower(o.column)) {
+          proj = true;
+          break;
+        }
+      }
+      if (!proj) needAddRef(need, scope, o.column);
+    }
+    for (const auto& j : q.join_on) {
+      needAddRef(need, scope, j.left);
+      if (j.right_is_col) needAddRef(need, scope, j.right);
+    }
+  }
+  auto rec = [&](const Condition& c) {
+    if (c.subquery) collectNodeRefs(need, schemas, *c.subquery);
+  };
+  for (const auto& c : q.where) rec(c);
+  for (const auto& gr : q.where_groups)
+    for (const auto& c : gr) rec(c);
+}
+
+NeededMap computeNeeded(
+    const SelectStmt& s,
+    const std::map<std::string, const TableSchema*>& schemas) {
+  NeededMap need;
+  for (const auto& [tn, sc] : schemas)
+    need[tn].assign(sc->columns.size(), 0);
+  collectNodeRefs(need, schemas, s);
+  return need;
+}
+
+// ---- Partielle Row-Dekodierung (Codec-kompatibel, kein Format-Bruch) -------
+// Gleicher Codec wie decodeRow (Felder mit '|' getrennt, Typ-Praefix "X:",
+// S-Payload-Escapes); ein Durchlauf ohne Zwischen-Strings (string_view auf
+// der Row-Lebensdauer, keine Kopie des MVCC-Werts).
+// mask == nullptr oder mask[f] != 0 -> Feld f voll dekodieren (exakt wie
+// decodeRow). Sonst: S-Felder nur Escape-validieren (kein String-Aufbau,
+// Wert NULL), I/F/B/N voll dekodieren (keine/winzige Alloks). Feldzahl- und
+// Typ-Prefix-Pruefung identisch zu decodeRow, daher werden korrupte Zeilen
+// exakt wie bisher uebersprungen (Aufrufer: try/catch -> continue).
+std::string unescapeView(std::string_view sv) {
+  std::string o;
+  o.reserve(sv.size());
+  for (std::size_t i = 0; i < sv.size(); ++i) {
+    if (sv[i] == '\\' && i + 1 < sv.size()) {
+      const char n = sv[i + 1];
+      if (n == '\\') {
+        o += '\\';
+        ++i;
+      } else if (n == 'p') {
+        o += '|';
+        ++i;
+      } else if (n == 'n') {
+        o += '\n';
+        ++i;
+      } else if (n == 'r') {
+        o += '\r';
+        ++i;
+      } else {
+        throw SqlError("Korrupte Row-Kodierung (Escape)");
+      }
+    } else if (sv[i] == '\\') {
+      throw SqlError("Korrupte Row-Kodierung (trailing backslash)");
+    } else {
+      o += sv[i];
+    }
+  }
+  return o;
+}
+
+void validateEscapes(std::string_view sv) {
+  for (std::size_t i = 0; i < sv.size(); ++i) {
+    if (sv[i] == '\\' && i + 1 < sv.size()) {
+      const char n = sv[i + 1];
+      if (n == '\\' || n == 'p' || n == 'n' || n == 'r') {
+        ++i;
+        continue;
+      }
+      throw SqlError("Korrupte Row-Kodierung (Escape)");
+    } else if (sv[i] == '\\') {
+      throw SqlError("Korrupte Row-Kodierung (trailing backslash)");
+    }
+  }
+}
+
+std::vector<Value> decodeRowSelected(const std::string& s, std::size_t ncols,
+                                     const std::vector<char>* mask) {
+  // Feldgrenzen in einem Durchlauf: "\x" ist eine Einheit, '|' sonst Trenner
+  // (exakt wie splitRowFields, aber ohne Feld-Strings zu materialisieren).
+  std::vector<std::pair<std::size_t, std::size_t>> b;
+  b.reserve(ncols);
+  std::size_t start = 0;
+  for (std::size_t i = 0; i < s.size();) {
+    if (s[i] == '\\' && i + 1 < s.size()) {
+      i += 2;
+    } else if (s[i] == '|') {
+      b.emplace_back(start, i - start);
+      start = i + 1;
+      ++i;
+    } else {
+      ++i;
+    }
+  }
+  b.emplace_back(start, s.size() - start);
+  if (b.size() != ncols)
+    throw SqlError("Row-Kodierung: Spaltenzahl passt nicht");
+  std::vector<Value> out;
+  out.reserve(ncols);
+  for (std::size_t f = 0; f < ncols; ++f) {
+    const char* p = s.data() + b[f].first;
+    const std::size_t len = b[f].second;
+    if (len < 2 || p[1] != ':') throw SqlError("Korrupte Row-Kodierung");
+    const char t = p[0];
+    const std::string_view pay(p + 2, len - 2);
+    const bool needf =
+        (mask == nullptr) || (f >= mask->size()) || ((*mask)[f] != 0);
+    switch (t) {
+      case 'N':
+        out.emplace_back(std::monostate{});
+        break;
+      case 'I':
+        out.emplace_back(static_cast<int64_t>(std::stoll(std::string(pay))));
+        break;
+      case 'F':
+        out.emplace_back(std::stod(std::string(pay)));
+        break;
+      case 'S':
+        if (needf) {
+          out.emplace_back(unescapeView(pay));
+        } else {
+          validateEscapes(pay);
+          out.emplace_back(std::monostate{});
+        }
+        break;
+      case 'B':
+        if (pay == "1")
+          out.emplace_back(true);
+        else if (pay == "0")
+          out.emplace_back(false);
+        else
+          throw SqlError("Korrupte Row-Kodierung (BOOL)");
+        break;
+      default:
+        throw SqlError("Korrupte Row-Kodierung (Typ)");
+    }
+  }
+  return out;
 }
 
 }  // namespace
@@ -517,6 +842,16 @@ Result Executor::execute(const std::string& sql) {
       }
       if (!mvcc_.Commit(w)) throw SqlError("MVCC-Commit fehlgeschlagen");
     }
+    // HTAP: committed Vollzeilen als neue Replika-Versionen spiegeln (alte
+    // Versionen werden per end_ts geschlossen -> alte Snapshots intakt).
+    if (!hits.empty()) {
+      const std::uint64_t cts = commitTsOf(hits[0].first);
+      if (cts == 0) {
+        rebuildReplicaForTable(norm);
+      } else {
+        for (const auto& [k, enc] : hits) mirrorUpsertOne(norm, k, enc, cts);
+      }
+    }
     return {{},
             {},
             "UPDATE " + std::to_string(hits.size()),
@@ -643,6 +978,15 @@ Result Executor::execute(const std::string& sql) {
       }
       if (!mvcc_.Commit(w)) throw SqlError("MVCC-Commit fehlgeschlagen");
     }
+    // HTAP: Tombstones in der Replika spiegeln (enc bleibt fuer alte Snapshots).
+    if (!keys.empty()) {
+      const std::uint64_t cts = commitTsOf(keys[0]);
+      if (cts == 0) {
+        rebuildReplicaForTable(norm);
+      } else {
+        for (const auto& k : keys) mirrorEraseOne(norm, k, cts);
+      }
+    }
     return {{},
             {},
             "DELETE " + std::to_string(keys.size()),
@@ -691,6 +1035,7 @@ Result Executor::execute(const std::string& sql) {
       if (!mvcc_.Commit(w)) throw SqlError("MVCC-Commit fehlgeschlagen");
     }
     tables_.erase(it);
+    replica_.erase(norm);  // HTAP: Scan-Replika konsistent verwerfen
     return {{}, {}, "DROP TABLE", 0};
   }
   return execSelect(std::get<SelectStmt>(st));
@@ -717,6 +1062,7 @@ Result Executor::execCreate(const CreateTableStmt& s) {
   sch.columns = s.columns;
   sch.next_rowid = 0;
   tables_[norm] = sch;
+  replica_.try_emplace(norm);  // HTAP: leere Scan-Replika (immer-sichtbar)
 
   const std::string enc = schemaEncode(s.columns);
   kv_.Put("sql/__schema/" + norm, enc);
@@ -832,6 +1178,18 @@ Result Executor::execInsert(const InsertStmt& s) {
     if (!mvcc_.Commit(w)) throw SqlError("MVCC-Commit fehlgeschlagen");
   }
 
+  // 4) HTAP: committed Rows in die Scan-Replika spiegeln (ein Commit-TS pro
+  // Writer-Commit -> Statement atomar sichtbar; KV/MVCC bleibt Write-Truth).
+  if (!keys.empty()) {
+    const std::uint64_t cts = commitTsOf(keys[0]);
+    if (cts == 0) {
+      rebuildReplicaForTable(norm);  // unerreichbar nach erfolgreichem Commit
+    } else {
+      for (std::size_t i = 0; i < keys.size(); ++i)
+        mirrorUpsertOne(norm, keys[i], encs[i], cts);
+    }
+  }
+
   return {{}, {}, "INSERT 0 " + std::to_string(fullRows.size()),
           fullRows.size()};
 }
@@ -858,76 +1216,94 @@ Result Executor::execSelect(const SelectStmt& s) {
     rsch = &jt->second;
   }
 
-  // Snapshot-Read: Key-Mengen aus EINEM KV-Snapshot, Werte aus EINEM
-  // MVCC-Snapshot (beide Seiten konsistent). Sichtbar NUR bei committed
-  // MVCC-Version (kein KV-Fallback-Dirty-Read).
-  auto snap = kv_.GetSnapshot();
+  // Snapshot-Read aus der HTAP Scan-Replika (statt KV-Prefix-Scan + MVCC-Read
+  // je Zeile): genau EIN MVCC-Snapshot (rtxn) liefert die Sichtbarkeits-TS,
+  // sichtbare Rows kommen aus der Replika (begin_ts <= snapshot < end_ts).
+  // KV/MVCC bleibt Write-Truth (INSERT/UPDATE/DELETE/Matching unveraendert).
+  //
+  // Streaming-Ausfuehrung ohne Temp-Database: jede Tabelle wird genau einmal
+  // dekodiert (nur benoetigte Spalten, s. computeNeeded/decodeRowSelected)
+  // und per Move in Snapshot-Tabellen gestellt; Filter, Projektion, JOIN,
+  // GROUP BY, ORDER BY, Aggregation und Subqueries wertet
+  // Database::execSelectSnapshot danach in genau einem Durchlauf direkt auf
+  // diesen Rows aus (kein Zweit-Insert, kein Coerce-Loop, keine
+  // Doppel-Auswertung, keine Row-Duplikate).
   txn::Transaction rtxn = mvcc_.BeginRead();
+  const std::uint64_t snapTs = mvcc_.SnapshotOf(rtxn);
+  std::map<std::string, const TableSchema*> schemas;
+  schemas[norm] = &sch;
+  if (s.has_join) schemas[rnorm] = rsch;
+  std::set<std::string> needed;
+  collectSelectTables(s, needed);
+  for (const auto& tn : needed) {
+    if (schemas.count(tn) != 0) continue;
+    auto jt = tables_.find(tn);
+    if (jt == tables_.end()) continue;  // execSelectSnapshot wirft "unbekannt"
+    schemas[tn] = &jt->second;
+  }
+  NeededMap need;
+  try {
+    need = computeNeeded(s, schemas);
+  } catch (...) {
+    need.clear();  // Fallback: alles voll dekodieren (s. decodeRowSelected)
+  }
   auto loadRows = [&](const std::string& tnorm, const TableSchema& sc) {
     std::vector<std::vector<Value>> rows;
-    auto kvs = snap->Scan(tablePrefix(tnorm));
-    rows.reserve(kvs.size());
-    for (auto& [k, v] : kvs) {
-      (void)v;  // Key-Menge aus KV, Wert NUR aus MVCC.
-      auto mv = mvcc_.Read(rtxn, k);
-      if (!mv.has_value()) continue;
-      const std::string& enc = *mv;
+    auto nit = need.find(tnorm);
+    const std::vector<char>* mask =
+        (nit != need.end()) ? &nit->second : nullptr;
+    auto rit = replica_.find(tnorm);
+    if (rit == replica_.end()) {
+      // Invarianten-Bruch (sollte nie passieren: CREATE legt die Replika an):
+      // aus KV/MVCC-Truth heilen, dann lesen (einmaliger Legacy-Scan statt
+      // falschem Leer-Ergebnis).
+      rebuildReplicaForTable(tnorm);
+      rit = replica_.find(tnorm);
+      if (rit == replica_.end()) return rows;
+    }
+    const columnar::ColumnarStore& rep = rit->second;
+    const std::vector<std::size_t> vis = rep.ReplicaVisible(snapTs);
+    const auto& rrows = rep.ReplicaRows();
+    rows.reserve(vis.size());
+    for (std::size_t idx : vis) {
+      if (idx >= rrows.size()) continue;  // defensive (unreachable)
       try {
-        rows.push_back(decodeRow(enc, sc.columns.size()));
+        rows.push_back(
+            decodeRowSelected(rrows[idx].enc, sc.columns.size(), mask));
       } catch (...) {
         continue;  // korrupte Zeile ueberspringen (sollte nicht passieren)
       }
     }
     return rows;
   };
-  std::vector<std::vector<Value>> allRows = loadRows(norm, sch);
-  std::vector<std::vector<Value>> allRRows;
-  if (needRight) allRRows = loadRows(rnorm, *rsch);
+  std::map<std::string, Table> snapTables;
+  {
+    Table t;
+    t.columns = sch.columns;
+    t.rows = loadRows(norm, sch);
+    snapTables.emplace(norm, std::move(t));
+  }
+  if (needRight) {
+    Table t;
+    t.columns = rsch->columns;
+    t.rows = loadRows(rnorm, *rsch);
+    snapTables.emplace(rnorm, std::move(t));
+  }
   // Subquery-Tabellen im selben Snapshot mitladen (unkorreliert -> konsistent).
-  std::set<std::string> needed;
-  collectSelectTables(s, needed);
   needed.erase(norm);
   if (s.has_join) needed.erase(rnorm);
-  std::map<std::string, std::vector<std::vector<Value>>> extraRows;
-  std::map<std::string, const TableSchema*> extraSch;
-  for (auto& tn : needed) {
-    auto jt = tables_.find(tn);
-    if (jt == tables_.end()) continue;  // tmp.execSelect wirft "unbekannt"
-    extraSch[tn] = &jt->second;
-    extraRows[tn] = loadRows(tn, jt->second);
+  for (const auto& tn : needed) {
+    auto jt = schemas.find(tn);
+    if (jt == schemas.end()) continue;  // execSelectSnapshot wirft "unbekannt"
+    Table t;
+    t.columns = jt->second->columns;
+    t.rows = loadRows(tn, *jt->second);
+    snapTables.emplace(tn, std::move(t));
   }
   mvcc_.Commit(rtxn);
 
-  // Filter/Projektion/JOIN an In-Memory-Database delegieren
-  // (parser-kompatible Semantik: =, <>, LIKE/ILIKE, AND, IS NULL ...).
-  Database tmp;
-  tmp.execCreate(CreateTableStmt{s.table, sch.columns, false});
-  if (!allRows.empty()) {
-    InsertStmt ins;
-    ins.table = s.table;
-    ins.rows = allRows;
-    tmp.execInsert(ins);
-  }
-  if (needRight) {
-    tmp.execCreate(CreateTableStmt{s.join_table, rsch->columns, false});
-    if (!allRRows.empty()) {
-      InsertStmt ins;
-      ins.table = s.join_table;
-      ins.rows = allRRows;
-      tmp.execInsert(ins);
-    }
-  }
-  for (auto& [tn, schp] : extraSch) {
-    tmp.execCreate(CreateTableStmt{tn, schp->columns, false});
-    auto& rows = extraRows[tn];
-    if (!rows.empty()) {
-      InsertStmt ins;
-      ins.table = tn;
-      ins.rows = rows;
-      tmp.execInsert(ins);
-    }
-  }
-  return tmp.execSelect(s);
+  Database db;
+  return db.execSelectSnapshot(s, std::move(snapTables));
 }
 
 void Executor::applyCreateRecord(const std::string& table,
@@ -944,6 +1320,7 @@ void Executor::applyCreateRecord(const std::string& table,
     it->second.columns = std::move(cols);
   }
   kv_.Put("sql/__schema/" + norm, schemaEnc);
+  replica_.try_emplace(norm);  // HTAP: Replika-Eintrag (kein Clear bei Replay)
 }
 
 bool Executor::applyInsertRecord(const std::string& table, const std::string& key,
@@ -953,12 +1330,68 @@ bool Executor::applyInsertRecord(const std::string& table, const std::string& ke
   kv_.Put(key, rowEnc);
   txn::Transaction w = mvcc_.BeginWriteBlocking();
   if (mvcc_.Write(w, key, rowEnc)) {
-    if (mvcc_.Commit(w)) return true;
+    if (mvcc_.Commit(w)) {
+      // HTAP: replayte Version mit ihrem eigenen Commit-TS spiegeln (WAL-
+      // Reihenfolge = Versionsreihenfolge -> gleiche Sichtbarkeit wie live).
+      mirrorUpsertOne(norm, key, rowEnc, commitTsOf(key));
+      return true;
+    }
     mvcc_.Abort(w);
     return false;
   }
   mvcc_.Abort(w);
   return false;
+}
+
+std::uint64_t Executor::commitTsOf(const std::string& key) {
+  // Exakte Commit-TS aus der MVCC-Kette (keine NextTimestamp-Heuristik):
+  // Commit installiert jede Version mit genau einer commit_ts (s. mvcc.cpp),
+  // die neueste Kette traegt sie in trx_begin.
+  const auto chain = mvcc_.GetChain(key);
+  if (chain.empty()) return 0;
+  return chain.back().trx_begin;
+}
+
+void Executor::mirrorUpsertOne(const std::string& norm, const std::string& key,
+                               const std::string& enc,
+                               std::uint64_t commit_ts) {
+  auto it = replica_.find(norm);
+  if (it == replica_.end() || commit_ts == 0) {
+    rebuildReplicaForTable(norm);  // Selbstheilung (unreachable im Normalfall)
+    return;
+  }
+  it->second.ReplicaAppend(key, enc, commit_ts);
+}
+
+void Executor::mirrorEraseOne(const std::string& norm, const std::string& key,
+                              std::uint64_t commit_ts) {
+  auto it = replica_.find(norm);
+  if (it == replica_.end() || commit_ts == 0) {
+    rebuildReplicaForTable(norm);  // Selbstheilung (unreachable im Normalfall)
+    return;
+  }
+  it->second.ReplicaErase(key, commit_ts);
+}
+
+void Executor::rebuildReplicaForTable(const std::string& norm) {
+  // Latest-State aus KV-Keymenge + jeweils neuester MVCC-Version (Tombstones
+  // entfallen; begin_ts aus der Kette). Nur Fallback/Selbstheilung: im
+  // Normalfall spiegeln Writes inkrementell (Versionen exakt, kein Re-Scan).
+  auto it = tables_.find(norm);
+  if (it == tables_.end()) {
+    replica_.erase(norm);
+    return;
+  }
+  columnar::ColumnarStore fresh;
+  for (const auto& [k, v] : kv_.Scan(tablePrefix(norm))) {
+    (void)v;  // Wert aus der MVCC-Kette (kein Dirty-Read)
+    const auto chain = mvcc_.GetChain(k);
+    if (chain.empty()) continue;
+    const auto& newest = chain.back();
+    if (newest.deleted) continue;
+    fresh.ReplicaAppend(k, newest.value, newest.trx_begin);
+  }
+  replica_[norm] = std::move(fresh);
 }
 
 std::size_t Executor::recover() {
@@ -1012,6 +1445,7 @@ std::size_t Executor::recover() {
           kv_.Delete(key);
           txn::Transaction w = mvcc_.BeginWriteBlocking();
           if (mvcc_.Erase(w, key) && mvcc_.Commit(w)) {
+            mirrorEraseOne(norm, key, commitTsOf(key));  // HTAP: Tombstone spiegeln
             ++recover_applied_;
           } else {
             mvcc_.Abort(w);
@@ -1055,6 +1489,7 @@ std::size_t Executor::recover() {
             }
           }
           tables_.erase(norm);
+          replica_.erase(norm);  // HTAP: Scan-Replika konsistent verwerfen
           if (ok) {
             ++recover_applied_;
           } else {
