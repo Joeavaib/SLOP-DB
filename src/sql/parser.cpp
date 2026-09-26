@@ -3,9 +3,13 @@
 
 #include "dbengine/sql/parser.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
 #include <iomanip>
+#include <limits>
+#include <numeric>
 #include <regex>
 #include <sstream>
 #include <unordered_map>
@@ -585,10 +589,16 @@ class Parser {
   }
 
   // Klausel-Keywords: nach einem Aggregat kein Alias (sondern Fortsetzung).
+  // Enthält zusätzlich alle reservierten Wörter, die eine Projektion
+  // fortsetzen können (WHERE-/ORDER BY-Kontext), damit sie nie als
+  // Blank-Alias geschluckt werden.
   bool peekClauseKeyword() const {
     static const char* kws[] = {"FROM", "WHERE", "GROUP", "ORDER",
                                 "LIMIT", "OFFSET", "AND",  "OR",
-                                "HAVING"};
+                                "HAVING", "BY",   "ASC",  "DESC",
+                                "NULLS",  "FIRST", "LAST", "NOT",
+                                "BETWEEN", "IN",  "IS",   "LIKE",
+                                "ILIKE",  "NULL"};
     for (auto k : kws)
       if (peekKeyword(k)) return true;
     return false;
@@ -643,13 +653,22 @@ class Parser {
     expectKeyword("FROM");
     s.table = parseIdent();
     if (matchKeyword("WHERE")) {
+      // DNF: Disjunktion von Konjunktionen (AND bindet staerker als OR).
+      std::vector<std::vector<Condition>> groups;
       while (true) {
-        s.where.push_back(parseCondition());
-        if (matchKeyword("AND")) continue;
+        std::vector<Condition> conj;
+        conj.push_back(parseCondition());
+        while (matchKeyword("AND")) conj.push_back(parseCondition());
+        groups.push_back(std::move(conj));
+        if (matchKeyword("OR")) continue;
         break;
       }
-      if (matchKeyword("OR"))
-        throw SqlError("OR erst ab V2 (aktuell nur AND)");
+      if (groups.size() == 1) {
+        s.where = std::move(groups[0]);
+      } else {
+        s.where.clear();
+        s.where_groups = std::move(groups);
+      }
     }
     if (matchKeyword("GROUP")) {
       expectKeyword("BY");
@@ -672,26 +691,152 @@ class Parser {
         s.aggregates.push_back(std::move(a));
       }
     }
-    // LIMIT/OFFSET/ORDER BY/HAVING/JOIN -> klare V2-Fehlermeldung statt
-    // Silent-Ignore (GROUP BY wird seit s43 oben unterstuetzt).
-    if (peekKeyword("ORDER") || peekKeyword("LIMIT") || peekKeyword("OFFSET") ||
-        peekKeyword("HAVING") || peekKeyword("JOIN"))
-      throw SqlError("ORDER BY / LIMIT / OFFSET / HAVING / JOIN erst ab V2");
+    // ORDER BY (1..n Items), danach LIMIT / OFFSET (je max. einmal,
+    // Reihenfolge egal). Anwendung: nach Filter/Gruppierung/Aggregation.
+    if (peekKeyword("ORDER")) {
+      ++pos_;
+      expectKeyword("BY");
+      while (true) {
+        s.order_by.push_back(parseOrderItem());
+        if (matchSymbol(",")) continue;
+        break;
+      }
+    }
+    while (true) {
+      if (peekKeyword("LIMIT") && !s.has_limit) {
+        ++pos_;
+        parseLimitValue(s, true);
+      } else if (peekKeyword("OFFSET") && !s.has_offset) {
+        ++pos_;
+        parseLimitValue(s, false);
+      } else {
+        break;
+      }
+    }
+    if (peekKeyword("LIMIT") || peekKeyword("OFFSET"))
+      throw SqlError("Doppeltes LIMIT / OFFSET");
+    // HAVING/JOIN -> klare V2-Fehlermeldung statt Silent-Ignore.
+    if (peekKeyword("HAVING") || peekKeyword("JOIN"))
+      throw SqlError("HAVING / JOIN erst ab V2");
     return s;
+  }
+
+  OrderByItem parseOrderItem() {
+    OrderByItem o;
+    if (peek().kind == TokKind::Integer) {
+      Token u = next();
+      int64_t v = 0;
+      try {
+        v = std::stoll(u.text);
+      } catch (...) {
+        throw SqlError("Ungueltige ORDER BY-Position");
+      }
+      if (v <= 0) throw SqlError("ORDER BY-Position muss >= 1 sein");
+      o.is_ordinal = true;
+      o.ordinal = v;
+    } else if (peekAggregate()) {
+      o.is_agg = true;
+      o.agg = parseAggregate();
+    } else {
+      o.column = parseIdent();
+    }
+    if (matchKeyword("ASC")) {
+      o.desc = false;
+    } else if (matchKeyword("DESC")) {
+      o.desc = true;
+    }
+    if (matchKeyword("NULLS")) {
+      if (matchKeyword("FIRST")) {
+        o.has_nulls = true;
+        o.nulls_first = true;
+      } else if (matchKeyword("LAST")) {
+        o.has_nulls = true;
+        o.nulls_first = false;
+      } else {
+        throw SqlError("Erwartet FIRST oder LAST nach NULLS");
+      }
+    } else {
+      // PG-Default: ASC -> NULLS LAST, DESC -> NULLS FIRST.
+      o.nulls_first = o.desc;
+    }
+    return o;
+  }
+
+  void parseLimitValue(SelectStmt& s, bool is_limit) {
+    const char* what = is_limit ? "LIMIT" : "OFFSET";
+    if (peekKeyword("ALL")) {
+      if (!is_limit)
+        throw SqlError("Erwartet OFFSET-Wert (nicht-negative Ganzzahl)");
+      ++pos_;
+      s.has_limit = false;  // LIMIT ALL = kein Limit (PG)
+      return;
+    }
+    bool neg = false;
+    if (peek().kind == TokKind::Symbol &&
+        (peek().text == "-" || peek().text == "+")) {
+      neg = (peek().text == "-");
+      ++pos_;
+    }
+    if (peek().kind != TokKind::Integer)
+      throw SqlError(std::string("Erwartet ") + what +
+                     "-Wert (nicht-negative Ganzzahl)");
+    Token w = next();
+    int64_t v = 0;
+    try {
+      v = std::stoll(w.text);
+    } catch (...) {
+      throw SqlError(std::string("Ungueltiger ") + what + "-Wert");
+    }
+    if (neg) v = -v;
+    if (v < 0) throw SqlError(std::string(what) + " darf nicht negativ sein");
+    if (is_limit) {
+      s.has_limit = true;
+      s.limit = v;
+    } else {
+      s.has_offset = true;
+      s.offset = v;
+    }
   }
 
   Condition parseCondition() {
     Condition c;
     c.column = parseIdent();
+    // Optionales NOT-Praefix: NOT BETWEEN / NOT IN / NOT LIKE / NOT ILIKE.
+    bool neg = false;
+    if (peekKeyword("NOT")) {
+      ++pos_;
+      neg = true;
+    }
     const Token& t = next();
     if (t.kind == TokKind::Ident) {
       std::string kw = toUpper(t.text);
       if (kw == "LIKE" || kw == "ILIKE") {
-        c.op = kw;
+        c.op = neg ? ("NOT " + kw) : kw;
         c.value = parseLiteral();
         return c;
       }
+      if (kw == "BETWEEN") {
+        c.op = neg ? "NOT BETWEEN" : "BETWEEN";
+        c.value = parseLiteral();
+        expectKeyword("AND");
+        c.second = parseLiteral();
+        return c;
+      }
+      if (kw == "IN") {
+        c.op = neg ? "NOT IN" : "IN";
+        expectSymbol("(");
+        if (peek().kind == TokKind::Symbol && peek().text == ")")
+          throw SqlError("IN-Liste darf nicht leer sein");
+        while (true) {
+          c.list.push_back(parseLiteral());
+          if (matchSymbol(",")) continue;
+          break;
+        }
+        expectSymbol(")");
+        return c;
+      }
       if (kw == "IS") {
+        if (neg) throw SqlError("Unbekannter Operator: NOT IS");
         // IS [NOT] NULL
         bool is_not = false;
         if (peekKeyword("NOT")) {
@@ -703,9 +848,11 @@ class Parser {
         c.value = Value{std::monostate{}};
         return c;
       }
-      throw SqlError("Unbekannter Operator: " + t.text);
+      throw SqlError("Unbekannter Operator: " +
+                     (neg ? ("NOT " + t.text) : t.text));
     }
     if (t.kind == TokKind::Symbol) {
+      if (neg) throw SqlError("Unbekannter Operator: NOT " + t.text);
       static const char* kOps[] = {"=", "<", "<=", ">", ">=", "<>", "!="};
       bool ok = false;
       for (auto o : kOps)
@@ -788,13 +935,40 @@ bool evalCondition(const Table& t, const std::vector<Value>& row,
   const Value& v = row[(std::size_t)idx];
   if (c.op == "IS NULL") return valueIsNull(v);
   if (c.op == "IS NOT NULL") return !valueIsNull(v);
+  if (c.op == "IN" || c.op == "NOT IN") {
+    // c.value ist hier unbesetzt (NULL-Sentinel) -> eigene NULL-Behandlung:
+    // Zeilen-NULL -> false; Listen-NULL matcht nie (IN), bzw. macht
+    // NOT IN zu UNKNOWN -> filtern (PG).
+    if (valueIsNull(v)) return false;
+    bool has_null = false;
+    for (auto& e : c.list) {
+      if (valueIsNull(e)) {
+        has_null = true;
+        continue;
+      }
+      if (compareValues(v, e) == 0) return (c.op == "IN");
+    }
+    if (c.op == "IN") return false;
+    return !has_null;
+  }
   if (valueIsNull(v) || valueIsNull(c.value)) return false;  // NULL -> false
-  if (c.op == "LIKE" || c.op == "ILIKE") {
+  if (c.op == "BETWEEN" || c.op == "NOT BETWEEN") {
+    // Inklusiv, PG: NULL (Zeile oder Grenze) -> UNKNOWN -> filtern.
+    if (valueIsNull(c.second)) return false;
+    int lo = compareValues(v, c.value);
+    int hi = compareValues(v, c.second);
+    if (lo == -2 || hi == -2) return false;
+    bool in = (lo >= 0 && hi <= 0);
+    return (c.op == "BETWEEN") ? in : !in;
+  }
+  if (c.op == "LIKE" || c.op == "ILIKE" || c.op == "NOT LIKE" ||
+      c.op == "NOT ILIKE") {
     auto* vs = std::get_if<std::string>(&v);
     auto* ps = std::get_if<std::string>(&c.value);
     if (!vs || !ps)
       throw SqlError(c.op + " braucht TEXT-Operanden");
-    return likeMatch(*vs, *ps, c.op == "ILIKE");
+    bool m = likeMatch(*vs, *ps, c.op == "ILIKE" || c.op == "NOT ILIKE");
+    return (c.op == "LIKE" || c.op == "ILIKE") ? m : !m;
   }
   int cmp = compareValues(v, c.value);
   if (cmp == -2) return false;
@@ -805,6 +979,69 @@ bool evalCondition(const Table& t, const std::vector<Value>& row,
   if (c.op == ">") return cmp > 0;
   if (c.op == ">=") return cmp >= 0;
   throw SqlError("Unbekannter Operator: " + c.op);
+}
+
+// WHERE als DNF: ohne OR gilt where (AND), mit OR gelten where_groups
+// (OR von AND-Konjunktionen, AND bindet staerker).
+bool evalWhere(const Table& t, const std::vector<Value>& row,
+               const SelectStmt& s) {
+  if (!s.where_groups.empty()) {
+    for (auto& conj : s.where_groups) {
+      bool ok = true;
+      for (auto& c : conj) {
+        if (!evalCondition(t, row, c)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
+  for (auto& c : s.where)
+    if (!evalCondition(t, row, c)) return false;
+  return true;
+}
+
+// 3-Wege-Vergleich fuer ORDER BY (Richtung + NULLs bereits
+// aufgeloest). NULL vs. non-NULL via nulls_first, non-NULL via compareValues
+// (numerisch tolerant, bestehende Vergleichssemantik).
+int compareOrdered(const Value& a, const Value& b, bool desc,
+                   bool nulls_first) {
+  bool an = valueIsNull(a);
+  bool bn = valueIsNull(b);
+  if (an && bn) return 0;
+  if (an) return nulls_first ? -1 : 1;
+  if (bn) return nulls_first ? 1 : -1;
+  int c = compareValues(a, b);
+  if (c == -2) return 0;  // unerreichbar (NULL oben behandelt)
+  if (desc) c = -c;
+  return (c < 0) ? -1 : ((c > 0) ? 1 : 0);
+}
+
+// LIMIT/OFFSET-Slice auf dem fertigen Result (nach Projektion/Aggregation).
+// Negative Werte -> SqlError (Parse stellt das sicher, hier als zweite
+// Huerde fuer handgebaute Statements). Aktualisiert message/affected.
+void applyLimitOffset(Result& r, const SelectStmt& s) {
+  if (s.has_limit && s.limit < 0)
+    throw SqlError("LIMIT darf nicht negativ sein");
+  if (s.has_offset && s.offset < 0)
+    throw SqlError("OFFSET darf nicht negativ sein");
+  std::size_t off =
+      s.has_offset ? static_cast<std::size_t>(s.offset) : std::size_t{0};
+  std::size_t lim = s.has_limit ? static_cast<std::size_t>(s.limit)
+                                : std::numeric_limits<std::size_t>::max();
+  std::vector<std::vector<Value>> out;
+  if (off < r.rows.size()) {
+    std::size_t avail = r.rows.size() - off;
+    std::size_t take = std::min(avail, lim);
+    out.reserve(take);
+    for (std::size_t i = 0; i < take; ++i)
+      out.push_back(std::move(r.rows[off + i]));
+  }
+  r.rows = std::move(out);
+  r.message = "SELECT " + std::to_string(r.rows.size());
+  r.affected = r.rows.size();
 }
 
 Value coerceTo(const Value& v, ColType type, const std::string& col) {
@@ -965,7 +1202,46 @@ Value computeAggregate(const Table& t,
   throw SqlError("Unbekannte Aggregatfunktion: " + a.func);
 }
 
+// ORDER BY-Referenzen auf 1-zeiligen Aggregat-Results (skalar oder
+// COUNT(*)-Legacy) validieren. Sortieren ist dort ein No-Op, unbekannte
+// Spalten/Positionen muessen aber trotzdem fehlschlagen. Aggregat-Items,
+// die nicht projiziert sind, werden einmal ausgewertet und verworfen
+// (nur zur Spalten-Validierung, PG-kompatible Fehlermeldung).
+void validateOrderScalar(const Table& t,
+                         const std::vector<std::vector<Value>>& kept,
+                         const SelectStmt& s, const Result& r) {
+  for (auto& o : s.order_by) {
+    if (o.is_ordinal) {
+      if (o.ordinal < 1 || static_cast<std::size_t>(o.ordinal) > r.columns.size())
+        throw SqlError("ORDER BY-Position ausserhalb der Projektion");
+    } else if (o.is_agg) {
+      bool known = false;
+      for (auto& a : s.aggregates)
+        if (a.display == o.agg.display && a.func == o.agg.func) {
+          known = true;
+          break;
+        }
+      if (!known) {
+        std::vector<const std::vector<Value>*> refs;
+        refs.reserve(kept.size());
+        for (auto& row : kept) refs.push_back(&row);
+        (void)computeAggregate(t, refs, o.agg);
+      }
+    } else {
+      bool ok = false;
+      for (auto& c : r.columns)
+        if (foldIdent(c) == foldIdent(o.column)) {
+          ok = true;
+          break;
+        }
+      if (!ok) throw SqlError("Unbekannte Spalte in ORDER BY: " + o.column);
+    }
+  }
+}
+
 // Ein-Zeilen-Result. Empty-Set: COUNT->0, Rest NULL. Sonst NULL-Skip.
+// ORDER BY ist hier ein validierter No-Op, LIMIT/OFFSET schneiden die
+// eine Zeile (LIMIT 0 / OFFSET >= 1 -> 0 Zeilen).
 Result execScalarAggregates(const Table& t,
                             const std::vector<std::vector<Value>>& kept,
                             const SelectStmt& s) {
@@ -980,8 +1256,8 @@ Result execScalarAggregates(const Table& t,
   out.reserve(s.aggregates.size());
   for (auto& a : s.aggregates) out.push_back(computeAggregate(t, refs, a));
   r.rows.push_back(std::move(out));
-  r.message = "SELECT 1";
-  r.affected = 1;
+  validateOrderScalar(t, kept, s, r);
+  applyLimitOffset(r, s);
   return r;
 }
 
@@ -1005,9 +1281,190 @@ std::string groupKeyField(const Value& v) {
   return "X:" + valueToString(v) + ";";
 }
 
-// Hash-Aggregation (s43, Q1-Kern ohne ORDER BY): eine Zeile pro Gruppe in
-// First-Seen-Reihenfolge, Spalten in SELECT-Reihenfolge (Gruppen-Spalten +
-// Aggregate gemischt). Leere Eingabe -> 0 Gruppen (keine Zeile).
+// Eine GROUP BY-Gruppe: Key in group_by-Reihenfolge + Member-Zeilen.
+// (Namespace-Scope, damit die ORDER BY-Sortierung darauf zugreifen kann;
+// r.rows[i] korrespondiert zu groups[i].)
+struct Group {
+  std::vector<Value> key;
+  std::vector<const std::vector<Value>*> rows;
+};
+
+// ORDER BY auf ungefiltert-projizierten Plain-Zeilen (kein GROUP BY, keine
+// Aggregate): sortiert die vollen Tabellen-Zeilen VOR der Projektion, damit
+// auch nicht-projizierte Spalten als Sortierschluessel taugen (PG).
+// Aufloesung je Item: Ausgabe-Alias/Spalte zuerst, dann Tabellenspalte,
+// sonst SqlError. Aggregate/Positionsfehler -> SqlError. Stabil (Ties
+// behalten Einfuegereihenfolge).
+void sortPlainRows(const Table& t, std::vector<std::vector<Value>>& kept,
+                   const SelectStmt& s) {
+  struct Key {
+    int col = -1;
+    bool desc = false;
+    bool nulls_first = false;
+  };
+  auto resolveName = [&](const std::string& name) -> int {
+    if (!s.select_all) {
+      for (std::size_t i = 0; i < s.columns.size(); ++i) {
+        std::string alias;
+        if (i < s.column_aliases.size()) alias = s.column_aliases[i];
+        const std::string& outname = alias.empty() ? s.columns[i] : alias;
+        if (foldIdent(outname) == foldIdent(name)) {
+          int ti = t.colIndex(s.columns[i]);
+          if (ti < 0) throw SqlError("Unbekannte Spalte in ORDER BY: " + name);
+          return ti;
+        }
+      }
+    }
+    int ti = t.colIndex(name);
+    if (ti < 0) throw SqlError("Unbekannte Spalte in ORDER BY: " + name);
+    return ti;
+  };
+  auto resolveOrdinal = [&](int64_t ord) -> int {
+    std::size_t n_out =
+        s.select_all ? t.columns.size() : s.columns.size();
+    if (ord < 1 || static_cast<std::size_t>(ord) > n_out)
+      throw SqlError("ORDER BY-Position ausserhalb der Projektion");
+    if (s.select_all) return static_cast<int>(ord - 1);
+    int ti = t.colIndex(s.columns[static_cast<std::size_t>(ord - 1)]);
+    if (ti < 0) throw SqlError("Unbekannte Spalte in ORDER BY");
+    return ti;
+  };
+  std::vector<Key> keys;
+  keys.reserve(s.order_by.size());
+  for (auto& o : s.order_by) {
+    Key k;
+    k.desc = o.desc;
+    k.nulls_first = o.has_nulls ? o.nulls_first : o.desc;
+    if (o.is_agg)
+      throw SqlError(
+          "ORDER BY mit Aggregat nur mit GROUP BY oder Aggregat-Projektion");
+    else if (o.is_ordinal)
+      k.col = resolveOrdinal(o.ordinal);
+    else
+      k.col = resolveName(o.column);
+    keys.push_back(k);
+  }
+  std::stable_sort(kept.begin(), kept.end(),
+                   [&](const std::vector<Value>& a,
+                       const std::vector<Value>& b) {
+                     for (auto& k : keys) {
+                       int c = compareOrdered(
+                           a[static_cast<std::size_t>(k.col)],
+                           b[static_cast<std::size_t>(k.col)], k.desc,
+                           k.nulls_first);
+                       if (c != 0) return c < 0;
+                     }
+                     return false;
+                   });
+}
+
+// Aufgeloester Gruppierungs-Sortierschluessel: Result-Spalte (Alias,
+// Gruppen-Spalte, projiziertes Aggregat), GROUP BY-Key (gruppiert, aber
+// nicht projiziert) oder frisch pro Gruppe berechnetes Aggregat
+// (ORDER BY-Aggregat ausserhalb der Projektion).
+struct GroupOrderKey {
+  enum class Kind { Result, GroupKey, Computed };
+  Kind kind = Kind::Result;
+  std::size_t pos = 0;  // Result-Position bzw. group_by-Position
+  Aggregate agg;        // bei Computed
+  bool desc = false;
+  bool nulls_first = false;
+};
+
+// ORDER BY auf gruppierten Results (nach Aggregation). Aufloesung je Item:
+// Ordinal -> Ausgabeposition; Aggregat -> projiziert (Display-Match) oder
+// pro Gruppe berechnet; Name -> Ausgabespalte/Alias, sonst GROUP BY-Spalte,
+// sonst SqlError. Unsortiert bleibt First-Seen-Reihenfolge. Stabil.
+void sortGroupedRows(const Table& t, const std::vector<Group>& groups,
+                     const SelectStmt& s, Result& r) {
+  std::vector<GroupOrderKey> keys;
+  keys.reserve(s.order_by.size());
+  for (auto& o : s.order_by) {
+    GroupOrderKey k;
+    k.desc = o.desc;
+    k.nulls_first = o.has_nulls ? o.nulls_first : o.desc;
+    if (o.is_ordinal) {
+      if (o.ordinal < 1 ||
+          static_cast<std::size_t>(o.ordinal) > r.columns.size())
+        throw SqlError("ORDER BY-Position ausserhalb der Projektion");
+      k.kind = GroupOrderKey::Kind::Result;
+      k.pos = static_cast<std::size_t>(o.ordinal - 1);
+    } else if (o.is_agg) {
+      int rpos = -1;
+      for (std::size_t i = 0; i < r.columns.size(); ++i)
+        if (foldIdent(r.columns[i]) == foldIdent(o.agg.display)) {
+          rpos = static_cast<int>(i);
+          break;
+        }
+      // Alias-Treffer: ORDER BY <alias> waere als Name gekommen; hier nur
+      // Display-Match, sonst pro Gruppe frisch berechnen.
+      if (rpos >= 0) {
+        k.kind = GroupOrderKey::Kind::Result;
+        k.pos = static_cast<std::size_t>(rpos);
+      } else {
+        k.kind = GroupOrderKey::Kind::Computed;
+        k.agg = o.agg;
+      }
+    } else {
+      int rpos = -1;
+      for (std::size_t i = 0; i < r.columns.size(); ++i)
+        if (foldIdent(r.columns[i]) == foldIdent(o.column)) {
+          rpos = static_cast<int>(i);
+          break;
+        }
+      if (rpos >= 0) {
+        k.kind = GroupOrderKey::Kind::Result;
+        k.pos = static_cast<std::size_t>(rpos);
+      } else {
+        int gpos = -1;
+        for (std::size_t i = 0; i < s.group_by.size(); ++i)
+          if (foldIdent(s.group_by[i]) == foldIdent(o.column)) {
+            gpos = static_cast<int>(i);
+            break;
+          }
+        if (gpos < 0)
+          throw SqlError("Unbekannte Spalte in ORDER BY: " + o.column);
+        k.kind = GroupOrderKey::Kind::GroupKey;
+        k.pos = static_cast<std::size_t>(gpos);
+      }
+    }
+    keys.push_back(std::move(k));
+  }
+  std::size_t n = r.rows.size();
+  std::vector<std::vector<Value>> kvals(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    kvals[i].reserve(keys.size());
+    for (auto& k : keys) {
+      if (k.kind == GroupOrderKey::Kind::Result)
+        kvals[i].push_back(r.rows[i][k.pos]);
+      else if (k.kind == GroupOrderKey::Kind::GroupKey)
+        kvals[i].push_back(groups[i].key[k.pos]);
+      else
+        kvals[i].push_back(computeAggregate(t, groups[i].rows, k.agg));
+    }
+  }
+  std::vector<std::size_t> idx(n);
+  for (std::size_t i = 0; i < n; ++i) idx[i] = i;
+  std::stable_sort(idx.begin(), idx.end(),
+                   [&](std::size_t a, std::size_t b) {
+                     for (std::size_t j = 0; j < keys.size(); ++j) {
+                       int c = compareOrdered(kvals[a][j], kvals[b][j],
+                                              keys[j].desc,
+                                              keys[j].nulls_first);
+                       if (c != 0) return c < 0;
+                     }
+                     return false;
+                   });
+  std::vector<std::vector<Value>> sorted;
+  sorted.reserve(n);
+  for (auto i : idx) sorted.push_back(std::move(r.rows[i]));
+  r.rows = std::move(sorted);
+}
+
+// Hash-Aggregation (s43, Q1-Kern): eine Zeile pro Gruppe in
+// First-Seen-Reihenfolge (ohne ORDER BY), Spalten in SELECT-Reihenfolge
+// (Gruppen-Spalten + Aggregate gemischt). Leere Eingabe -> 0 Gruppen
+// (keine Zeile).
 Result execGroupedAggregates(const Table& t,
                              const std::vector<std::vector<Value>>& kept,
                              const SelectStmt& s) {
@@ -1033,10 +1490,6 @@ Result execGroupedAggregates(const Table& t,
       throw SqlError("Spalte '" + c + "' muss in GROUP BY erscheinen");
   }
   // Hash-Partitionierung (Key = Wert-Tupel), Gruppen in First-Seen-Ordnung
-  struct Group {
-    std::vector<Value> key;  // Gruppenwerte in group_by-Reihenfolge
-    std::vector<const std::vector<Value>*> rows;
-  };
   std::vector<Group> groups;
   std::unordered_map<std::string, std::size_t> pos;
   for (auto& row : kept) {
@@ -1108,8 +1561,9 @@ Result execGroupedAggregates(const Table& t,
     }
     r.rows.push_back(std::move(out));
   }
-  r.message = "SELECT " + std::to_string(r.rows.size());
-  r.affected = r.rows.size();
+  // ORDER BY nach Aggregation (Default: First-Seen), dann LIMIT/OFFSET.
+  if (!s.order_by.empty()) sortGroupedRows(t, groups, s, r);
+  applyLimitOffset(r, s);
   return r;
 }
 
@@ -1246,23 +1700,20 @@ Result Database::execSelect(const SelectStmt& s) {
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
   const Table& t = it->second;
-  // Filter
+  // Filter (AND bzw. DNF bei OR)
   std::vector<std::vector<Value>> kept;
   for (auto& row : t.rows) {
-    bool ok = true;
-    for (auto& c : s.where)
-      if (!evalCondition(t, row, c)) {
-        ok = false;
-        break;
-      }
-    if (ok) kept.push_back(row);
+    if (evalWhere(t, row, s)) kept.push_back(row);
   }
   if (!s.group_by.empty()) {
     return execGroupedAggregates(t, kept, s);
   }
   if (s.count_star) {
-    return { {"count"}, { {Value{(int64_t)kept.size()}} },
-             "SELECT 1", std::size_t{1} };
+    Result r{ {"count"}, { {Value{(int64_t)kept.size()}} },
+              "SELECT 1", std::size_t{1} };
+    validateOrderScalar(t, kept, s, r);
+    applyLimitOffset(r, s);
+    return r;
   }
   if (!s.aggregates.empty()) {
     if (!s.columns.empty() || s.select_all)
@@ -1292,13 +1743,15 @@ Result Database::execSelect(const SelectStmt& s) {
   }
   Result r;
   r.columns = cols;
+  // ORDER BY vor der Projektion auf den vollen Zeilen (nicht-projizierte
+  // Spalten bleiben sortierbar), LIMIT/OFFSET danach auf dem Result.
+  if (!s.order_by.empty()) sortPlainRows(t, kept, s);
   for (auto& row : kept) {
     std::vector<Value> o;
     for (int i : idxs) o.push_back(row[(std::size_t)i]);
     r.rows.push_back(std::move(o));
   }
-  r.message = "SELECT " + std::to_string(r.rows.size());
-  r.affected = r.rows.size();
+  applyLimitOffset(r, s);
   return r;
 }
 

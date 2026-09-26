@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -95,6 +96,32 @@ std::vector<uint8_t> encodeAuthOk() {
   putInt32BE(out, 8);
   putInt32BE(out, 0);
   return out;
+}
+
+// AuthenticationCleartextPassword: 'R' | len=8 | int32(3). Kein Payload.
+// SICHERHEIT: Klartext ohne TLS mitlesbar — nur mit Sidecar-TLS nutzen.
+std::vector<uint8_t> encodeAuthCleartext() {
+  std::vector<uint8_t> out;
+  out.push_back('R');
+  putInt32BE(out, 8);
+  putInt32BE(out, 3);
+  return out;
+}
+
+// PasswordMessage ('p' | len | password\0) -> Passwort. nullopt bei Fehlformat
+// (falscher Typ wird vom Caller geprüft; hier nur Payload-Form: genau ein
+// NUL am Ende, keine eingebetteten NULs/Trailer).
+std::optional<std::string> parsePasswordMessage(
+    const std::vector<uint8_t>& msg) {
+  if (msg.size() < 6) return std::nullopt;  // 'p' + len(4) + mind. NUL
+  if (msg[0] != 'p') return std::nullopt;
+  if (msg.back() != 0) return std::nullopt;
+  const char* begin = reinterpret_cast<const char*>(msg.data() + 5);
+  std::size_t payLen = msg.size() - 5;
+  std::size_t n = 0;
+  while (n < payLen && begin[n] != '\0') ++n;
+  if (n + 1 != payLen) return std::nullopt;
+  return std::string(begin, n);
 }
 
 std::string trimUpper(const std::string& s) {
@@ -241,6 +268,16 @@ PgServer::PgServer() : executor_(kv_, mvcc_, nullptr) {}
 
 PgServer::~PgServer() { stop(); }
 
+void PgServer::setAuth(const std::map<std::string, std::string>& users) {
+  std::lock_guard<std::mutex> lk(authMu_);
+  authUsers_ = users;
+}
+
+void PgServer::setAuthRequired(bool required) {
+  std::lock_guard<std::mutex> lk(authMu_);
+  authRequired_ = required;
+}
+
 bool PgServer::running() const { return running_.load(); }
 
 void PgServer::start() {
@@ -311,13 +348,56 @@ void PgServer::handleConn(int fd) {
     ::close(fd);
     return;
   }
+  dbengine::pgwire::StartupParams startupParams;
   try {
-    (void)dbengine::pgwire::parseStartup(startup);
+    startupParams = dbengine::pgwire::parseStartup(startup);
   } catch (const std::exception& e) {
     auto err = dbengine::pgwire::encodeError("FATAL", "08P01", e.what());
     sendAll(fd, err);
     ::close(fd);
     return;
+  }
+
+  // 1b) Auth-Hook (opt-in). Default Trust-All: direkt zu 2).
+  // Wenn required: R(3 Cleartext) statt R(0), PasswordMessage ('p') lesen,
+  // gegen authUsers_ vergleichen; Fail -> E FATAL 28P01 + close, OK -> 2).
+  {
+    bool required = false;
+    std::map<std::string, std::string> users;
+    {
+      std::lock_guard<std::mutex> lk(authMu_);
+      required = authRequired_;
+      users = authUsers_;
+    }
+    if (required) {
+      if (!sendAll(fd, encodeAuthCleartext())) {
+        ::close(fd);
+        return;
+      }
+      char ptype = 0;
+      std::vector<uint8_t> pmsg;
+      if (!readTypedMessage(fd, ptype, pmsg)) {
+        ::close(fd);
+        return;
+      }
+      std::optional<std::string> pw;
+      if (ptype == 'p') pw = parsePasswordMessage(pmsg);
+      bool ok = false;
+      if (pw.has_value()) {
+        auto it = users.find(startupParams.user);
+        if (it != users.end() && pw.value() == it->second) ok = true;
+      }
+      if (!ok) {
+        auto err = dbengine::pgwire::encodeError(
+            "FATAL", "28P01",
+            std::string("password authentication failed for user \"") +
+                startupParams.user + "\"");
+        sendAll(fd, err);
+        ::close(fd);
+        return;
+      }
+      // OK: weiter zu 2) (R(0) + Z wie bisher).
+    }
   }
 
   // 2) AuthOk (psql/libpq erwartet 'R') + ReadyForQuery('I').

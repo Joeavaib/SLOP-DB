@@ -31,6 +31,15 @@ float sub_l2_squared(const float* a, const float* b, int n) {
   // Heisser Pfad (PQ-Lloyd, IVF-Coarse, ADC-Tabellen): AVX2-Kern teilen.
   return dbengine::vector::detail::l2_squared_kernel(a, b, n);
 }
+
+// Sample-Budget (Prozent-Regel): min(N, max(2048, N/10)).
+// Kleine N: alles; grosse N: 10 % statt fixem Cap. Deterministisch
+// (Aufrufer shuffelt via Seed und nimmt die ersten nuse).
+size_t sample_budget(size_t n) {
+  const size_t ten_pct = n / 10;
+  const size_t cap = std::max<size_t>(2048, ten_pct);
+  return std::min(n, cap);
+}
 }  // namespace
 
 // --- Sq8Quantizer -----------------------------------------------------------
@@ -294,7 +303,8 @@ void PqNQuantizer::fit(const std::vector<Vector>& data, int iters,
   for (const auto& v : data) pool.push_back(&v);
   std::mt19937 rng(seed);
   std::shuffle(pool.begin(), pool.end(), rng);
-  const size_t nuse = std::min<size_t>(pool.size(), 2048);
+  // Prozent-Regel: min(N, max(2048, N/10)) statt fix 2048.
+  const size_t nuse = sample_budget(pool.size());
   std::vector<const Vector*> use(pool.begin(), pool.begin() + nuse);
 
   codebooks_.assign(m_, {});
@@ -398,6 +408,33 @@ float PqNQuantizer::adc_l2_squared(
 }
 
 // --- IvfPqIndex ---------------------------------------------------------------
+int IvfPqIndex::default_nlist(size_t n) {
+  if (n == 0) return 1;
+  const double raw = 4.0 * std::sqrt(static_cast<double>(n));
+  long nl = static_cast<long>(std::lround(raw));
+  if (nl < 1) nl = 1;
+  if (nl > 4096) nl = 4096;
+  if (static_cast<size_t>(nl) > n) nl = static_cast<long>(n);
+  if (nl < 1) nl = 1;
+  return static_cast<int>(nl);
+}
+
+int IvfPqIndex::default_nprobe(int nlist) {
+  if (nlist <= 1) return 1;
+  // ~nlist/8, aufgerundet, mind. 1, max. nlist.
+  int np = (nlist + 7) / 8;
+  if (np < 1) np = 1;
+  if (np > nlist) np = nlist;
+  return np;
+}
+
+IvfPqIndex::IvfDefaults IvfPqIndex::autotune(size_t n) {
+  IvfDefaults d;
+  d.nlist = default_nlist(n);
+  d.nprobe = default_nprobe(d.nlist);
+  return d;
+}
+
 void IvfPqIndex::train(const std::vector<Vector>& data, int coarse_iters,
                        int pq_iters, unsigned seed) {
   if (dim_ <= 0 || nlist_ <= 0)
@@ -417,7 +454,8 @@ void IvfPqIndex::train(const std::vector<Vector>& data, int coarse_iters,
   coarse_.assign(nlist_, Vector(dim_, 0.0f));
   for (int c = 0; c < nlist_; ++c) coarse_[c] = *pool[c % pool.size()];
 
-  const size_t nuse = std::min<size_t>(data.size(), 4096);
+  // Prozent-Regel: min(N, max(2048, N/10)) statt fix 4096.
+  const size_t nuse = sample_budget(data.size());
   std::vector<const Vector*> use(pool.begin(), pool.begin() + nuse);
   std::vector<int> assign(nuse, 0);
   std::vector<Vector> acc(nlist_, Vector(dim_, 0.0f));
@@ -444,15 +482,11 @@ void IvfPqIndex::train(const std::vector<Vector>& data, int coarse_iters,
       for (int d = 0; d < dim_; ++d) coarse_[c][d] = acc[c][d] / cnt[c];
     }
   }
-  // PQ auf vollen Daten (nicht-residual, bewusst simpel + rerank-stark).
-  pq_.fit(data, pq_iters, seed + 1);
-  trained_ = true;
-  built_ = false;
-}
-
-void IvfPqIndex::build(const std::vector<Vector>& data) {
-  if (!trained_) throw std::logic_error("IvfPqIndex::build: train missing");
-  invlists_.assign(nlist_, {});
+  // Residuales PQ-Training (IVFADC): PQ auf (Daten - zugeordnetes
+  // Coarse-Zentroid) fitten. Zuordnung ueber volles N (exaktes Nearest),
+  // PQ-Subsampling passiert deterministisch in PqNQuantizer::fit (seed+1).
+  std::vector<Vector> residuals;
+  residuals.reserve(data.size());
   for (size_t i = 0; i < data.size(); ++i) {
     int best = 0;
     float bestd = std::numeric_limits<float>::infinity();
@@ -463,9 +497,35 @@ void IvfPqIndex::build(const std::vector<Vector>& data) {
         best = c;
       }
     }
+    Vector r(dim_);
+    for (int d = 0; d < dim_; ++d) r[d] = data[i][d] - coarse_[best][d];
+    residuals.push_back(std::move(r));
+  }
+  pq_.fit(residuals, pq_iters, seed + 1);
+  trained_ = true;
+  built_ = false;
+}
+
+void IvfPqIndex::build(const std::vector<Vector>& data) {
+  if (!trained_) throw std::logic_error("IvfPqIndex::build: train missing");
+  invlists_.assign(nlist_, {});
+  Vector resid(dim_);
+  for (size_t i = 0; i < data.size(); ++i) {
+    int best = 0;
+    float bestd = std::numeric_limits<float>::infinity();
+    for (int c = 0; c < nlist_; ++c) {
+      float d = sub_l2_squared(data[i].data(), coarse_[c].data(), dim_);
+      if (d < bestd) {
+        bestd = d;
+        best = c;
+      }
+    }
+    // Residual-Code speichern (Format-Wechsel: inkompatibel zu
+    // nicht-residualen Codes; in-memory, kein Persistenz-Format betroffen).
+    for (int d = 0; d < dim_; ++d) resid[d] = data[i][d] - coarse_[best][d];
     Posting p;
     p.id = static_cast<int>(i);
-    p.code = pq_.encode(data[i]);
+    p.code = pq_.encode(resid);
     invlists_[best].push_back(std::move(p));
   }
   ntotal_ = data.size();
@@ -506,14 +566,19 @@ std::vector<SearchHit> IvfPqIndex::search(
   if (nprobe <= 0) nprobe = 1;
   if (nprobe > nlist_) nprobe = nlist_;
   auto probes = pick_probes(query, nprobe);
-  auto table = pq_.build_adc_table(query);
+  // Residual-ADC: pro Sonde Tabelle aus (Query - Sonden-Zentroid), da Codes
+  // Residuen sind: ||q - (c + r)||^2 = ||(q - c) - r||^2.
   std::vector<std::pair<float, int>> scored;
   size_t total = 0;
   for (int c : probes) total += invlists_[c].size();
   scored.reserve(total);
-  for (int c : probes)
+  Vector rq(dim_);
+  for (int c : probes) {
+    for (int d = 0; d < dim_; ++d) rq[d] = query[d] - coarse_[c][d];
+    auto table = pq_.build_adc_table(rq);
     for (const auto& p : invlists_[c])
       scored.emplace_back(pq_.adc_with_table(table, p.code), p.id);
+  }
   int ef = std::min<int>(static_cast<int>(scored.size()), ef_rerank);
   if (ef < k) ef = std::min<int>(static_cast<int>(scored.size()), k);
   if (ef <= 0) return {};

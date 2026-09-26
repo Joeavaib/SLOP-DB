@@ -96,3 +96,27 @@ Netzwerk-Raft (nach V1).
 - WAL-CRC-Fehler im Log → Torn-Tail ist normal nach Kill -9, kein Bug solange
   Prefix-Replay greift.
 - Pager `uses_mmap=no` → `pread`-Fallback aktiv (Container ohne mmap), funktional ok.
+
+## 7. TLS-Sidecar (stunnel, optional)
+
+Der Server selbst spricht Klartext (Trust / Proxy-Vertrauen): TLS terminiert
+im Sidecar, der Server vertraut Connections von `127.0.0.1` / dem Sidecar
+weiter als Trust (kein eigenes TLS im Server in V1). Beispiel `stunnel.conf`:
+
+```ini
+[postgres]
+accept = 5433
+connect = 5432
+cert = /etc/stunnel/server.pem
+key = /etc/stunnel/server.key
+```
+
+Test via `psql` mit Pflicht-TLS:
+
+```sh
+psql "host=127.0.0.1 port=5433 sslmode=require" -c "SELECT 1;"
+```
+
+Warnung: ohne TLS (direkt auf Port 5432 oder Auth-Hook ohne Sidecar) laufen
+Auth-Daten im Klartext übers Netz — Auth-Hook nur mit TLS-Sidecar davor in
+nicht-vertrauenswürdigen Netzen betreiben.

@@ -47,3 +47,25 @@ spec:
         resources:
           requests:
             storage: 10Gi
+
+# TLS-Sidecar-Skizze (optional, alles auskommentiert — wird nicht deployed):
+# cert-Volume (Secret):
+#      volumes:
+#        - name: tls-cert
+#          secret:
+#            secretName: dbengine-tls
+# Sidecar-Container (stunnel: accept 5433 -> connect 5432):
+#      containers:
+#        - name: stunnel
+#          image: stunnel:5.71
+#          ports:
+#            - name: pgwire-tls
+#              containerPort: 5433
+#          volumeMounts:
+#            - name: tls-cert
+#              mountPath: /etc/stunnel
+#              readOnly: true
+# TLS-Service-Port (Skizze):
+#      ports:
+#        - name: pgwire-tls
+#          port: 5433

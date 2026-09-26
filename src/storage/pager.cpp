@@ -51,6 +51,50 @@ std::uint64_t decode_u64_le(const std::uint8_t* p) {
   return v;
 }
 
+bool is_all_zero(const std::uint8_t* p, std::size_t n) {
+  for (std::size_t i = 0; i < n; ++i) {
+    if (p[i] != 0) return false;
+  }
+  return true;
+}
+
+bool fsync_fd(int fd) {
+#ifdef __linux__
+  if (::fdatasync(fd) == 0) return true;
+#endif
+  return ::fsync(fd) == 0;
+}
+
+void fsync_dir_of(const std::string& path) {
+  // After rename(): dir-fsync so the rename itself is Kill -9 safe.
+  auto slash = path.find_last_of('/');
+  std::string dir = (slash == std::string::npos) ? "." : path.substr(0, slash);
+  if (dir.empty()) dir = ".";
+  int dfd = ::open(dir.c_str(), O_RDONLY
+#ifdef O_DIRECTORY
+                                     | O_DIRECTORY
+#endif
+  );
+  if (dfd < 0) return;  // best effort
+  (void)::fsync(dfd);
+  ::close(dfd);
+}
+
+bool pwrite_full(int fd, std::int64_t offset, const void* buf, std::size_t n) {
+  const auto* p = static_cast<const std::uint8_t*>(buf);
+  std::size_t done = 0;
+  while (done < n) {
+    ssize_t w =
+        ::pwrite(fd, p + done, n - done, static_cast<off_t>(offset + static_cast<std::int64_t>(done)));
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    done += static_cast<std::size_t>(w);
+  }
+  return true;
+}
+
 }  // namespace
 
 Pager::Pager(std::string path, std::size_t cache_capacity)
@@ -305,6 +349,18 @@ bool Pager::contains(std::uint64_t key) const {
 
 bool Pager::load_image() {
   entries_.clear();
+  image_dirty_ = false;
+  if (page_count_ < 1) return false;
+  // Validate header (magic/version/page_count); open() checked these too,
+  // but load_image must reject corrupt images on its own.
+  PageBuffer hdr{};
+  if (!read_exact(0, hdr.data(), kPageSize)) return false;
+  if (std::memcmp(hdr.data(), kMagic, 8) != 0) return false;
+  if (decode_u32_le(hdr.data() + 8) != kPagerFormatVersion) return false;
+  const std::uint32_t header_pages = decode_u32_le(hdr.data() + 12);
+  if (header_pages != 0 && header_pages > page_count_) {
+    return false;  // file shorter than header claims -> torn/truncated
+  }
   // Linear scan of the record stream starting at page 1.
   std::vector<std::uint8_t> stream;
   stream.reserve(static_cast<std::size_t>(page_count_ > 1 ? page_count_ - 1 : 0) * kPageSize);
@@ -312,48 +368,119 @@ bool Pager::load_image() {
   for (PageId p = 1; p < page_count_; ++p) {
     if (!read_exact(static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize), page.data(),
                     kPageSize)) {
+      entries_.clear();
       return false;
     }
     stream.insert(stream.end(), page.begin(), page.end());
   }
   std::size_t off = 0;
-  // First 4 bytes of stream can hold a record count hint; accept both
-  // hinted and unhinted images: try hinted, fall back to raw scan.
-  // MVP writer below writes raw records without hint, so scan raw.
-  while (off + 12 <= stream.size()) {
+  while (off < stream.size()) {
+    if (off + 12 > stream.size()) {
+      // Truncated record header: only clean if pure zero padding.
+      if (!is_all_zero(stream.data() + off, stream.size() - off)) {
+        entries_.clear();
+        return false;
+      }
+      off = stream.size();
+      break;
+    }
+    const std::size_t rec = off;
     const std::uint64_t key = decode_u64_le(stream.data() + off);
     const std::uint32_t len = decode_u32_le(stream.data() + off + 8);
+    if (len > kMaxValueBytes) {
+      // Padding tail is zeros; anything else is corruption, not EOF.
+      if (!is_all_zero(stream.data() + rec, stream.size() - rec)) {
+        entries_.clear();
+        return false;
+      }
+      off = stream.size();
+      break;
+    }
     off += 12;
-    if (len > kMaxValueBytes) break;  // padding / zero tail
-    if (off + len > stream.size()) break;
+    if (off + len > stream.size()) {
+      entries_.clear();
+      return false;  // torn payload: record claims more bytes than file
+    }
     // Zero-tail detection: a (0,0) record followed by all zeros ends stream.
     if (len == 0 && key == 0) {
-      bool rest_zero = true;
-      for (std::size_t i = off; i < stream.size(); ++i) {
-        if (stream[i] != 0) {
-          rest_zero = false;
-          break;
-        }
+      if (is_all_zero(stream.data() + off, stream.size() - off)) {
+        off = stream.size();  // consume zero padding -> clean EOF
+        break;
       }
-      if (rest_zero) break;
+      // Else: legitimate empty value for key 0 (or corrupt framing that
+      // will fail strictly below); record it and keep scanning.
     }
     entries_[key] = std::vector<std::uint8_t>(stream.begin() + static_cast<std::ptrdiff_t>(off),
                                               stream.begin() + static_cast<std::ptrdiff_t>(off + len));
     off += len;
+  }
+  if (off != stream.size()) {
+    entries_.clear();
+    return false;  // trailing garbage after last record -> corrupt, not EOF
   }
   image_dirty_ = false;
   return true;
 }
 
 bool Pager::store_image() {
+  // Atomic persist (Muster wal.cpp checkpoint): full new image into
+  // path_+".tmp", fsync, rename, dir-fsync, then fd_ reopen. A crash
+  // leaves the old or the new complete image, never a torn mix.
+  // insert/erase/flush call this followed by flush_raw_pages()+fsync(),
+  // so staged raw tail pages are written right after the rename.
+  auto drop_cached = [this](PageId id) {
+    cache_.erase(id);
+    for (auto it = lru_.begin(); it != lru_.end();) {
+      if (*it == id)
+        it = lru_.erase(it);
+      else
+        ++it;
+    }
+  };
+
   if (!image_dirty_) {
-    // Still need to reconcile header page_count with raw allocations.
+    // Reconcile header page_count with raw allocations. Fast path: header
+    // already current -> nothing to do (no observable rewrite).
     PageBuffer hdr{};
     if (!read_exact(0, hdr.data(), kPageSize)) return false;
     if (std::memcmp(hdr.data(), kMagic, 8) != 0) return false;
+    const std::uint32_t hp = decode_u32_le(hdr.data() + 12);
+    const std::uint32_t he = decode_u32_le(hdr.data() + 16);
+    if (hp == page_count_ && he == static_cast<std::uint32_t>(entries_.size())) return true;
     encode_u32_le(hdr.data() + 12, page_count_);
     encode_u32_le(hdr.data() + 16, static_cast<std::uint32_t>(entries_.size()));
-    if (!write_exact(0, hdr.data(), kPageSize)) return false;
+
+    // Copy current file verbatim (patched header page 0) through tmp.
+    const std::string tmp = path_ + ".tmp";
+    int tfd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (tfd < 0) return false;
+    bool ok = pwrite_full(tfd, 0, hdr.data(), kPageSize);
+    PageBuffer pg{};
+    for (PageId p = 1; ok && p < page_count_; ++p) {
+      if (!read_exact(static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize), pg.data(),
+                      kPageSize)) {
+        ok = false;
+        break;
+      }
+      ok = pwrite_full(tfd, static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize),
+                       pg.data(), kPageSize);
+    }
+    if (ok) ok = fsync_fd(tfd);
+    ::close(tfd);
+    if (!ok) {
+      ::unlink(tmp.c_str());
+      return false;
+    }
+    if (::rename(tmp.c_str(), path_.c_str()) != 0) {
+      ::unlink(tmp.c_str());
+      return false;
+    }
+    fsync_dir_of(path_);
+    drop_mmap();
+    ::close(fd_);
+    fd_ = ::open(path_.c_str(), O_RDWR);
+    if (fd_ < 0) return false;
+    drop_cached(0);  // header is authoritative
     return true;
   }
   // Serialize sorted entries (std::map iteration is sorted => clustered).
@@ -367,8 +494,6 @@ bool Pager::store_image() {
     // current count, zero the freed region instead.
     total = page_count_;
   }
-  const std::int64_t total_bytes = static_cast<std::int64_t>(total) * static_cast<std::int64_t>(kPageSize);
-  if (::ftruncate(fd_, total_bytes) != 0) return false;
 
   std::vector<std::uint8_t> stream(static_cast<std::size_t>(data_pages) * kPageSize, 0);
   std::size_t off = 0;
@@ -381,52 +506,54 @@ bool Pager::store_image() {
       off += v.size();
     }
   }
-  for (PageId p = 1; p <= data_pages; ++p) {
-    if (!write_exact(static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize),
-                     stream.data() + static_cast<std::size_t>(p - 1) * kPageSize, kPageSize)) {
-      return false;
-    }
-    // Keep LRU coherent: staged raw pages in the data region are
-    // superseded by the KV image.
-    cache_.erase(p);
-    for (auto it = lru_.begin(); it != lru_.end();) {
-      if (*it == p)
-        it = lru_.erase(it);
-      else
-        ++it;
-    }
-  }
-  if (total > data_pages + 1) {
-    // Zero tail pages beyond the image so a later load stops cleanly.
-    PageBuffer zero{};
-    zero.fill(0);
-    for (PageId p = data_pages + 1; p < total; ++p) {
-      auto it = cache_.find(p);
-      if (it != cache_.end() && it->second.second.dirty) continue;  // keep staged raw write
-      if (!write_exact(static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize), zero.data(),
-                       kPageSize)) {
-        return false;
-      }
-    }
-  }
 
-  page_count_ = total;
   PageBuffer hdr{};
   std::memcpy(hdr.data(), kMagic, 8);
   encode_u32_le(hdr.data() + 8, kPagerFormatVersion);
-  encode_u32_le(hdr.data() + 12, page_count_);
+  encode_u32_le(hdr.data() + 12, total);
   encode_u32_le(hdr.data() + 16, static_cast<std::uint32_t>(entries_.size()));
   encode_u32_le(hdr.data() + 20, 0);
-  if (!write_exact(0, hdr.data(), kPageSize)) return false;
 
-  // Header is authoritative; drop cached page 0 copy.
-  cache_.erase(0);
-  for (auto it = lru_.begin(); it != lru_.end();) {
-    if (*it == 0)
-      it = lru_.erase(it);
-    else
-      ++it;
+  const std::string tmp = path_ + ".tmp";
+  int tfd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (tfd < 0) return false;
+  bool ok = pwrite_full(tfd, 0, hdr.data(), kPageSize);
+  for (PageId p = 1; ok && p <= data_pages; ++p) {
+    ok = pwrite_full(tfd, static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize),
+                     stream.data() + static_cast<std::size_t>(p - 1) * kPageSize, kPageSize);
   }
+  if (ok && total > data_pages + 1) {
+    // Zero tail pages beyond the image so a later load stops cleanly.
+    // Dirty staged raw tail pages get zeros here; flush_raw_pages()
+    // (caller, right after rename) writes their real content.
+    PageBuffer zero{};
+    zero.fill(0);
+    for (PageId p = data_pages + 1; ok && p < total; ++p) {
+      ok = pwrite_full(tfd, static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize),
+                       zero.data(), kPageSize);
+    }
+  }
+  if (ok) ok = fsync_fd(tfd);
+  ::close(tfd);
+  if (!ok) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  if (::rename(tmp.c_str(), path_.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  fsync_dir_of(path_);
+  // Reopen: old fd still points at the pre-rename inode.
+  drop_mmap();
+  ::close(fd_);
+  fd_ = ::open(path_.c_str(), O_RDWR);
+  if (fd_ < 0) return false;
+
+  page_count_ = total;
+  // Keep LRU coherent: staged raw pages in the data region are
+  // superseded by the KV image; header is authoritative.
+  for (PageId p = 0; p <= data_pages; ++p) drop_cached(p);
   image_dirty_ = false;
   return true;
 }

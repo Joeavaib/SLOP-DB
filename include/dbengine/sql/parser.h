@@ -7,8 +7,14 @@
 //                                   c DOUBLE|FLOAT|REAL, d BOOL|BOOLEAN,
 //                                   j JSONB)
 //   INSERT INTO t [(cols)] VALUES (v, ...), (...), ...
-//   SELECT [* | col, ... | COUNT(*)] FROM t [WHERE cond [AND cond ...]]
-//     cond := col (=|<>|!=|<|<=|>|>=) literal | col LIKE 'pat' | col ILIKE 'pat'
+//   SELECT [* | col [AS alias], ... | COUNT(*)] FROM t
+//     [WHERE disj [OR disj ...]] [GROUP BY <cols>] [ORDER BY o [ASC|DESC]
+//     [NULLS FIRST|LAST], ...] [LIMIT n|ALL] [OFFSET n]
+//     disj  := cond [AND cond ...]              (AND bindet staerker als OR)
+//     cond  := col (=|<>|!=|<|<=|>|>=) literal | col LIKE 'pat' | col ILIKE 'pat'
+//            | col NOT LIKE 'pat' | col NOT ILIKE 'pat'
+//            | col [NOT] BETWEEN a AND b | col [NOT] IN (v, ...)
+//            | col IS [NOT] NULL
 //   Skalar-Aggregate (s39, ohne GROUP BY): SUM/AVG/MIN/MAX/COUNT(col|*),
 //     Arg = Spalte oder binaerer */+-Ausdruck, z.B. SUM(price*(1-disc)).
 //   GROUP BY (s43): SELECT <group-cols>, AGG(..) [AS alias], ... FROM t
@@ -17,8 +23,12 @@
 //     1-Zeilen-Semantik der Skalar-Aggregate bestehen.
 // Literale: INT, FLOAT, 'string' ('' = escape), NULL, TRUE/FALSE,
 //           JSONB als Text-Literal ('{"a":1}'::jsonb wird als Text genommen).
-// V2-Luecken (bewusst): Joins, ORDER BY/LIMIT, UPDATE/DELETE, Indexe, Typcheck
-// streng, Prepared Statements / Extended Protocol.
+// ORDER BY-Referenzen: Ausgabe-Spalte/Alias, (gruppierte) Tabellenspalte,
+// Aggregat-Ausdruck oder 1-basiertes Positions-Ordinal (PG). Sortierung +
+// LIMIT/OFFSET werden nach Filter/Gruppierung/Aggregation angewendet.
+// NULL-Platzierung PG-konform (Default ASC->NULLS LAST, DESC->NULLS FIRST).
+// V2-Luecken (bewusst): Joins, UPDATE/DELETE, Indexe, Typcheck streng,
+// Prepared Statements / Extended Protocol.
 
 #include <cstdint>
 #include <map>
@@ -67,8 +77,12 @@ struct InsertStmt {
 
 struct Condition {
   std::string column;
-  std::string op;  // "=", "<>", "!=", "<", "<=", ">", ">=", "LIKE", "ILIKE"
-  Value value;
+  std::string op;  // "=", "<>", "<", "<=", ">", ">=", "LIKE", "ILIKE",
+                   // "NOT LIKE", "NOT ILIKE", "IS NULL", "IS NOT NULL",
+                   // "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"
+  Value value;              // Einzel-Literal bzw. BETWEEN-Untergrenze
+  Value second;             // BETWEEN-Obergrenze (sonst NULL)
+  std::vector<Value> list;  // IN-Wertliste (sonst leer)
 };
 
 // Arithmetischer Ausdruck als Aggregat-Argument (Q6): Spalte | Literal |
@@ -101,6 +115,21 @@ struct SelectItem {
   std::size_t index = 0;  // Position in aggregates bzw. columns
 };
 
+// ORDER BY-Item: Spalte/Alias (column, lower-gefoldet) | Aggregat-Ausdruck
+// (is_agg, z.B. SUM(x)) | Positions-Ordinal (is_ordinal, 1-basiert auf die
+// Ausgabe-Spalten). Richtung je Item (desc), NULL-Platzierung effektiv in
+// nulls_first (Default aus desc, explizit via NULLS FIRST/LAST).
+struct OrderByItem {
+  bool is_agg = false;
+  Aggregate agg;      // gueltig wenn is_agg
+  std::string column;  // gueltig wenn !is_agg && !is_ordinal
+  bool is_ordinal = false;
+  int64_t ordinal = 0;  // 1-basiert, wenn is_ordinal
+  bool desc = false;
+  bool has_nulls = false;    // explizites NULLS FIRST/LAST angegeben
+  bool nulls_first = false;  // effektiv (Default: desc)
+};
+
 struct SelectStmt {
   std::string table;
   std::vector<std::string> columns;  // leer + select_all = "*"
@@ -108,9 +137,17 @@ struct SelectStmt {
   bool select_all = true;
   bool count_star = false;  // legacy: alleiniges COUNT(*) (Verhalten fixiert)
   std::vector<Aggregate> aggregates;  // nicht-leer => skalares Aggregat ohne GROUP BY
-  std::vector<Condition> where;  // AND-verknuepft
+  std::vector<Condition> where;  // AND-verknuepft; bei OR leer (s. where_groups)
+  // DNF bei OR: Disjunktion von Konjunktionen. Leer = kein OR (where gilt).
+  // Nicht-leer = where ist leer und diese Gruppen gelten (OR dazwischen).
+  std::vector<std::vector<Condition>> where_groups;
   std::vector<std::string> group_by;  // leer = keine Gruppierung (1..n Spalten)
   std::vector<SelectItem> items;  // Projektionsreihenfolge (leer = legacy-Pfad)
+  std::vector<OrderByItem> order_by;  // leer = unsortiert (Einfuege-/First-Seen-Reihenfolge)
+  bool has_limit = false;
+  int64_t limit = 0;  // >= 0 (negativ -> SqlError)
+  bool has_offset = false;
+  int64_t offset = 0;  // >= 0 (negativ -> SqlError)
 };
 
 using Statement =

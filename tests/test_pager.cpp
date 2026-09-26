@@ -15,9 +15,13 @@
 // Pager tests: write+read roundtrip + restart persistence (single-file).
 
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <unistd.h>
 
 #include "dbengine/storage/pager.h"
 
@@ -144,6 +148,58 @@ int main() {
     std::array<std::uint8_t, dbengine::storage::kPageSize> r{};
     check(pager.read_page(id, r) && r == w, "read_page roundtrip");
     pager.close();
+    std::remove(path.c_str());
+  }
+
+  std::cout << "[pager] torn image detected (shorten + garbage)\n";
+  {
+    const std::string path = tmp_path("dbengine_pager_torn.db");
+    {
+      Pager pager(path);
+      check(pager.open(), "open (torn setup)");
+      check(pager.insert(1, "one"), "insert torn-1");
+      check(pager.insert(2, "two"), "insert torn-2");
+      for (std::uint64_t i = 3; i < 50; ++i) {
+        if (!pager.insert(i, "value-" + std::to_string(i))) {
+          check(false, "insert torn bulk");
+          break;
+        }
+      }
+      check(pager.flush(), "flush torn setup");
+      pager.close();
+    }
+    {
+      // Sanity: uncorrupted image reopens cleanly.
+      Pager pager(path);
+      check(pager.open(), "reopen clean before corruption");
+      std::string v;
+      check(pager.find(1, v) && v == "one", "clean image intact");
+      pager.close();
+    }
+    {
+      // Corrupt: shorten the data region, append garbage, pad back to a
+      // page multiple so the size check passes and load_image() must judge.
+      const std::size_t ps = dbengine::storage::kPageSize;
+      int fd = ::open(path.c_str(), O_RDWR);
+      check(fd >= 0, "open raw file for corruption");
+      if (fd >= 0) {
+        check(::ftruncate(fd, static_cast<off_t>(ps) + 5) == 0, "shorten data region");
+        std::uint8_t garbage[64];
+        std::memset(garbage, 0xAB, sizeof(garbage));
+        ssize_t w = ::pwrite(fd, garbage, sizeof(garbage), static_cast<off_t>(ps) + 5);
+        check(w == static_cast<ssize_t>(sizeof(garbage)), "append garbage");
+        check(::ftruncate(fd, static_cast<off_t>(2 * ps)) == 0, "pad to page multiple");
+        check(std::filesystem::file_size(path) % ps == 0, "corrupt size still page-aligned");
+        ::fsync(fd);
+        ::close(fd);
+      }
+    }
+    {
+      // Must report an error, not silently expose partial records.
+      Pager pager(path);
+      check(!pager.open(), "torn image: open fails instead of partial data");
+      pager.close();
+    }
     std::remove(path.c_str());
   }
 

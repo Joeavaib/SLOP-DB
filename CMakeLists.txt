@@ -22,6 +22,9 @@ add_test(NAME smoke COMMAND smoke)
 add_library(sql STATIC src/sql/parser.cpp src/server/pgwire.cpp)
 target_include_directories(sql PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(sql PRIVATE -Wall -Wextra -Wpedantic)
+# Workaround GCC-16.2-ICE (Segfault in parseCondition bei -O2, s48):
+# Parser ist kein Hot Path (Scan kostet), daher -O1 nur fuer diese TU.
+set_source_files_properties(src/sql/parser.cpp PROPERTIES COMPILE_OPTIONS -O1)
 
 add_executable(test_sql tests/test_sql.cpp)
 target_link_libraries(test_sql PRIVATE sql)

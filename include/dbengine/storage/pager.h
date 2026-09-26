@@ -111,7 +111,21 @@ class Pager {
     bool dirty = false;
   };
 
+  // Strict loader, caller holds mutex_.
+  // Validates page-0 magic/version and the record stream (pages 1..N).
+  // Returns true only for a fully valid image (trailing bytes must be
+  // zero padding). Returns false on corrupt/torn input (bad magic or
+  // version, header page_count exceeding the file, truncated record
+  // header/payload, impossible value length, trailing garbage, or I/O
+  // error). On false, entries_ is left empty: never silently exposes
+  // partial data; callers (open) treat false as open failure.
   bool load_image();
+  // Atomically persists the KV image (crash-safe):
+  // serializes into path+".tmp", fsyncs the tmp file, renames it over
+  // path_, then dir-fsyncs the parent directory (pattern from wal.cpp).
+  // After a crash the file is either the old or the new complete image,
+  // never a torn mix. Returns false on I/O error (old image untouched
+  // until a successful rename).
   bool store_image();
   bool ensure_mmap();
   void drop_mmap();

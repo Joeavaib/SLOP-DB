@@ -11,7 +11,9 @@
 //   Nicht-Q/X (Extended/COPY) -> E(0A000)/Z, unveraendert.
 
 #include <atomic>
+#include <map>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #include "dbengine/kv.h"
@@ -36,6 +38,18 @@ class PgServer {
   int port() const { return port_; }
   bool running() const;
 
+  // Auth-Hook (opt-in, default: Trust-All wie bisher).
+  //   setAuth({{user, pass}, ...}) hinterlegt Cleartext-Passwoerter.
+  //   setAuthRequired(true) aktiviert den Check, false (Default) = Trust-All:
+  //     Startup -> R(0 AuthOk) + Z (exakt heutiges Verhalten, keine 'p'-Runde).
+  //   Wenn required: Startup -> R(3 Cleartext) -> lese PasswordMessage ('p')
+  //     -> bei Match R(0) + weiter wie bisher, sonst E FATAL 28P01 + close.
+  //   SICHERHEIT: Cleartext-Passwort ohne TLS ist mitlesbar (PG-Protokoll).
+  //     Nur mit Sidecar-TLS (z.B. stunnel gegen 127.0.0.1-Bind) nutzen,
+  //     nie direkt auf untrusted Netz binden. Kein Hashing/SASL in V1.
+  void setAuth(const std::map<std::string, std::string>& users);
+  void setAuthRequired(bool required = false);
+
  private:
   void acceptLoop();
   void handleConn(int fd);
@@ -51,6 +65,11 @@ class PgServer {
   txn::MvccStore mvcc_;
   sql::Executor executor_;
   std::mutex execMu_;
+  // Auth-Config (V1: Cleartext-Map + Flag, Default Trust-All).
+  // Wird pro Connection unter authMu_ kopiert (handleConn-Threads).
+  std::mutex authMu_;
+  std::map<std::string, std::string> authUsers_;
+  bool authRequired_ = false;
 };
 
 }  // namespace dbengine::pgserver

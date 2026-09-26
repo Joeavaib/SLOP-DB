@@ -89,6 +89,9 @@ class PqQuantizer {
 // Abwaertskompatibel: PqQuantizer (M=2 fix) bleibt erhalten. Neu: PqNQuantizer
 // mit M=1..32 (empfohlen 2/4/8/16), echten ADC-Lookup-Tabellen
 // (build_adc_table pro Query, O(M*256*subdim)), deterministischem k-means.
+// Sample-Regel: fit nutzt min(N, max(2048, N/10)) Samples (deterministisch
+// via seed geshuffelt); alte Aufrufe ohne explizite Sample-Zahl profitieren
+// automatisch (kleine N: alles; grosse N: 10 % statt fix 2048).
 class PqNQuantizer {
  public:
   static constexpr int kCentroids = 256;
@@ -127,32 +130,60 @@ class PqNQuantizer {
   bool fitted_ = false;
 };
 
-// --- IVF-Coarse + PQ + Re-Rank (IVFADC-light, ohne Residual-Training) --------
-// Coarse-Quantizer: k-means ueber volle Vektoren (nlist Centroide).
-// Inverted Lists: pro Coarse-Zelle alle (id, pq-code).
-// Suche: nprobe naechste Zellen -> ADC-Score via PQ-Tabelle -> Top-ef_rerank
-// -> exaktes Re-Rank mit float32. Deterministisch (seed), STL-only.
+// --- IVF-Coarse + Residual-PQ + Re-Rank (IVFADC-light) ----------------------
+// Coarse-Quantizer: k-means ueber volle Vektoren (nlist Centroide,
+// Sample-Regel min(N, max(2048, N/10)), deterministisch via seed).
+// Residual-PQ: PQ wird auf Residuen (Daten - zugeordnetes Coarse-Zentroid)
+// trainiert; inverted lists speichern pro Posting den Residual-Code.
+// Suche: nprobe naechste Zellen -> pro Sonde ADC-Tabelle aus
+// (Query - Sonden-Zentroid) -> Top-ef_rerank -> exaktes Re-Rank mit float32.
+// Deterministisch (seed), STL-only.
+//
+// FORMAT-WECHSEL (Codes inkompatibel zu frueheren nicht-residualen Codes):
+// Vorher: pq_.encode(vollvektor); Tabelle aus Query. Jetzt: pq_.encode(v -
+// coarse[assign(v)]); Tabelle aus (query - coarse[sonde]). Alte Codes duerfen
+// NICHT wiederverwendet werden (neu train()+build() noetig). Kein
+// Persistenz-Format betroffen: Index ist in-memory (kein File-Layout,
+// anders als DiskSpill); nur train/build/search muessen zusammenpassen.
+// PqNQuantizer::decode(code) liefert daher eine Residual-Rekonstruktion
+// (Vollvektor = coarse + decode), kein Vollvektor direkt.
 class IvfPqIndex {
  public:
   struct Posting {
     int id = -1;
-    std::vector<uint8_t> code;
+    std::vector<uint8_t> code;  // Residual-Code (s. Format-Wechsel oben)
   };
+
+  // Default-Parameter (Faustregeln, dokumentiert):
+  //   nlist  ~= 4*sqrt(N), gedeckelt auf [1, 4096] und <= N (N>=1).
+  //   nprobe ~= nlist/8 (aufgerundet, mind. 1, max. nlist).
+  // Hoeherer Recall-Bedarf -> nprobe groesser waehlen (z.B. nlist/4 bis
+  // nlist/2); nprobe=nlist = Vollscan aller Listen (exaktes Re-Rank dominiert).
+  struct IvfDefaults {
+    int nlist = 0;
+    int nprobe = 0;
+  };
+  static int default_nlist(size_t n);
+  static int default_nprobe(int nlist);
+  static IvfDefaults autotune(size_t n);
 
   IvfPqIndex() = default;
   IvfPqIndex(int dim, int num_subspaces, int nlist)
       : dim_(dim), nlist_(nlist), pq_(dim, num_subspaces) {}
 
-  // Trainiert coarse (k-means, iters) + PQ auf data. Danach build().
+  // Trainiert coarse (k-means, iters, Sample-Regel min(N, max(2048, N/10)))
+  // + Residual-PQ auf (Daten - zugeordnetes Coarse-Zentroid). Danach build().
   void train(const std::vector<Vector>& data, int coarse_iters = 10,
              int pq_iters = 8, unsigned seed = 42u);
-  // Baut inverted lists aus data (IDs = Position). Braucht train() vorher.
+  // Baut inverted lists aus data (IDs = Position, Codes = Residuen).
+  // Braucht train() vorher.
   void build(const std::vector<Vector>& data);
   [[nodiscard]] bool trained() const { return trained_; }
   [[nodiscard]] size_t size() const { return ntotal_; }
   [[nodiscard]] int nlist() const { return nlist_; }
 
-  // Suche: nprobe Zellen, ADC-Coarse, Re-Rank exakt auf ef_rerank.
+  // Suche: nprobe Zellen, ADC-Coarse auf Residual-Tabellen
+  // (Query - Sonden-Zentroid), Re-Rank exakt auf ef_rerank.
   // base_data: volle Vektoren fuer Re-Rank (muss zu build()-IDs passen).
   [[nodiscard]] std::vector<SearchHit> search(
       const Vector& query, const std::vector<Vector>& base_data, int k,
