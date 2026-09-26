@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine V1 (embedded-first): Postgres-kompatibler Row-Kern (B+Tree, WAL, MVCC Snapshot), filterbarer Vektor-Index (HNSW-basic + BM25 Hybrid-vorbereitet), Columnar Parquet-Tiering vorbereitet, Single-Binary Zero-Ops, Apache-2.0. Kein Distributed Global in V1."
+  statement: "C++ DB Engine V2 (echt): mehrschichtiger filterbarer HNSW, PQ-N + ADC + IVF-Coarse, WAL Gruppencommit + LSN-Wait/CDC, Columnar File+Merge+Compaction, Raft-TCP-Transport + persistentes Log + Snapshots. STL-only, Apache-2.0."
   profile: feature
 oracles:
   - kind: test
@@ -173,3 +173,50 @@ steps:
       - docs/RUNBOOK.md
       - docs/SBOM.md
       - k8s/statefulset.yaml
+  - id: s21-hnsw
+    title: s21-hnsw
+    paths:
+      - src/vector/hnsw.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R vector --output-on-failure
+    engine: implement
+    want: "Echter mehrschichtiger HNSW: Level-Sampling (mL), Entry-Point, efConstruction, M/Mmax getrennt, inkrementelles Insert ohne O(N2)-Rebuild, filterbar, Recall@10>0.95 vs brute_force"
+  - id: s22-pqadc
+    title: s22-pqadc
+    paths:
+      - src/vector/quant.cpp
+      - include/dbengine/vector/quant.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R quant --output-on-failure
+    engine: implement
+    want: "PQ-N echt + IVF-Coarse: konfigurierbare Subspaces (N=2/4/8/16), k-means fit deterministisch, ADC-Lookup-Tabellen, IVF-Coarse mit nlist/probes + Re-Rank, Recall/Latenz-Bench"
+  - id: s23-walgroup
+    title: s23-walgroup
+    paths:
+      - src/storage/wal.cpp
+      - include/dbengine/storage/wal.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R wal --output-on-failure
+    engine: implement
+    want: "WAL Gruppencommit echt: append-Queue + Group-Commit-Flusher (Batch-fsync), WAIT FOR LSN (wait_for_lsn mit Timeout), CDC-Slots (subscribe/ab LSN replay), Crash-Safety nach flush erhalten"
+  - id: s24-colfile
+    title: s24-colfile
+    paths:
+      - src/columnar/store.cpp
+      - include/dbengine/columnar/store.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R columnar --output-on-failure
+    engine: implement
+    want: "Columnar File+Merge echt: persistentes Part-File (Header+Chunks+RLE/Dict), Load/Save, Merge/Compaction (sorted merge + Zonemaps), vektorierter Scan mit Pruning, S3-Stage weiter Stub-frei dokumentiert"
+  - id: s25-raftnet
+    title: s25-raftnet
+    paths:
+      - src/raft/shard.cpp
+      - include/dbengine/raft/shard.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R raft --output-on-failure
+    engine: implement
+    want: "Raft-Transport echt: TCP-Framing (len-prefixed Entry-Replikation), persistentes Log (Datei + Replay), Snapshots (State-Machine dump/load), Follower-Reads (read_index light), Split/Merge vorbereitet"
+  - id: s26-docsv2
+    title: s26-docsv2
+    paths:
+      - docs/ARCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "Doku V2: ARCH.md ergaenzt Mehrschicht-HNSW, PQ-N+IVF, WAL Group-Commit/LSN-Wait/CDC, COL1-File+Merge/Compact, Raft-TCP/Log/Snapshot/Split; stalen V1-Grenzen-Abschnitt korrigiert"
