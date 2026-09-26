@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 12 (production): TPC-H-Harness Q1/Q6, DDL UPDATE/DELETE/DROP, paralleler HNSW-Build, Extended-Protokoll minimal, Runbook-Ops. Alles verifiziert."
+  statement: "C++ DB Engine Welle 13 (production): Subqueries (IN/scalar), natives TLS optional (OpenSSL, default aus), Raft-Timer (Heartbeat/Wahl-Timeout), paralleler Columnar-Scan, Doku. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -511,3 +511,45 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
     engine: implement
     want: "Runbook-Ops: Backup/Restore-, Metrics- und Auth-Anleitungen mit Kommandos, K8s Monitor-Annotations, Guard-Keywords erhalten"
+  - id: s63-subquery
+    title: s63-subquery
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+      - src/sql/executor.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "Subqueries: IN (SELECT ...) + skalare = (SELECT ...) mit Single-Row-Check, korreliert explizit Fehler, alte Tests gruene"
+  - id: s64-tlsnative
+    title: s64-tlsnative
+    paths:
+      - src/server/pgserver.cpp
+      - include/dbengine/server/pgserver.h
+      - src/server/pgwire.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
+    engine: implement
+    want: "Natives TLS optional: OpenSSL nur via find_package (Default aus, STL-only erhalten), SSLRequest->S + Handshake bei Zert-Config, sonst N wie bisher, alte Tests gruene"
+  - id: s65-rafttimer
+    title: s65-rafttimer
+    paths:
+      - src/raft/shard.cpp
+      - include/dbengine/raft/shard.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R raft --output-on-failure
+    engine: implement
+    want: "Raft-Timer: Heartbeat- + Wahl-Timeout-Steuerung in-process (Leader sendet Heartbeats, Follower starten Wahl bei Timeout), deterministisch per Fake-Clock testbar, alte Tests gruene"
+  - id: s66-colpar
+    title: s66-colpar
+    paths:
+      - src/columnar/store.cpp
+      - include/dbengine/columnar/store.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R columnar --output-on-failure
+    engine: implement
+    want: "Paralleler Columnar-Scan: Morsel-Parallelismus ueber Parts (std::thread, deterministische Summen), Single-Fallback, alte Tests gruene"
+  - id: s67-docs1213
+    title: s67-docs1213
+    paths:
+      - docs/ARCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "ARCH-Update Welle 11-12: JOIN/DDL/Subquery-Stand, Extended/Auth/TLS, Backup/Metrics/Runbook, Pager-Atomar, IVF, TPC-H-Zahlen; stale Aussagen korrigiert"
