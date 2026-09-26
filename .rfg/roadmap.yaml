@@ -600,3 +600,13 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R dbfile --output-on-failure
     engine: implement
     want: "Single-File-Container: Db::open(foo.db) mit Header+Regionen+Recovery (create/open, Magic/Version, tmp+rename-Init), eigene Test-Suite dbfile"
+  - id: s73-btreekv
+    title: s73-btreekv
+    paths:
+      - src/kv/btree.cpp
+      - include/dbengine/kv/btree.h
+      - tests/test_btree.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ctest --test-dir build -R btreekv --output-on-failure
+    engine: implement
+    want: "Pager-B-Tree-KV: geordnete Put/Get/Delete/Scan/Iterator persistent auf Pager-Pages (Split/Merge), Crash-Reopen konsistent, eigene Suite btreekv"
