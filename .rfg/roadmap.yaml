@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine V2 (echt): mehrschichtiger filterbarer HNSW, PQ-N + ADC + IVF-Coarse, WAL Gruppencommit + LSN-Wait/CDC, Columnar File+Merge+Compaction, Raft-TCP-Transport + persistentes Log + Snapshots. STL-only, Apache-2.0."
+  statement: "C++ DB Engine Welle 4 (korrekt): Adversary-Luecken schliessen (Columnar-Active-Persistenz, Raft Snapshot/Phantom/Autosave, Executor Snapshot-Reads, Chaos-Abdeckung, RUNBOOK-Wahrheit), alle 21 Tests + Jury gruen, danach fairer Konkurrenz-Vergleich."
   profile: feature
 oracles:
   - kind: test
@@ -220,3 +220,83 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
     engine: implement
     want: "Doku V2: ARCH.md ergaenzt Mehrschicht-HNSW, PQ-N+IVF, WAL Group-Commit/LSN-Wait/CDC, COL1-File+Merge/Compact, Raft-TCP/Log/Snapshot/Split; stalen V1-Grenzen-Abschnitt korrigiert"
+  - id: s27-colpersist
+    title: s27-colpersist
+    paths:
+      - src/columnar/store.cpp
+      - include/dbengine/columnar/store.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R columnar --output-on-failure
+    engine: implement
+    want: "Columnar-Crashfix: Save persistiert aktiven Part (Load stellt ihn unsealed wieder her, TotalRows erhalten), tmp+rename+fsync fuer Parts+Manifest (Manifest zuletzt), alte Export-API unveraendert"
+  - id: s28-raftcorrect
+    title: s28-raftcorrect
+    paths:
+      - src/raft/shard.cpp
+      - include/dbengine/raft/shard.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R raft --output-on-failure
+    engine: implement
+    want: "Raft-Korrektheit: LoadSnapshot setzt last_applied=last_idx und replayt Tail (kein Commit-Verlust), LoadLog resettet State-Machine (keine Phantoms), opt-in Autosave-Pfad, tmp+rename+fsync Saves"
+  - id: s29-execmvcc
+    title: s29-execmvcc
+    paths:
+      - src/sql/executor.cpp
+      - include/dbengine/sql/executor.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R executor --output-on-failure
+    engine: implement
+    want: "Executor Snapshot-Reads: SELECT ohne MVCC-Commit unsichtbar (kein KV-Fallback-Dirty-Read), recover() zaehlt Skips, next_rowid aus Max-Suffix, alte Tests gruene"
+  - id: s30-chaoswide
+    title: s30-chaoswide
+    paths:
+      - tests/test_chaos.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R chaos --output-on-failure
+    engine: implement
+    want: "Chaos-Abdeckung: WAL checkpoint/CDC/wait_for_lsn interleaved im Fuzz (KV+WAL-Link beibehalten), deterministisch Seed 42, Verlust 0"
+  - id: s31-runbook
+    title: s31-runbook
+    paths:
+      - docs/RUNBOOK.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "RUNBOOK-Wahrheit: Kill-9-Absatz mit flush-Vorbehalt, Raft/Columnar-Persistenzgrenzen dokumentiert, docs-Guard Keywords erhalten"
+  - id: s32-simd
+    title: s32-simd
+    paths:
+      - src/vector/hnsw.cpp
+      - src/vector/quant.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: SIMD-Distanzkerne (AVX2-Runtime-Dispatch + skalarer Fallback) fuer L2/Cosine in HNSW+Quant, Bit-identische Rankings, Recall unveraendert, deutlich schneller
+  - id: s33-walfast
+    title: s33-walfast
+    paths:
+      - src/storage/wal.cpp
+      - src/kv/kv.cpp
+      - include/dbengine/storage/wal.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"wal|kv|chaos\" --output-on-failure"
+    engine: implement
+    want: "WAL/KV-Durchsatz: ein writev pro Record, weniger Kopien/Allokationen im Append-Pfad, Semantik (LSN/durable/Checkpoint) unveraendert"
+  - id: s34-hnswperf
+    title: s34-hnswperf
+    paths:
+      - src/vector/hnsw.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: "HNSW-Overhead runter: Build ohne Distanz-Rescans (Scores wiederverwenden, Shrink frequenz-/kostenguenstig), Suche ohne Per-Query-Allokationsflut, Recall >= Stand, Latenz/Build deutlich schneller"
+  - id: s35-hnswsmart
+    title: s35-hnswsmart
+    paths:
+      - src/vector/hnsw.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: "Suchpfad-Effizienz: diversifizierte Nachbar-Heuristik (besserer Graph), weniger Seeds/Beam bei gleichem Recall, Latenz runter ohne Recall-Verlust"
+  - id: s36-hnswentry
+    title: s36-hnswentry
+    paths:
+      - src/vector/hnsw.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: "Entry-Diversifizierung: Multi-Start-Descent ueber obere Layer (deterministisch), Queries entkommen falschem Cluster, uniform-Recall >= Stand, clustered-Recall hoch"

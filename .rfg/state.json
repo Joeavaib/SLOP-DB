@@ -25,7 +25,17 @@
     "s23-walgroup",
     "s24-colfile",
     "s25-raftnet",
-    "s26-docsv2"
+    "s26-docsv2",
+    "s27-colpersist",
+    "s28-raftcorrect",
+    "s29-execmvcc",
+    "s30-chaoswide",
+    "s31-runbook",
+    "s32-simd",
+    "s33-walfast",
+    "s34-hnswperf",
+    "s35-hnswsmart",
+    "s36-hnswentry"
   ],
   "verified": [
     "s07-index",
@@ -53,16 +63,26 @@
     "s23-walgroup",
     "s24-colfile",
     "s25-raftnet",
-    "s26-docsv2"
+    "s26-docsv2",
+    "s27-colpersist",
+    "s28-raftcorrect",
+    "s29-execmvcc",
+    "s30-chaoswide",
+    "s31-runbook",
+    "s32-simd",
+    "s33-walfast",
+    "s34-hnswperf",
+    "s35-hnswsmart",
+    "s36-hnswentry"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s26-docsv2-1790382395",
-    "step_id": "s26-docsv2",
-    "commit": "e083dfaf320b2993ef720e1ad71611dc8883ade1",
+    "id": "cp-s36-hnswentry-1790387539",
+    "step_id": "s36-hnswentry",
+    "commit": "0dc1a0ce0deda89c256f8b4aba3e1ba0617b52f9",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-26T00:26:35.667248+00:00"
+    "created_at": "2026-09-26T01:52:19.227510+00:00"
   },
   "checkpoints": [
     {
@@ -183,6 +203,76 @@
       "commit": "e083dfaf320b2993ef720e1ad71611dc8883ade1",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-26T00:26:35.667248+00:00"
+    },
+    {
+      "id": "cp-s27-colpersist-1790384932",
+      "step_id": "s27-colpersist",
+      "commit": "69410efd4e8c6cc5cd05a7206c9cb00425398c25",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:08:52.851058+00:00"
+    },
+    {
+      "id": "cp-s28-raftcorrect-1790384939",
+      "step_id": "s28-raftcorrect",
+      "commit": "83c07329d5d04fd0ff29f984b47f045d0bccc8f0",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:08:59.946053+00:00"
+    },
+    {
+      "id": "cp-s29-execmvcc-1790384946",
+      "step_id": "s29-execmvcc",
+      "commit": "431b32eb2cf2db10712e88cf3b352f1684254430",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:09:06.674193+00:00"
+    },
+    {
+      "id": "cp-s30-chaoswide-1790384952",
+      "step_id": "s30-chaoswide",
+      "commit": "d2bff57b6bff2fb69cb5bf568ba0d67259129edd",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:09:12.992804+00:00"
+    },
+    {
+      "id": "cp-s31-runbook-1790384962",
+      "step_id": "s31-runbook",
+      "commit": "a155242c5ea8c2b23241ea9d76acec754d9a693b",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:09:22.360583+00:00"
+    },
+    {
+      "id": "cp-s32-simd-1790385391",
+      "step_id": "s32-simd",
+      "commit": "f98e580d5a4be6d501604e1c31cbd39b48ed9dbc",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:16:31.096361+00:00"
+    },
+    {
+      "id": "cp-s33-walfast-1790385402",
+      "step_id": "s33-walfast",
+      "commit": "627fa2fbbebd1461dc6077b47ebd9d291b6503bf",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:16:42.206971+00:00"
+    },
+    {
+      "id": "cp-s34-hnswperf-1790386654",
+      "step_id": "s34-hnswperf",
+      "commit": "91bde79b29251bb1ad957142de4d672c7fc79fdc",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:37:34.225177+00:00"
+    },
+    {
+      "id": "cp-s35-hnswsmart-1790387095",
+      "step_id": "s35-hnswsmart",
+      "commit": "856f252176051258834e06a1a007eb2cea6ebb49",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:44:55.453225+00:00"
+    },
+    {
+      "id": "cp-s36-hnswentry-1790387539",
+      "step_id": "s36-hnswentry",
+      "commit": "0dc1a0ce0deda89c256f8b4aba3e1ba0617b52f9",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T01:52:19.227510+00:00"
     }
   ],
   "claim_step": "",
