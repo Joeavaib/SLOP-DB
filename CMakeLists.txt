@@ -9,6 +9,7 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 
 add_executable(dbengine src/main.cpp)
 target_include_directories(dbengine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dbengine PRIVATE dblib executor)
 
 enable_testing()
 
