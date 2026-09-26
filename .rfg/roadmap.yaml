@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 4 (korrekt): Adversary-Luecken schliessen (Columnar-Active-Persistenz, Raft Snapshot/Phantom/Autosave, Executor Snapshot-Reads, Chaos-Abdeckung, RUNBOOK-Wahrheit), alle 21 Tests + Jury gruen, danach fairer Konkurrenz-Vergleich."
+  statement: "C++ DB Engine Welle 8 (production-naeher): NVMe-Bench, Skalar-Aggregate (Q6 gruen), symmetrische Shrink-Heuristik, PGWire-Session echt, Metrics-Endpoint. Alles verifiziert, keine Regressionen."
   profile: feature
 oracles:
   - kind: test
@@ -308,3 +308,44 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
     engine: implement
     want: "Cross-Cluster-Kanten beim Insert: deterministische Spread-Probes ergaenzen Beam-Kandidaten, diversifizierte Selektion behaelt Fernkanten, clustered-Recall hoch, uniform >= Stand"
+  - id: s38-nvmebench
+    title: s38-nvmebench
+    paths:
+      - tools/bench.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R bench --output-on-failure
+    engine: implement
+    want: "dbbench --data-dir: WAL append_many+flush Throughput + p95-flush-Latenz auf beliebigem Verzeichnis (NVMe vs tmpfs vergleichbar), CSV-Output erweitert, alte Modi unveraendert"
+  - id: s39-sumexpr
+    title: s39-sumexpr
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+      - src/sql/executor.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor\" --output-on-failure"
+    engine: implement
+    want: Skalar-Aggregate SUM/AVG/MIN/MAX + COUNT(col), Arg = Spalte oder binaerer */+-Ausdruck (Q6 SUM(price*disc) gruen), ohne GROUP BY, alte Tests gruene
+  - id: s40-shrinksym
+    title: s40-shrinksym
+    paths:
+      - src/vector/hnsw.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: "Symmetrische Shrink-Heuristik: reziproke Kantenstuetzung mit Diversitaets-Heuristik statt naechste-only, Fernkanten bleiben, clustered-Recall hoch, uniform >= Stand"
+  - id: s41-pgsession
+    title: s41-pgsession
+    paths:
+      - src/server/pgserver.cpp
+      - include/dbengine/server/pgserver.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
+    engine: implement
+    want: "PGWire-Session echt: Q an Executor::execute verdrahtet, echte T/D/C (OIDs, NULLs), SELECT-1 weiter gruene, alte Tests gruene"
+  - id: s42-metrics
+    title: s42-metrics
+    paths:
+      - src/server/metrics.cpp
+      - include/dbengine/server/metrics.h
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ./build/dbmetrics --selfcheck
+    engine: implement
+    want: "Metrics-Endpoint: TCP GET /metrics mit WAL/RAFT/Columnar/HNSW-Kennzahlen (Prometheus-Textformat), dbmetrics-Binary mit --selfcheck (ephemeral, asserted Keywords), STL/POSIX-only"
