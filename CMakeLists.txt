@@ -241,3 +241,9 @@ add_executable(dbmetrics src/server/metrics.cpp)
 target_include_directories(dbmetrics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dbmetrics PRIVATE dbengine_wal dbengine_kv dbengine_raft columnar dbengine_vector)
 target_compile_options(dbmetrics PRIVATE -Wall -Wextra -Wpedantic)
+
+# backup: Offline BackupCoordinator (WAL-flush + Columnar/Raft-Save + WAL-Copy + MANIFEST) + dbbackup --selfcheck/--backup/--restore
+add_executable(dbbackup src/server/backup.cpp)
+target_include_directories(dbbackup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dbbackup PRIVATE dbengine_wal dbengine_raft columnar)
+target_compile_options(dbbackup PRIVATE -Wall -Wextra -Wpedantic)

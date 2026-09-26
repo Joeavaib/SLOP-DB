@@ -9,6 +9,12 @@
 //   INSERT INTO t [(cols)] VALUES (v, ...), (...), ...
 //   SELECT [* | col, ... | COUNT(*)] FROM t [WHERE cond [AND cond ...]]
 //     cond := col (=|<>|!=|<|<=|>|>=) literal | col LIKE 'pat' | col ILIKE 'pat'
+//   Skalar-Aggregate (s39, ohne GROUP BY): SUM/AVG/MIN/MAX/COUNT(col|*),
+//     Arg = Spalte oder binaerer */+-Ausdruck, z.B. SUM(price*(1-disc)).
+//   GROUP BY (s43): SELECT <group-cols>, AGG(..) [AS alias], ... FROM t
+//     [WHERE ...] GROUP BY <cols> (1..n Spalten, Hash-Aggregation, Q1-Kern).
+//     Leere Eingabe -> 0 Gruppen (keine Zeile); ohne GROUP BY bleibt die
+//     1-Zeilen-Semantik der Skalar-Aggregate bestehen.
 // Literale: INT, FLOAT, 'string' ('' = escape), NULL, TRUE/FALSE,
 //           JSONB als Text-Literal ('{"a":1}'::jsonb wird als Text genommen).
 // V2-Luecken (bewusst): Joins, ORDER BY/LIMIT, UPDATE/DELETE, Indexe, Typcheck
@@ -84,15 +90,27 @@ struct Aggregate {
   bool star = false;                     // nur COUNT(*)
   std::shared_ptr<AggExpr> arg;          // null bei star
   std::string display;  // z.B. "SUM(price*disc)", "COUNT(*)"
+  std::string alias;  // optional: "SUM(x) AS s" (leer = display als Spaltenname)
+};
+
+// Ein Projektionseintrag in SELECT-Reihenfolge (nur Nicht-*-Pfad).
+// Ohne GROUP BY ist die Liste homogen (nur Spalten oder nur Aggregate);
+// mit GROUP BY mischt sie Gruppen-Spalten und Aggregate beliebig.
+struct SelectItem {
+  bool is_agg = false;    // true -> aggregates[index], false -> columns[index]
+  std::size_t index = 0;  // Position in aggregates bzw. columns
 };
 
 struct SelectStmt {
   std::string table;
   std::vector<std::string> columns;  // leer + select_all = "*"
+  std::vector<std::string> column_aliases;  // parallel zu columns, "" = kein Alias
   bool select_all = true;
   bool count_star = false;  // legacy: alleiniges COUNT(*) (Verhalten fixiert)
   std::vector<Aggregate> aggregates;  // nicht-leer => skalares Aggregat ohne GROUP BY
   std::vector<Condition> where;  // AND-verknuepft
+  std::vector<std::string> group_by;  // leer = keine Gruppierung (1..n Spalten)
+  std::vector<SelectItem> items;  // Projektionsreihenfolge (leer = legacy-Pfad)
 };
 
 using Statement =

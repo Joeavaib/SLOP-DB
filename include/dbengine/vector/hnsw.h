@@ -54,6 +54,15 @@ inline float dispatch_distance(const Vector& a, const Vector& b,
   return (m == DistanceMetric::L2) ? l2_distance(a, b)
                                    : cosine_distance(a, b);
 }
+// Quadrierter Vergleichspfad (squared-hotpath): L2 ohne sqrt pro Kandidat
+// (l2_squared-Basis), Cosine unveraendert (sqrt in Norm noetig).
+// Ordnungssaequivalent zu dispatch_distance fuer L2 (sqrt monoton),
+// inkl. deterministischem (dist,id)-Tie-Break auf quadrierter Basis.
+inline float dispatch_distance2(const Vector& a, const Vector& b,
+                                DistanceMetric m) {
+  return (m == DistanceMetric::L2) ? l2_squared(a, b)
+                                   : cosine_distance(a, b);
+}
 
 // --- AVX2-Distanzkerne mit Runtime-Dispatch (s-perf) --------------------------
 // Rohe Zeiger-Kerne (float-Akkumulation): AVX2-Pfad wo verfuegbar, sonst
@@ -157,6 +166,11 @@ class HnswIndex {
  private:
   [[nodiscard]] float dist(const Vector& a, const Vector& b) const;
   [[nodiscard]] float dist_to_stored(const Vector& q, int id) const;
+  // Quadrierter Hotpath: L2 -> l2_squared_kernel ohne sqrt (Beam-Heaps,
+  // select/shrink-Scores, greedy); Cosine -> identisch zu dist_to_stored
+  // (sqrt in Norm noetig, kein Einsparpotenzial). Finale search()-Outputs
+  // werden einmalig nach sqrt konvertiert (dist-Einheiten).
+  [[nodiscard]] float dist2_to_stored(const Vector& q, int id) const;
   // --- s21 Mehrschicht-Interna ---
   int random_level();
   [[nodiscard]] std::vector<SearchHit> search_layer(const Vector& q,

@@ -2,6 +2,7 @@
 // Framework-los (assert-light + cout), CTest-Name: raft (ctest -R raft).
 
 #include <chrono>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -122,6 +123,214 @@ void TestMajorityAndCatchup() {
   Check(g.append("put y 1") == 0, "quorum/no-append-without-leader");
 }
 
+// Chaos-Sequenzen (deterministisch, eigener RNG Seed 7, feste Op-Folgen).
+// Stil: Check()+g_failures wie Bestand. Temp-Files unter temp_directory_path
+// mit unique Namen + Cleanup (Datei + ".tmp"). Laufzeit <<5s (in-process Sim).
+
+void TestChaosStaleLoadMonoPhantom() {
+  namespace fs = std::filesystem;
+  // Eigener deterministischer RNG, Seed 7 (LCG, kein <random>-Include).
+  std::uint32_t rng = 7u;
+  auto next = [&]() -> std::uint32_t {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+  };
+  const fs::path log_path =
+      fs::temp_directory_path() / "raft_chaos7_a_stale.bin";
+  fs::remove(log_path);
+  fs::remove(fs::path(log_path.string() + ".tmp"));
+
+  RaftGroup g(20, "", "");
+  // Feste Op-Folge: 2 puts -> Save -> 3 puts (Tail).
+  Check(g.append("put chaos_a1 v1") == 1, "chaos-a/idx1");
+  Check(g.append("put chaos_a2 v2") == 2, "chaos-a/idx2");
+  const std::uint64_t commit_saved = g.commitIndex();
+  const std::uint64_t term_saved = g.term();
+  Check(commit_saved == 2, "chaos-a/saved-commit-2");
+  Check(g.SaveLog(log_path.string()), "chaos-a/save-ok");
+
+  const char* tail[3] = {"put chaos_a3 v3", "put chaos_a4 v4",
+                         "put chaos_a5 v5"};
+  std::uint64_t prev = commit_saved;
+  for (int i = 0; i < 3; ++i) {
+    (void)next();  // deterministischer Takt, feste Folge bleibt fix
+    std::uint64_t idx = g.append(tail[i]);
+    Check(idx == static_cast<std::uint64_t>(3 + i), "chaos-a/tail-idx");
+    Check(g.commitIndex() >= prev, "chaos-a/commit-mono-append");
+    prev = g.commitIndex();
+  }
+  const std::uint64_t commit_before_kill = g.commitIndex();
+  Check(commit_before_kill == 5, "chaos-a/commit-5-prekill");
+  Check(g.is_caught_up(1) && g.is_caught_up(2),
+        "chaos-a/caughtup-prekill");
+  Check(g.follower_get(1, "chaos_a5") == std::optional<std::string>("v5"),
+        "chaos-a/follower-prekill");
+
+  int old_leader = g.leaderId();
+  g.killLeader();
+  Check(g.leaderId() == -1, "chaos-a/no-leader-after-kill");
+  int fresh = g.failover();
+  Check(fresh >= 0 && fresh != old_leader, "chaos-a/new-leader");
+  // Commit-Monotonie ueber Failover (lebender Nachfolger hat gleichen Stand).
+  Check(g.commitIndex() == commit_before_kill,
+        "chaos-a/commit-mono-failover");
+  Check(g.term() >= term_saved, "chaos-a/term-mono-failover");
+
+  // Stale-Load: Recovery-Restore auf gespeicherten Stand (commit 2).
+  // Invariante: exaktes Restore + Phantom-Freiheit (Tail-Keys unsichtbar),
+  // Term-Monotonie (term = max). Kein In-place-Commit-Vorwaertsschutz:
+  // LoadLog setzt bewusst zurueck (applied.clear + re-apply).
+  Check(g.LoadLog(log_path.string()), "chaos-a/load-stale-ok");
+  Check(g.commitIndex() == commit_saved,
+        "chaos-a/load-restores-saved-commit");
+  Check(g.term() >= term_saved, "chaos-a/term-mono-after-load");
+  Check(!g.get("chaos_a3").has_value() &&
+            !g.get("chaos_a4").has_value() &&
+            !g.get("chaos_a5").has_value(),
+        "chaos-a/phantom-free-get");
+  int follower = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (i != g.leaderId() && g.isAlive(i)) {
+      follower = i;
+      break;
+    }
+  }
+  Check(follower >= 0, "chaos-a/alive-follower-present");
+  if (follower >= 0) {
+    Check(!g.follower_get(follower, "chaos_a3").has_value(),
+          "chaos-a/phantom-free-follower");
+    Check(g.is_caught_up(follower), "chaos-a/caughtup-after-load");
+  }
+  Check(g.get("chaos_a1") == std::optional<std::string>("v1") &&
+            g.get("chaos_a2") == std::optional<std::string>("v2"),
+        "chaos-a/saved-visible");
+
+  fs::remove(log_path);
+  fs::remove(fs::path(log_path.string() + ".tmp"));
+}
+
+void TestChaosSnapshotTailReplay() {
+  namespace fs = std::filesystem;
+  std::uint32_t rng = 7u;
+  auto next = [&]() -> std::uint32_t {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+  };
+  const fs::path snap_path =
+      fs::temp_directory_path() / "raft_chaos7_b_snap.bin";
+  fs::remove(snap_path);
+  fs::remove(fs::path(snap_path.string() + ".tmp"));
+
+  RaftGroup g(21, "", "");
+  // Feste Folge: 3 puts -> Snapshot bei C -> 5 appends bis C+5.
+  Check(g.append("put chaos_b1 v1") == 1, "chaos-b/idx1");
+  Check(g.append("put chaos_b2 v2") == 2, "chaos-b/idx2");
+  Check(g.append("put chaos_b3 v3") == 3, "chaos-b/idx3");
+  const std::uint64_t c = g.commitIndex();
+  Check(c == 3, "chaos-b/snap-base-c");
+  Check(g.SaveSnapshot(snap_path.string()), "chaos-b/save-snap-ok");
+
+  const char* tail[5] = {"put chaos_b4 v4", "put chaos_b5 v5",
+                         "put chaos_b6 v6", "put chaos_b7 v7",
+                         "put chaos_b8 v8"};
+  for (int i = 0; i < 5; ++i) {
+    (void)next();
+    std::uint64_t idx = g.append(tail[i]);
+    Check(idx == c + static_cast<std::uint64_t>(i + 1), "chaos-b/tail-idx");
+  }
+  Check(g.commitIndex() == c + 5, "chaos-b/commit-c-plus-5");
+
+  // Aelteren Snapshot (C) laden: kein Commit-Verlust, Tail-Replay.
+  Check(g.LoadSnapshot(snap_path.string()), "chaos-b/load-snap-ok");
+  Check(g.commitIndex() == c + 5, "chaos-b/commit-preserved-after-snap");
+  bool all_visible = true;
+  for (int i = 1; i <= 8; ++i) {
+    std::string k = "chaos_b" + std::to_string(i);
+    std::string v = "v" + std::to_string(i);
+    if (g.get(k) != std::optional<std::string>(v)) {
+      all_visible = false;
+      break;
+    }
+  }
+  Check(all_visible, "chaos-b/tail-replay-visible");
+  Check(g.is_caught_up(1) && g.is_caught_up(2),
+        "chaos-b/caughtup-after-snap");
+  // Naechster Append-Index = C+6 (Basis + Tail + 1).
+  std::uint64_t nxt = g.append("put chaos_b9 v9");
+  Check(nxt == c + 6, "chaos-b/append-c-plus-6");
+  Check(g.get("chaos_b9") == std::optional<std::string>("v9"),
+        "chaos-b/read-after-replay");
+
+  fs::remove(snap_path);
+  fs::remove(fs::path(snap_path.string() + ".tmp"));
+}
+
+void TestChaosReviveAfterSnapshotAutosave() {
+  namespace fs = std::filesystem;
+  std::uint32_t rng = 7u;
+  auto next = [&]() -> std::uint32_t {
+    rng = rng * 1664525u + 1013904223u;
+    return rng;
+  };
+  (void)next();
+  const fs::path snap_path =
+      fs::temp_directory_path() / "raft_chaos7_c_snap.bin";
+  const fs::path auto_path =
+      fs::temp_directory_path() / "raft_chaos7_c_auto.bin";
+  fs::remove(snap_path);
+  fs::remove(fs::path(snap_path.string() + ".tmp"));
+  fs::remove(auto_path);
+  fs::remove(fs::path(auto_path.string() + ".tmp"));
+
+  RaftGroup g(22, "", "");
+  Check(g.append("put chaos_c1 v1") == 1, "chaos-c/idx1");
+  Check(g.append("put chaos_c2 v2") == 2, "chaos-c/idx2");
+  Check(g.SaveSnapshot(snap_path.string()), "chaos-c/save-snap-ok");
+
+  // reviveNode-Pfad: Knoten 2 tot, Leader schreibt weiter, Revive holt auf.
+  g.killNode(2);
+  Check(!g.is_caught_up(2), "chaos-c/dead-not-caughtup");
+  Check(g.append("put chaos_c3 v3") == 3, "chaos-c/idx3-quorum");
+  g.reviveNode(2);
+  Check(g.isAlive(2), "chaos-c/revived");
+  Check(!g.node(2).log.empty(), "chaos-c/catchup-log-nonempty");
+  Check(g.node(2).commit_index == 3, "chaos-c/catchup-commit");
+  Check(g.is_caught_up(2), "chaos-c/caughtup-after-revive");
+  Check(g.follower_get(2, "chaos_c3") == std::optional<std::string>("v3"),
+        "chaos-c/follower-after-revive");
+
+  // Aelteren Snapshot (C=2) laden, dann erneut revive (nach Snapshot).
+  Check(g.LoadSnapshot(snap_path.string()), "chaos-c/load-snap-ok");
+  Check(g.commitIndex() == 3, "chaos-c/commit-preserved");
+  Check(g.get("chaos_c3") == std::optional<std::string>("v3"),
+        "chaos-c/tail-replay");
+  g.killNode(1);
+  g.reviveNode(1);
+  Check(g.is_caught_up(1), "chaos-c/caughtup-revive-after-snap");
+  Check(g.follower_get(1, "chaos_c3") == std::optional<std::string>("v3"),
+        "chaos-c/follower-after-snap-revive");
+
+  // Autosave-Pfad: jeder Commit schreibt volles Log (kompaktiert, Basis 2).
+  g.set_autosave_log(auto_path.string());
+  std::uint64_t idx4 = g.append("put chaos_c4 v4");
+  Check(idx4 == 4, "chaos-c/autosave-idx4");
+  Check(fs::exists(auto_path), "chaos-c/autosave-file-exists");
+  // Frische Gruppe kann Autosave-Datei per LoadLog lesen.
+  RaftGroup h(23, "", "");
+  Check(h.LoadLog(auto_path.string()), "chaos-c/autosave-load-ok");
+  Check(h.commitIndex() == g.commitIndex(),
+        "chaos-c/autosave-commit-match");
+  Check(h.get("chaos_c3") == std::optional<std::string>("v3") &&
+            h.get("chaos_c4") == std::optional<std::string>("v4"),
+        "chaos-c/autosave-tail-visible");
+  g.clear_autosave();
+
+  fs::remove(snap_path);
+  fs::remove(fs::path(snap_path.string() + ".tmp"));
+  fs::remove(auto_path);
+  fs::remove(fs::path(auto_path.string() + ".tmp"));
+}
+
 }  // namespace
 
 int main() {
@@ -130,6 +339,9 @@ int main() {
   TestReplication();
   TestFailover100ms();
   TestMajorityAndCatchup();
+  TestChaosStaleLoadMonoPhantom();
+  TestChaosSnapshotTailReplay();
+  TestChaosReviveAfterSnapshotAutosave();
 
   if (g_failures == 0) {
     std::cout << "ALL RAFT TESTS PASSED\n";

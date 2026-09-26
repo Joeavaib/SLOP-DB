@@ -5,8 +5,10 @@
 
 #include <cctype>
 #include <cmath>
+#include <iomanip>
 #include <regex>
 #include <sstream>
+#include <unordered_map>
 
 namespace dbengine::sql {
 namespace {
@@ -582,53 +584,60 @@ class Parser {
     throw SqlError("Erwartet Spalte, Zahl oder '(' in Aggregat-Argument");
   }
 
+  // Klausel-Keywords: nach einem Aggregat kein Alias (sondern Fortsetzung).
+  bool peekClauseKeyword() const {
+    static const char* kws[] = {"FROM", "WHERE", "GROUP", "ORDER",
+                                "LIMIT", "OFFSET", "AND",  "OR",
+                                "HAVING"};
+    for (auto k : kws)
+      if (peekKeyword(k)) return true;
+    return false;
+  }
+
   SelectStmt parseSelect() {
     SelectStmt s;
-    // Projektion
+    // Projektion (Reihenfolge in s.items erhalten; ohne GROUP BY homogen)
     if (matchSymbol("*")) {
       s.select_all = true;
-    } else if (peekAggregate()) {
-      // Legacy-Pfad exakt erhalten: alleiniges COUNT(*) -> count_star.
-      bool legacy = false;
-      if (peekKeyword("COUNT")) {
-        const Token& t1 = peek(1);
-        const Token& t2 = peek(2);
-        const Token& t3 = peek(3);
-        const Token& t4 = peek(4);
-        bool paren = (t1.kind == TokKind::Symbol && t1.text == "(");
-        bool star = (t2.kind == TokKind::Star ||
-                     (t2.kind == TokKind::Symbol && t2.text == "*"));
-        bool close = (t3.kind == TokKind::Symbol && t3.text == ")");
-        bool fromAfter = (t4.kind == TokKind::Ident &&
-                          toUpper(t4.text) == "FROM");
-        if (paren && star && close && fromAfter) legacy = true;
-      }
-      if (legacy) {
-        ++pos_;
-        expectSymbol("(");
-        if (!(matchSymbol("*"))) throw SqlError("Nur COUNT(*) in V1");
-        expectSymbol(")");
-        s.select_all = false;
-        s.count_star = true;
-      } else {
-        s.select_all = false;
-        s.count_star = false;
-        while (true) {
-          if (!peekAggregate())
-            throw SqlError(
-                "Ohne GROUP BY: Aggregate (SUM/AVG/MIN/MAX/COUNT) und Spalten "
-                "nicht mischbar");
-          s.aggregates.push_back(parseAggregate());
-          if (matchSymbol(",")) continue;
-          break;
-        }
-      }
     } else {
       s.select_all = false;
+      s.count_star = false;
       while (true) {
-        s.columns.push_back(parseIdent());
+        if (peekAggregate()) {
+          Aggregate a = parseAggregate();
+          // Optionaler Alias: "SUM(x) AS s" oder blank "SUM(x) s".
+          if (matchKeyword("AS")) {
+            a.alias = parseIdent();
+          } else if (peek().kind == TokKind::Ident && !peekClauseKeyword()) {
+            a.alias = parseIdent();
+          }
+          s.items.push_back(SelectItem{true, s.aggregates.size()});
+          s.aggregates.push_back(std::move(a));
+        } else {
+          std::string col = parseIdent();
+          std::string alias;
+          // Optionaler Alias auch fuer Plain-Spalten: "rf AS g" / "rf g".
+          if (matchKeyword("AS")) {
+            alias = parseIdent();
+          } else if (peek().kind == TokKind::Ident && !peekClauseKeyword()) {
+            alias = parseIdent();
+          }
+          s.items.push_back(SelectItem{false, s.columns.size()});
+          s.columns.push_back(std::move(col));
+          s.column_aliases.push_back(std::move(alias));
+        }
         if (matchSymbol(",")) continue;
         break;
+      }
+      // Legacy-Pfad exakt erhalten: alleiniges COUNT(*) ohne Alias, gefolgt
+      // von FROM, -> count_star. Mit GROUP BY danach bleibt es Multi-Aggregat
+      // (eine Zeile pro Gruppe statt einer Zeile total).
+      if (s.columns.empty() && s.aggregates.size() == 1 &&
+          s.items.size() == 1 && s.aggregates[0].star &&
+          s.aggregates[0].alias.empty() && peekKeyword("FROM")) {
+        s.count_star = true;
+        s.aggregates.clear();
+        s.items.clear();
       }
     }
     expectKeyword("FROM");
@@ -642,10 +651,32 @@ class Parser {
       if (matchKeyword("OR"))
         throw SqlError("OR erst ab V2 (aktuell nur AND)");
     }
-    // LIMIT/OFFSET/ORDER BY -> klare V2-Fehlermeldung statt Silent-Ignore
+    if (matchKeyword("GROUP")) {
+      expectKeyword("BY");
+      if (s.select_all)
+        throw SqlError("SELECT * mit GROUP BY wird nicht unterstuetzt");
+      while (true) {
+        s.group_by.push_back(parseIdent());
+        if (matchSymbol(",")) continue;
+        break;
+      }
+      if (s.count_star) {
+        // "SELECT COUNT(*) ... GROUP BY": keine Legacy-Einzeiler-Semantik,
+        // sondern COUNT(*) pro Gruppe (Multi-Aggregat zurueckbauen).
+        s.count_star = false;
+        Aggregate a;
+        a.func = "COUNT";
+        a.star = true;
+        a.display = "COUNT(*)";
+        s.items.push_back(SelectItem{true, 0});
+        s.aggregates.push_back(std::move(a));
+      }
+    }
+    // LIMIT/OFFSET/ORDER BY/HAVING/JOIN -> klare V2-Fehlermeldung statt
+    // Silent-Ignore (GROUP BY wird seit s43 oben unterstuetzt).
     if (peekKeyword("ORDER") || peekKeyword("LIMIT") || peekKeyword("OFFSET") ||
-        peekKeyword("GROUP") || peekKeyword("JOIN"))
-      throw SqlError("ORDER BY / LIMIT / GROUP BY / JOIN erst ab V2");
+        peekKeyword("HAVING") || peekKeyword("JOIN"))
+      throw SqlError("ORDER BY / LIMIT / OFFSET / HAVING / JOIN erst ab V2");
     return s;
   }
 
@@ -872,70 +903,213 @@ void requireNumericForSumAvg(const Value& v, const std::string& func) {
     throw SqlError(func + " braucht numerische Operanden");
 }
 
+// Ein Aggregat ueber eine Zeilenmenge (s39-Semantik, pro Gruppe wiederverwendet):
+// COUNT(*)=Zeilen, COUNT(col)=non-null, SUM/AVG ueber non-null numerisch
+// (leer -> NULL), MIN/MAX ueber non-null (leer -> NULL, Typ bleibt erhalten).
+Value computeAggregate(const Table& t,
+                       const std::vector<const std::vector<Value>*>& rows,
+                       const Aggregate& a) {
+  if (a.star) {  // COUNT(*)
+    return Value{static_cast<int64_t>(rows.size())};
+  }
+  if (!a.arg) throw SqlError("Aggregat ohne Argument: " + a.func);
+  if (a.func == "COUNT") {
+    int64_t c = 0;
+    for (auto rp : rows) {
+      Value v = evalAggExprNode(t, *rp, *a.arg);
+      if (!valueIsNull(v)) ++c;
+    }
+    return Value{c};
+  }
+  if (a.func == "SUM") {
+    bool any = false;
+    double sum = 0.0;
+    for (auto rp : rows) {
+      Value v = evalAggExprNode(t, *rp, *a.arg);
+      if (valueIsNull(v)) continue;
+      requireNumericForSumAvg(v, "SUM");
+      sum += aggToDouble(v);
+      any = true;
+    }
+    return any ? Value{sum} : Value{std::monostate{}};
+  }
+  if (a.func == "AVG") {
+    double sum = 0.0;
+    int64_t n = 0;
+    for (auto rp : rows) {
+      Value v = evalAggExprNode(t, *rp, *a.arg);
+      if (valueIsNull(v)) continue;
+      requireNumericForSumAvg(v, "AVG");
+      sum += aggToDouble(v);
+      ++n;
+    }
+    return n > 0 ? Value{sum / static_cast<double>(n)}
+                 : Value{std::monostate{}};
+  }
+  if (a.func == "MIN" || a.func == "MAX") {
+    bool any = false;
+    Value best{std::monostate{}};
+    for (auto rp : rows) {
+      Value v = evalAggExprNode(t, *rp, *a.arg);
+      if (valueIsNull(v)) continue;
+      if (!any) {
+        best = v;
+        any = true;
+      } else {
+        int cmp = compareValues(v, best);
+        if (a.func == "MIN" ? (cmp < 0) : (cmp > 0)) best = v;
+      }
+    }
+    return any ? best : Value{std::monostate{}};
+  }
+  throw SqlError("Unbekannte Aggregatfunktion: " + a.func);
+}
+
 // Ein-Zeilen-Result. Empty-Set: COUNT->0, Rest NULL. Sonst NULL-Skip.
 Result execScalarAggregates(const Table& t,
                             const std::vector<std::vector<Value>>& kept,
                             const SelectStmt& s) {
   Result r;
   r.columns.reserve(s.aggregates.size());
-  for (auto& a : s.aggregates) r.columns.push_back(a.display);
+  for (auto& a : s.aggregates)
+    r.columns.push_back(a.alias.empty() ? a.display : a.alias);
+  std::vector<const std::vector<Value>*> refs;
+  refs.reserve(kept.size());
+  for (auto& row : kept) refs.push_back(&row);
   std::vector<Value> out;
   out.reserve(s.aggregates.size());
-  for (auto& a : s.aggregates) {
-    if (a.star) {  // COUNT(*) in Multi-Aggregat-Liste
-      out.emplace_back(static_cast<int64_t>(kept.size()));
-    } else if (a.func == "COUNT") {
-      int64_t c = 0;
-      for (auto& row : kept) {
-        Value v = evalAggExprNode(t, row, *a.arg);
-        if (!valueIsNull(v)) ++c;
-      }
-      out.emplace_back(c);
-    } else if (a.func == "SUM") {
-      bool any = false;
-      double sum = 0.0;
-      for (auto& row : kept) {
-        Value v = evalAggExprNode(t, row, *a.arg);
-        if (valueIsNull(v)) continue;
-        requireNumericForSumAvg(v, "SUM");
-        sum += aggToDouble(v);
-        any = true;
-      }
-      out.push_back(any ? Value{sum} : Value{std::monostate{}});
-    } else if (a.func == "AVG") {
-      double sum = 0.0;
-      int64_t n = 0;
-      for (auto& row : kept) {
-        Value v = evalAggExprNode(t, row, *a.arg);
-        if (valueIsNull(v)) continue;
-        requireNumericForSumAvg(v, "AVG");
-        sum += aggToDouble(v);
-        ++n;
-      }
-      out.push_back(n > 0 ? Value{sum / static_cast<double>(n)}
-                          : Value{std::monostate{}});
-    } else if (a.func == "MIN" || a.func == "MAX") {
-      bool any = false;
-      Value best{std::monostate{}};
-      for (auto& row : kept) {
-        Value v = evalAggExprNode(t, row, *a.arg);
-        if (valueIsNull(v)) continue;
-        if (!any) {
-          best = v;
-          any = true;
-        } else {
-          int cmp = compareValues(v, best);
-          if (a.func == "MIN" ? (cmp < 0) : (cmp > 0)) best = v;
-        }
-      }
-      out.push_back(any ? best : Value{std::monostate{}});
-    } else {
-      throw SqlError("Unbekannte Aggregatfunktion: " + a.func);
-    }
-  }
+  for (auto& a : s.aggregates) out.push_back(computeAggregate(t, refs, a));
   r.rows.push_back(std::move(out));
   r.message = "SELECT 1";
   r.affected = 1;
+  return r;
+}
+
+// Gruppenschluessel-Feld als String (laengenpraefixiert -> kollisionssicher
+// ueber 1..n Spalten; DOUBLE mit voller Roundtrip-Praezision; NULL gruppiert
+// wie in PG als eigene Gruppe, d.h. NULL == NULL beim Gruppieren).
+std::string groupKeyField(const Value& v) {
+  if (std::holds_alternative<std::monostate>(v)) return "N;";
+  if (auto* iv = std::get_if<int64_t>(&v))
+    return "I:" + std::to_string(*iv) + ";";
+  if (auto* dv = std::get_if<double>(&v)) {
+    std::ostringstream o;
+    o << std::setprecision(17) << *dv;
+    std::string p = o.str();
+    return "F:" + std::to_string(p.size()) + ":" + p + ";";
+  }
+  if (auto* sv = std::get_if<std::string>(&v))
+    return "S:" + std::to_string(sv->size()) + ":" + *sv + ";";
+  if (auto* bv = std::get_if<bool>(&v))
+    return std::string("B:") + (*bv ? "1;" : "0;");
+  return "X:" + valueToString(v) + ";";
+}
+
+// Hash-Aggregation (s43, Q1-Kern ohne ORDER BY): eine Zeile pro Gruppe in
+// First-Seen-Reihenfolge, Spalten in SELECT-Reihenfolge (Gruppen-Spalten +
+// Aggregate gemischt). Leere Eingabe -> 0 Gruppen (keine Zeile).
+Result execGroupedAggregates(const Table& t,
+                             const std::vector<std::vector<Value>>& kept,
+                             const SelectStmt& s) {
+  if (s.select_all || s.count_star)
+    throw SqlError("SELECT * / COUNT(*) mit GROUP BY wird nicht unterstuetzt");
+  // GROUP-Spalten aufloesen (unbekannt -> SqlError)
+  std::vector<int> gidx;
+  gidx.reserve(s.group_by.size());
+  for (auto& g : s.group_by) {
+    int idx = t.colIndex(g);
+    if (idx < 0) throw SqlError("Unbekannte Spalte in GROUP BY: " + g);
+    gidx.push_back(idx);
+  }
+  // Plain-Spalten muessen gruppiert sein (PG-Semantik)
+  for (auto& c : s.columns) {
+    bool ok = false;
+    for (auto& g : s.group_by)
+      if (foldIdent(g) == foldIdent(c)) {
+        ok = true;
+        break;
+      }
+    if (!ok)
+      throw SqlError("Spalte '" + c + "' muss in GROUP BY erscheinen");
+  }
+  // Hash-Partitionierung (Key = Wert-Tupel), Gruppen in First-Seen-Ordnung
+  struct Group {
+    std::vector<Value> key;  // Gruppenwerte in group_by-Reihenfolge
+    std::vector<const std::vector<Value>*> rows;
+  };
+  std::vector<Group> groups;
+  std::unordered_map<std::string, std::size_t> pos;
+  for (auto& row : kept) {
+    std::string k;
+    std::vector<Value> kv;
+    kv.reserve(gidx.size());
+    for (int gi : gidx) {
+      const Value& v = row[static_cast<std::size_t>(gi)];
+      kv.push_back(v);
+      k += groupKeyField(v);
+    }
+    auto it = pos.find(k);
+    if (it == pos.end()) {
+      std::size_t id = groups.size();
+      pos.emplace(k, id);
+      Group g;
+      g.key = std::move(kv);
+      g.rows.push_back(&row);
+      groups.push_back(std::move(g));
+    } else {
+      groups[it->second].rows.push_back(&row);
+    }
+  }
+  // Plain-Spalte -> Position im GROUP BY (fuer Key-Lookup; oben validiert)
+  std::vector<std::size_t> colPos;
+  colPos.reserve(s.columns.size());
+  for (auto& c : s.columns) {
+    std::size_t p = 0;
+    for (; p < s.group_by.size(); ++p)
+      if (foldIdent(s.group_by[p]) == foldIdent(c)) break;
+    colPos.push_back(p);
+  }
+  // Projektion in SELECT-Reihenfolge (items leer = vor-s43-AST: erst Spalten)
+  std::vector<SelectItem> items = s.items;
+  if (items.empty()) {
+    for (std::size_t i = 0; i < s.columns.size(); ++i)
+      items.push_back(SelectItem{false, i});
+    for (std::size_t i = 0; i < s.aggregates.size(); ++i)
+      items.push_back(SelectItem{true, i});
+  }
+  Result r;
+  r.columns.reserve(items.size());
+  for (auto& it : items) {
+    if (it.is_agg) {
+      if (it.index >= s.aggregates.size())
+        throw SqlError("Ungueltige Projektion (Aggregat-Index)");
+      const Aggregate& a = s.aggregates[it.index];
+      r.columns.push_back(a.alias.empty() ? a.display : a.alias);
+    } else {
+      if (it.index >= s.columns.size())
+        throw SqlError("Ungueltige Projektion (Spalten-Index)");
+      int idx = t.colIndex(s.columns[it.index]);
+      if (idx < 0) throw SqlError("Unbekannte Spalte: " + s.columns[it.index]);
+      std::string alias;
+      if (it.index < s.column_aliases.size()) alias = s.column_aliases[it.index];
+      r.columns.push_back(
+          alias.empty() ? t.columns[static_cast<std::size_t>(idx)].name : alias);
+    }
+  }
+  for (auto& g : groups) {
+    std::vector<Value> out;
+    out.reserve(items.size());
+    for (auto& it : items) {
+      if (it.is_agg) {
+        out.push_back(computeAggregate(t, g.rows, s.aggregates[it.index]));
+      } else {
+        out.push_back(g.key[colPos[it.index]]);
+      }
+    }
+    r.rows.push_back(std::move(out));
+  }
+  r.message = "SELECT " + std::to_string(r.rows.size());
+  r.affected = r.rows.size();
   return r;
 }
 
@@ -1083,6 +1257,9 @@ Result Database::execSelect(const SelectStmt& s) {
       }
     if (ok) kept.push_back(row);
   }
+  if (!s.group_by.empty()) {
+    return execGroupedAggregates(t, kept, s);
+  }
   if (s.count_star) {
     return { {"count"}, { {Value{(int64_t)kept.size()}} },
              "SELECT 1", std::size_t{1} };
@@ -1103,11 +1280,14 @@ Result Database::execSelect(const SelectStmt& s) {
       cols.push_back(t.columns[i].name);
     }
   } else {
-    for (auto& c : s.columns) {
+    for (std::size_t i = 0; i < s.columns.size(); ++i) {
+      auto& c = s.columns[i];
       int idx = t.colIndex(c);
       if (idx < 0) throw SqlError("Unbekannte Spalte: " + c);
       idxs.push_back(idx);
-      cols.push_back(t.columns[(std::size_t)idx].name);
+      std::string alias;
+      if (i < s.column_aliases.size()) alias = s.column_aliases[i];
+      cols.push_back(alias.empty() ? t.columns[(std::size_t)idx].name : alias);
     }
   }
   Result r;
