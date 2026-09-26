@@ -10,8 +10,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 #include <fcntl.h>
@@ -595,6 +597,98 @@ ColumnarStore::ScanResult ColumnarStore::ScanSumLessThan(
   // Seal-Pflicht gilt nur fuer Tiering/Export-Konsistenz, nicht fuers Lesen.
   if (!active_.empty()) scan_one(active_);
   return r;
+}
+
+ColumnarStore::ScanResult ColumnarStore::ScanSumLessThanParallel(
+    int64_t threshold, unsigned n_threads) const {
+  // Aufloesung: 0 -> hardware_concurrency (0 -> 4 als Fallback).
+  unsigned eff = n_threads;
+  if (eff == 0) {
+    const unsigned hc = std::thread::hardware_concurrency();
+    eff = (hc == 0 ? 4u : hc);
+  }
+  // Fallback 1: seriell gewuenscht -> byte-identisch zum alten Pfad.
+  if (eff <= 1) return ScanSumLessThan(threshold);
+  const size_t n_sealed = parts_.size();
+  const bool has_active = !active_.empty();
+  const size_t work_items = n_sealed + (has_active ? size_t{1} : size_t{0});
+  // Fallback 2: <=1 Scan-Unit -> byte-identisch zum alten Pfad.
+  if (work_items <= 1) return ScanSumLessThan(threshold);
+  if (n_sealed == 0) return ScanSumLessThan(threshold);  // nur aktiv
+  // Workerzahl deckeln: min(sealed Parts, eff). Bei n_sealed <= eff exakt
+  // ein Thread pro sealed Part; sonst kontiguierliche Chunks (Indexordnung
+  // bleibt erhalten -> deterministische Kombination). Sealed Parts sind
+  // immutable: parallele Reads brauchen keinen Lock. Aufruferseitig darf
+  // waehrend des Scans nicht mutiert werden (wie Single-Pfad).
+  size_t n_workers = static_cast<size_t>(eff);
+  if (n_workers > n_sealed) n_workers = n_sealed;
+  std::vector<std::future<ScanResult>> futs;
+  futs.reserve(n_workers);
+  size_t begin = 0;
+  const size_t base = n_sealed / n_workers;
+  const size_t rem = n_sealed % n_workers;
+  for (size_t w = 0; w < n_workers; ++w) {
+    const size_t chunk = base + (w < rem ? size_t{1} : size_t{0});
+    const size_t end = begin + chunk;
+    futs.push_back(std::async(
+        std::launch::async, [this, threshold, begin, end]() -> ScanResult {
+          ScanResult r;
+          for (size_t i = begin; i < end; ++i) {
+            const Part& p = parts_[i];
+            ++r.parts_total;
+            if (p.empty()) {
+              ++r.parts_pruned;
+              continue;
+            }
+            size_t scanned = 0;
+            auto [s, pruned] = p.SumLessThan(threshold, &scanned);
+            r.sum += s;
+            r.rows_scanned += scanned;
+            if (pruned)
+              ++r.parts_pruned;
+            else if (scanned == 0)
+              ++r.parts_full;
+          }
+          return r;
+        }));
+    begin = end;
+  }
+  // Aktiver Part im Caller-Thread (ueberlappt mit Workern).
+  ScanResult active_res;
+  if (has_active) {
+    const Part& p = active_;
+    ++active_res.parts_total;
+    if (p.empty()) {
+      ++active_res.parts_pruned;
+    } else {
+      size_t scanned = 0;
+      auto [s, pruned] = p.SumLessThan(threshold, &scanned);
+      active_res.sum += s;
+      active_res.rows_scanned += scanned;
+      if (pruned)
+        ++active_res.parts_pruned;
+      else if (scanned == 0)
+        ++active_res.parts_full;
+    }
+  }
+  // Deterministisch kombinieren: Worker in Chunk-Reihenfolge (== Part-Index-
+  // ordnung, identische Additionsreihenfolge wie Single-Pfad), aktiv zuletzt
+  // (wie Single-Pfad: sealed, dann aktiv).
+  ScanResult total;
+  for (auto& f : futs) {
+    ScanResult r = f.get();
+    total.sum += r.sum;
+    total.parts_total += r.parts_total;
+    total.parts_pruned += r.parts_pruned;
+    total.parts_full += r.parts_full;
+    total.rows_scanned += r.rows_scanned;
+  }
+  total.sum += active_res.sum;
+  total.parts_total += active_res.parts_total;
+  total.parts_pruned += active_res.parts_pruned;
+  total.parts_full += active_res.parts_full;
+  total.rows_scanned += active_res.rows_scanned;
+  return total;
 }
 
 bool ColumnarStore::ExportCsv(const std::string& path) const {

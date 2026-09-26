@@ -6,6 +6,10 @@
 // replicateToFollowers, commitIndex/apply in eine KV-State-Machine.
 // Failover: killLeader + failover() waehlt deterministisch den naechsten
 // lebenden Knoten — in-process in Mikrosekunden, also <100ms sim.
+// Timer-Election (Fake-Clock, Opt-in Auto-Modus): tick(now_ms) ersetzt im
+// Auto-Modus das manuelle killLeader/failover — Baustein Richtung Netz-Raft
+// (Heartbeat-Timeout -> Candidate -> electLeader, kein Thread/keine Echtzeit
+// im Core, Zeit kommt als Parameter).
 
 #include <cstdint>
 #include <map>
@@ -38,6 +42,11 @@ struct Node {
   std::uint64_t last_applied = 0;  // hoechster angewendeter Index
   bool alive = true;
   std::map<std::string, std::string> applied;  // State-Machine (KV)
+  // sXX Timer-Election (Fake-Clock, volatil, keine Persistenz): letzter
+  // gesehener Leader-Heartbeat in ms, Timeout je Knoten deterministisch
+  // 150-300ms aus node_id-Hash (kein RNG). Nur im Auto-Modus aktiv.
+  std::uint64_t last_heartbeat_ms = 0;
+  std::uint64_t election_timeout_ms = 150;
 };
 
 class RaftGroup {
@@ -77,6 +86,27 @@ class RaftGroup {
   int failover();
   void killNode(int node_id);
   void reviveNode(int node_id);  // holt Log auf (Catch-up) + apply
+
+  // ---- sXX: Timer-Election (Fake-Clock, Opt-in Auto-Modus) ------------------
+  // Baustein Richtung Netz-Raft: ersetzt im Auto-Modus das manuelle
+  // killLeader/failover. Fake-Clock: now_ms kommt als Parameter (kein Thread,
+  // keine echte Zeit im Core, deterministisch testbar). Default AUS, damit
+  // alle bestehenden Sim/Chaos-Sequenzen unveraendert gruen bleiben.
+  // tick(now_ms): Leader lebend -> Heartbeats (last_heartbeat aller lebenden
+  //   Knoten = now, KEIN Log-Eintrag). Follower ohne Heartbeat nach Timeout
+  //   (now - last >= election_timeout) -> Candidate via electLeader-Logik
+  //   (term++, Mehrheit), Heartbeats auf now resyncen. Gibt Leader-Id zurueck.
+  // heartbeat(node_id, now_ms): empfangener Heartbeat -> last_heartbeat setzen.
+  // enable_auto_election(now_ms): Auto-Modus an + alle last_heartbeat = now.
+  // election_timeout_for(node_id): 150 + ((node_id*67+101) % 151), fix 150-300.
+  static std::uint64_t election_timeout_for(int node_id) noexcept;
+  void enable_auto_election(std::uint64_t now_ms);
+  void disable_auto_election() noexcept;
+  [[nodiscard]] bool auto_election() const;
+  [[nodiscard]] std::uint64_t last_heartbeat_ms(int node_id) const;
+  [[nodiscard]] std::uint64_t election_timeout_ms(int node_id) const;
+  void heartbeat(int node_id, std::uint64_t now_ms);
+  int tick(std::uint64_t now_ms);
 
   // ---- Abfragen ------------------------------------------------------------
   [[nodiscard]] std::uint64_t commitIndex() const;
@@ -142,6 +172,8 @@ class RaftGroup {
   std::uint64_t log_base_ = 0;
   // s25: Opt-in Autosave-Ziel (leer = aus). Unter mutex_, s. set/clear oben.
   std::string autosave_path_;
+  // sXX: Timer-Election Auto-Modus (default false = manuell, Bestand grueng).
+  bool auto_election_ = false;
 };
 
 // Shard/Tablet: id + Key-Range [range_start, range_end), traegt eine RaftGroup.

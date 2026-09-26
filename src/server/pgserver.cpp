@@ -1,5 +1,6 @@
 // s12-pgserver: TCPServer (POSIX, 127.0.0.1, ephemeral port).
 // Nutzt pgwire-Codec fuer Framing. Siehe include/dbengine/server/pgserver.h.
+// TLS opt-in: SSLRequest -> 'N' (Default) bzw. 'S' + SSL_accept (mit Zert).
 
 #include "dbengine/server/pgserver.h"
 
@@ -24,13 +25,28 @@
 #include "dbengine/server/pgwire.h"
 #include "dbengine/sql/parser.h"
 
+#ifdef DBENGINE_WITH_TLS
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+#endif
+
 namespace dbengine::pgserver {
 namespace {
 
 using dbengine::pgwire::getInt32BE;
 using dbengine::pgwire::putInt32BE;
 
-bool sendAll(int fd, const uint8_t* data, std::size_t len) {
+// Connection-Abstraktion: Klartext (fd) oder TLS (SSL* auf gleichem fd).
+// Alles OpenSSL hinter DBENGINE_WITH_TLS; ohne Define enthaelt Conn nur fd.
+struct Conn {
+  int fd = -1;
+  bool useTls = false;
+#ifdef DBENGINE_WITH_TLS
+  SSL* ssl = nullptr;
+#endif
+};
+
+bool sendRaw(int fd, const uint8_t* data, std::size_t len) {
   std::size_t off = 0;
   while (off < len) {
     ssize_t n = ::send(fd, data + off, len - off, MSG_NOSIGNAL);
@@ -43,12 +59,50 @@ bool sendAll(int fd, const uint8_t* data, std::size_t len) {
   return true;
 }
 
-bool sendAll(int fd, const std::vector<uint8_t>& v) {
-  if (v.empty()) return true;
-  return sendAll(fd, v.data(), v.size());
+#ifdef DBENGINE_WITH_TLS
+bool sendSsl(SSL* ssl, const uint8_t* data, std::size_t len) {
+  std::size_t off = 0;
+  while (off < len) {
+    int n = SSL_write(ssl, data + off,
+                      static_cast<int>(len - off));
+    if (n <= 0) {
+      int e = SSL_get_error(ssl, n);
+      if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
+      return false;
+    }
+    off += static_cast<std::size_t>(n);
+  }
+  return true;
 }
 
-bool recvAll(int fd, uint8_t* out, std::size_t len) {
+bool recvSsl(SSL* ssl, uint8_t* out, std::size_t len) {
+  std::size_t off = 0;
+  while (off < len) {
+    int n = SSL_read(ssl, out + off, static_cast<int>(len - off));
+    if (n <= 0) {
+      int e = SSL_get_error(ssl, n);
+      if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) continue;
+      return false;
+    }
+    off += static_cast<std::size_t>(n);
+  }
+  return true;
+}
+#endif
+
+bool connSend(Conn& c, const uint8_t* data, std::size_t len) {
+#ifdef DBENGINE_WITH_TLS
+  if (c.useTls && c.ssl != nullptr) return sendSsl(c.ssl, data, len);
+#endif
+  return sendRaw(c.fd, data, len);
+}
+
+bool connSend(Conn& c, const std::vector<uint8_t>& v) {
+  if (v.empty()) return true;
+  return connSend(c, v.data(), v.size());
+}
+
+bool recvRaw(int fd, uint8_t* out, std::size_t len) {
   std::size_t off = 0;
   while (off < len) {
     ssize_t n = ::recv(fd, out + off, len - off, 0);
@@ -62,33 +116,73 @@ bool recvAll(int fd, uint8_t* out, std::size_t len) {
   return true;
 }
 
+bool connRecv(Conn& c, uint8_t* out, std::size_t len) {
+#ifdef DBENGINE_WITH_TLS
+  if (c.useTls && c.ssl != nullptr) return recvSsl(c.ssl, out, len);
+#endif
+  return recvRaw(c.fd, out, len);
+}
+
 // Startup: Int32 len | Rest(len-4). Gibt volles Paket (inkl. len) zurueck.
-bool readStartupPacket(int fd, std::vector<uint8_t>& out) {
+bool readStartupPacket(Conn& c, std::vector<uint8_t>& out) {
   uint8_t hdr[4];
-  if (!recvAll(fd, hdr, 4)) return false;
+  if (!connRecv(c, hdr, 4)) return false;
   int32_t len = getInt32BE(hdr);
   if (len < 8 || len > 1024 * 1024) return false;
   out.resize(static_cast<std::size_t>(len));
   std::memcpy(out.data(), hdr, 4);
-  if (!recvAll(fd, out.data() + 4, static_cast<std::size_t>(len) - 4))
+  if (!connRecv(c, out.data() + 4, static_cast<std::size_t>(len) - 4))
     return false;
   return true;
 }
 
 // Normale Nachricht: 'T' | Int32 len | Payload(len-4).
 // Gibt Typ + volles Paket (Typ + len + payload) zurueck.
-bool readTypedMessage(int fd, char& type, std::vector<uint8_t>& out) {
+bool readTypedMessage(Conn& c, char& type, std::vector<uint8_t>& out) {
   uint8_t hdr[5];
-  if (!recvAll(fd, hdr, 5)) return false;
+  if (!connRecv(c, hdr, 5)) return false;
   type = static_cast<char>(hdr[0]);
   int32_t len = getInt32BE(hdr + 1);
   if (len < 4 || len > 16 * 1024 * 1024) return false;
   out.resize(1 + static_cast<std::size_t>(len));
   std::memcpy(out.data(), hdr, 5);
   std::size_t rest = static_cast<std::size_t>(len) - 4;
-  if (rest > 0 && !recvAll(fd, out.data() + 5, rest)) return false;
+  if (rest > 0 && !connRecv(c, out.data() + 5, rest)) return false;
   return true;
 }
+
+// SSLRequest: exakt len 8 + Code 80877103 (kein Typ-Byte).
+bool isSslRequestPacket(const std::vector<uint8_t>& pkt) {
+  if (pkt.size() != 8) return false;
+  return getInt32BE(pkt.data() + 4) == dbengine::pgwire::kSslRequestCode;
+}
+
+#ifdef DBENGINE_WITH_TLS
+// Server-Handshake auf gleichem fd (ctx pro Connection, danach freigegeben).
+bool tlsHandshake(Conn& c, const std::string& certPath,
+                  const std::string& keyPath) {
+  SSL_CTX* ctx = SSL_CTX_new(TLS_server_method());
+  if (ctx == nullptr) return false;
+  bool ok = false;
+  if (SSL_CTX_use_certificate_file(ctx, certPath.c_str(), SSL_FILETYPE_PEM) ==
+          1 &&
+      SSL_CTX_use_PrivateKey_file(ctx, keyPath.c_str(), SSL_FILETYPE_PEM) ==
+          1) {
+    SSL* ssl = SSL_new(ctx);
+    if (ssl != nullptr) {
+      if (SSL_set_fd(ssl, c.fd) == 1 && SSL_accept(ssl) == 1) {
+        c.ssl = ssl;
+        c.useTls = true;
+        ok = true;
+      } else {
+        SSL_free(ssl);
+      }
+    }
+  }
+  SSL_CTX_free(ctx);
+  return ok;
+}
+#endif
 
 std::vector<uint8_t> encodeAuthOk() {
   std::vector<uint8_t> out;
@@ -691,6 +785,17 @@ void PgServer::setAuthRequired(bool required) {
   authRequired_ = required;
 }
 
+void PgServer::setTlsCert(const std::string& keyPath,
+                          const std::string& certPath) {
+  std::lock_guard<std::mutex> lk(tlsMu_);
+  tlsKeyPath_ = keyPath;
+  tlsCertPath_ = certPath;
+  tlsEnabled_ = !keyPath.empty() && !certPath.empty();
+#ifndef DBENGINE_WITH_TLS
+  // Ohne OpenSSL: No-Op (Pfade nur gespeichert, 'N'-Pfad bleibt aktiv).
+#endif
+}
+
 bool PgServer::running() const { return running_.load(); }
 
 void PgServer::start() {
@@ -755,10 +860,70 @@ void PgServer::acceptLoop() {
 }
 
 void PgServer::handleConn(int fd) {
-  // 1) Startup lesen (kein Typ-Byte).
+  Conn conn;
+  conn.fd = fd;
+  auto closeConn = [&]() {
+#ifdef DBENGINE_WITH_TLS
+    if (conn.ssl != nullptr) {
+      SSL_shutdown(conn.ssl);
+      SSL_free(conn.ssl);
+      conn.ssl = nullptr;
+    }
+#endif
+    ::close(conn.fd);
+  };
+
+  // 0) SSLRequest-Schleife (PG-konform, max. 2 Runden):
+  //    'N' -> Klartext-Retry auf gleichem fd; 'S' + Handshake -> weiter via TLS.
+  //    Danach genau ein normaler Startup (parseStartup wirft sonst FATAL).
   std::vector<uint8_t> startup;
-  if (!readStartupPacket(fd, startup)) {
-    ::close(fd);
+  bool gotStartup = false;
+  for (int round = 0; round < 2; ++round) {
+    if (!readStartupPacket(conn, startup)) {
+      closeConn();
+      return;
+    }
+    if (!isSslRequestPacket(startup)) {
+      gotStartup = true;
+      break;
+    }
+#ifdef DBENGINE_WITH_TLS
+    bool wantTls = false;
+    std::string keyPath;
+    std::string certPath;
+    {
+      std::lock_guard<std::mutex> lk(tlsMu_);
+      wantTls = tlsEnabled_;
+      keyPath = tlsKeyPath_;
+      certPath = tlsCertPath_;
+    }
+    if (wantTls) {
+      uint8_t s = 'S';
+      if (!sendRaw(conn.fd, &s, 1)) {
+        closeConn();
+        return;
+      }
+      if (!tlsHandshake(conn, certPath, keyPath)) {
+        closeConn();
+        return;
+      }
+      continue;  // naechstes Paket (Startup) kommt ueber TLS
+    }
+#endif
+    {
+      uint8_t n = 'N';
+      if (!sendRaw(conn.fd, &n, 1)) {
+        closeConn();
+        return;
+      }
+      continue;  // Client faellt auf Klartext zurueck, sendet Startup neu
+    }
+  }
+  if (!gotStartup) {
+    auto err =
+        dbengine::pgwire::encodeError("FATAL", "08P01", "Startup erwartet");
+    connSend(conn, err);
+    closeConn();
     return;
   }
   dbengine::pgwire::StartupParams startupParams;
@@ -766,8 +931,8 @@ void PgServer::handleConn(int fd) {
     startupParams = dbengine::pgwire::parseStartup(startup);
   } catch (const std::exception& e) {
     auto err = dbengine::pgwire::encodeError("FATAL", "08P01", e.what());
-    sendAll(fd, err);
-    ::close(fd);
+    connSend(conn, err);
+    closeConn();
     return;
   }
 
@@ -783,14 +948,14 @@ void PgServer::handleConn(int fd) {
       users = authUsers_;
     }
     if (required) {
-      if (!sendAll(fd, encodeAuthCleartext())) {
-        ::close(fd);
+      if (!connSend(conn, encodeAuthCleartext())) {
+        closeConn();
         return;
       }
       char ptype = 0;
       std::vector<uint8_t> pmsg;
-      if (!readTypedMessage(fd, ptype, pmsg)) {
-        ::close(fd);
+      if (!readTypedMessage(conn, ptype, pmsg)) {
+        closeConn();
         return;
       }
       std::optional<std::string> pw;
@@ -805,8 +970,8 @@ void PgServer::handleConn(int fd) {
             "FATAL", "28P01",
             std::string("password authentication failed for user \"") +
                 startupParams.user + "\"");
-        sendAll(fd, err);
-        ::close(fd);
+        connSend(conn, err);
+        closeConn();
         return;
       }
       // OK: weiter zu 2) (R(0) + Z wie bisher).
@@ -814,12 +979,12 @@ void PgServer::handleConn(int fd) {
   }
 
   // 2) AuthOk (psql/libpq erwartet 'R') + ReadyForQuery('I').
-  if (!sendAll(fd, encodeAuthOk())) {
-    ::close(fd);
+  if (!connSend(conn, encodeAuthOk())) {
+    closeConn();
     return;
   }
-  if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) {
-    ::close(fd);
+  if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) {
+    closeConn();
     return;
   }
 
@@ -835,11 +1000,11 @@ void PgServer::handleConn(int fd) {
   auto sendExtError = [&](const std::string& code, const std::string& what,
                           bool& brk) -> bool {
     auto err = dbengine::pgwire::encodeError("ERROR", code, what);
-    if (!sendAll(fd, err)) {
+    if (!connSend(conn, err)) {
       brk = true;
       return false;
     }
-    if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) {
+    if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) {
       brk = true;
       return false;
     }
@@ -850,7 +1015,7 @@ void PgServer::handleConn(int fd) {
   while (true) {
     char type = 0;
     std::vector<uint8_t> msg;
-    if (!readTypedMessage(fd, type, msg)) break;
+    if (!readTypedMessage(conn, type, msg)) break;
     if (type == 'X') break;  // Terminate
     if (type == 'Q') {
       std::optional<std::string> q;
@@ -858,15 +1023,15 @@ void PgServer::handleConn(int fd) {
         q = dbengine::pgwire::parseQueryMessage(msg);
       } catch (const std::exception& e) {
         auto err = dbengine::pgwire::encodeError("ERROR", "42601", e.what());
-        if (!sendAll(fd, err)) break;
-        if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+        if (!connSend(conn, err)) break;
+        if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
         continue;
       }
       if (!q.has_value()) {
         auto err = dbengine::pgwire::encodeError(
             "ERROR", "0A000", "nur Simple Protocol (Q) in V1");
-        if (!sendAll(fd, err)) break;
-        if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+        if (!connSend(conn, err)) break;
+        if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
         continue;
       }
       // Sonderpfad: byte-identisch T(?column?)/D("1")/C(SELECT 1).
@@ -875,10 +1040,10 @@ void PgServer::handleConn(int fd) {
         auto d = dbengine::pgwire::encodeDataRow({"1"});
         auto c = dbengine::pgwire::encodeCommandComplete("SELECT 1");
         auto z = dbengine::pgwire::encodeReadyForQuery('I');
-        if (!sendAll(fd, t)) break;
-        if (!sendAll(fd, d)) break;
-        if (!sendAll(fd, c)) break;
-        if (!sendAll(fd, z)) break;
+        if (!connSend(conn, t)) break;
+        if (!connSend(conn, d)) break;
+        if (!connSend(conn, c)) break;
+        if (!connSend(conn, z)) break;
         continue;
       }
       // Session: Q-String an die server-eigene Executor-Instanz.
@@ -892,22 +1057,22 @@ void PgServer::handleConn(int fd) {
         tag = res.message;
       } catch (const dbengine::sql::SqlError& e) {
         auto err = dbengine::pgwire::encodeError("ERROR", "42601", e.what());
-        if (!sendAll(fd, err)) break;
-        if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+        if (!connSend(conn, err)) break;
+        if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
         continue;
       } catch (const std::exception& e) {
         auto err = dbengine::pgwire::encodeError("ERROR", "0A000", e.what());
-        if (!sendAll(fd, err)) break;
-        if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+        if (!connSend(conn, err)) break;
+        if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
         continue;
       }
       if (!res.columns.empty()) {
         auto t = encodeRowDescriptionTyped(res.columns, oids);
-        if (!sendAll(fd, t)) break;
+        if (!connSend(conn, t)) break;
         bool ok = true;
         for (const auto& row : res.rows) {
           auto d = encodeDataRowValues(row);
-          if (!sendAll(fd, d)) {
+          if (!connSend(conn, d)) {
             ok = false;
             break;
           }
@@ -916,14 +1081,14 @@ void PgServer::handleConn(int fd) {
         if (tag.empty()) tag = "SELECT " + std::to_string(res.rows.size());
         auto c = dbengine::pgwire::encodeCommandComplete(tag);
         auto z = dbengine::pgwire::encodeReadyForQuery('I');
-        if (!sendAll(fd, c)) break;
-        if (!sendAll(fd, z)) break;
+        if (!connSend(conn, c)) break;
+        if (!connSend(conn, z)) break;
       } else {
         if (tag.empty()) tag = "SELECT 0";
         auto c = dbengine::pgwire::encodeCommandComplete(tag);
         auto z = dbengine::pgwire::encodeReadyForQuery('I');
-        if (!sendAll(fd, c)) break;
-        if (!sendAll(fd, z)) break;
+        if (!connSend(conn, c)) break;
+        if (!connSend(conn, z)) break;
       }
       continue;
     }
@@ -955,7 +1120,7 @@ void PgServer::handleConn(int fd) {
           continue;
         }
         prepStmts[pm.stmt] = pm.query;
-        if (!sendAll(fd, encodeParseComplete())) break;
+        if (!connSend(conn, encodeParseComplete())) break;
         extNeedSync = true;
         extErrZ = false;
       } catch (const std::exception& e) {
@@ -994,7 +1159,7 @@ void PgServer::handleConn(int fd) {
           continue;
         }
         portals[bm.portal] = it->second;
-        if (!sendAll(fd, encodeBindComplete())) break;
+        if (!connSend(conn, encodeBindComplete())) break;
         extNeedSync = true;
         extErrZ = false;
       } catch (const std::exception& e) {
@@ -1056,10 +1221,10 @@ void PgServer::handleConn(int fd) {
           continue;
         }
         if (!hasCols) {
-          if (!sendAll(fd, encodeNoData())) break;
+          if (!connSend(conn, encodeNoData())) break;
         } else {
           auto t = encodeRowDescriptionTyped(cols, oids);
-          if (!sendAll(fd, t)) break;
+          if (!connSend(conn, t)) break;
         }
         extNeedSync = true;
         extErrZ = false;
@@ -1093,9 +1258,9 @@ void PgServer::handleConn(int fd) {
           auto t = dbengine::pgwire::encodeRowDescription({"?column?"});
           auto d = dbengine::pgwire::encodeDataRow({"1"});
           auto c = dbengine::pgwire::encodeCommandComplete("SELECT 1");
-          if (!sendAll(fd, t)) break;
-          if (!sendAll(fd, d)) break;
-          if (!sendAll(fd, c)) break;
+          if (!connSend(conn, t)) break;
+          if (!connSend(conn, d)) break;
+          if (!connSend(conn, c)) break;
           extNeedSync = true;
           extErrZ = false;
           continue;
@@ -1119,11 +1284,11 @@ void PgServer::handleConn(int fd) {
         }
         if (!res.columns.empty()) {
           auto t = encodeRowDescriptionTyped(res.columns, oids);
-          if (!sendAll(fd, t)) break;
+          if (!connSend(conn, t)) break;
           bool ok = true;
           for (const auto& row : res.rows) {
             auto d = encodeDataRowValues(row);
-            if (!sendAll(fd, d)) {
+            if (!connSend(conn, d)) {
               ok = false;
               break;
             }
@@ -1131,11 +1296,11 @@ void PgServer::handleConn(int fd) {
           if (!ok) break;
           if (tag.empty()) tag = "SELECT " + std::to_string(res.rows.size());
           auto c = dbengine::pgwire::encodeCommandComplete(tag);
-          if (!sendAll(fd, c)) break;
+          if (!connSend(conn, c)) break;
         } else {
           if (tag.empty()) tag = "SELECT 0";
           auto c = dbengine::pgwire::encodeCommandComplete(tag);
-          if (!sendAll(fd, c)) break;
+          if (!connSend(conn, c)) break;
         }
         extNeedSync = true;
         extErrZ = false;
@@ -1156,7 +1321,7 @@ void PgServer::handleConn(int fd) {
         extErrZ = false;
         continue;  // Z des Fehlers bereits gesendet, kein Doppel-Z
       }
-      if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+      if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
       extNeedSync = false;
       extErrZ = false;
       continue;
@@ -1175,7 +1340,7 @@ void PgServer::handleConn(int fd) {
           if (brk) break;
           continue;
         }
-        if (!sendAll(fd, encodeCloseComplete())) break;
+        if (!connSend(conn, encodeCloseComplete())) break;
         extNeedSync = true;
         extErrZ = false;
       } catch (const std::exception& e) {
@@ -1187,10 +1352,10 @@ void PgServer::handleConn(int fd) {
     // Unbekannter Typ: Error + ReadyForQuery, Connection bleibt offen.
     auto err = dbengine::pgwire::encodeError(
         "ERROR", "0A000", std::string("nur Q/X in V1 (got '") + type + "')");
-    if (!sendAll(fd, err)) break;
-    if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+    if (!connSend(conn, err)) break;
+    if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
   }
-  ::close(fd);
+  closeConn();
 }
 
 }  // namespace dbengine::pgserver

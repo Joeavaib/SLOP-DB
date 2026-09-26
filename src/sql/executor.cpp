@@ -5,6 +5,8 @@
 #include <cctype>
 #include <iomanip>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 
 namespace dbengine::sql {
@@ -205,6 +207,54 @@ Value coerceValue(const Value& v, ColType type, const std::string& col) {
   return v;
 }
 
+// Alle Tabellen eines SELECTs inkl. genesteter WHERE-Subqueries (normiert).
+// Unkorrelierte Subqueries duerfen beliebige (eigene) Tabellen lesen; der
+// KV-Executor muss sie alle in die tmp-Database spiegeln, sonst wuerde die
+// Exec-Delegation an Database mit "Tabelle unbekannt" scheitern.
+void collectSelectTables(const SelectStmt& s, std::set<std::string>& out) {
+  out.insert(Executor::normalizeTable(s.table));
+  if (s.has_join) out.insert(Executor::normalizeTable(s.join_table));
+  std::vector<const SelectStmt*> stack;
+  for (auto& c : s.where)
+    if (c.subquery) stack.push_back(c.subquery.get());
+  for (auto& gr : s.where_groups)
+    for (auto& c : gr)
+      if (c.subquery) stack.push_back(c.subquery.get());
+  while (!stack.empty()) {
+    const SelectStmt* q = stack.back();
+    stack.pop_back();
+    out.insert(Executor::normalizeTable(q->table));
+    if (q->has_join) out.insert(Executor::normalizeTable(q->join_table));
+    for (auto& c : q->where)
+      if (c.subquery) stack.push_back(c.subquery.get());
+    for (auto& gr : q->where_groups)
+      for (auto& c : gr)
+        if (c.subquery) stack.push_back(c.subquery.get());
+  }
+}
+
+void collectWhereTables(const std::vector<Condition>& where,
+                        const std::vector<std::vector<Condition>>& groups,
+                        std::set<std::string>& out) {
+  std::vector<const SelectStmt*> stack;
+  for (auto& c : where)
+    if (c.subquery) stack.push_back(c.subquery.get());
+  for (auto& gr : groups)
+    for (auto& c : gr)
+      if (c.subquery) stack.push_back(c.subquery.get());
+  while (!stack.empty()) {
+    const SelectStmt* q = stack.back();
+    stack.pop_back();
+    out.insert(Executor::normalizeTable(q->table));
+    if (q->has_join) out.insert(Executor::normalizeTable(q->join_table));
+    for (auto& c : q->where)
+      if (c.subquery) stack.push_back(c.subquery.get());
+    for (auto& gr : q->where_groups)
+      for (auto& c : gr)
+        if (c.subquery) stack.push_back(c.subquery.get());
+  }
+}
+
 }  // namespace
 
 Executor::Executor(kv::KVStore& kv, txn::MvccStore& mvcc, storage::Wal* wal)
@@ -347,6 +397,11 @@ Result Executor::execute(const std::string& sql) {
     }
     Table shadow;
     shadow.columns = sch.columns;
+    (void)shadow;
+    // Subquery-Tabellen im selben Snapshot mitladen (fuer WHERE-Matching).
+    std::set<std::string> needed;
+    collectWhereTables(u.where, u.where_groups, needed);
+    needed.erase(norm);
     auto snap = kv_.GetSnapshot();
     txn::Transaction rtxn = mvcc_.BeginRead();
     std::vector<std::pair<std::string, std::vector<Value>>> vis;
@@ -360,12 +415,71 @@ Result Executor::execute(const std::string& sql) {
         continue;
       }
     }
+    std::map<std::string, std::vector<std::vector<Value>>> extraRows;
+    std::map<std::string, const TableSchema*> extraSch;
+    for (auto& tn : needed) {
+      auto jt = tables_.find(tn);
+      if (jt == tables_.end()) continue;  // tmp.execSelect wirft "unbekannt"
+      extraSch[tn] = &jt->second;
+      std::vector<std::vector<Value>> rows;
+      for (const auto& [k, v] : snap->Scan(tablePrefix(tn))) {
+        (void)v;
+        auto mv = mvcc_.Read(rtxn, k);
+        if (!mv.has_value()) continue;
+        try {
+          rows.push_back(decodeRow(*mv, jt->second.columns.size()));
+        } catch (...) {
+          continue;
+        }
+      }
+      extraRows[tn] = std::move(rows);
+    }
     mvcc_.Commit(rtxn);
     // Matching erst nach Commit des Read-Snapshots (Fehler aus WHERE
-    // hinterlassen keine offene Read-Txn).
+    // hinterlassen keine offene Read-Txn): via tmp-SELECT (Subqueries einmal
+    // aufgeloest), Rueckabbildung auf Keys per Wertevergleich.
+    Database tmp;
+    tmp.execCreate(CreateTableStmt{u.table, sch.columns, false});
+    if (!vis.empty()) {
+      InsertStmt ins;
+      ins.table = u.table;
+      ins.rows.reserve(vis.size());
+      for (auto& [k, row] : vis) ins.rows.push_back(row);
+      tmp.execInsert(ins);
+    }
+    for (auto& [tn, schp] : extraSch) {
+      tmp.execCreate(CreateTableStmt{tn, schp->columns, false});
+      auto& rows = extraRows[tn];
+      if (!rows.empty()) {
+        InsertStmt ins;
+        ins.table = tn;
+        ins.rows = rows;
+        tmp.execInsert(ins);
+      }
+    }
+    SelectStmt sel;
+    sel.table = u.table;
+    sel.select_all = true;
+    sel.where = u.where;
+    sel.where_groups = u.where_groups;
+    Result matched = tmp.execSelect(sel);
+    auto isMatch = [&](const std::vector<Value>& row) {
+      for (auto& m : matched.rows) {
+        if (m.size() != row.size()) continue;
+        bool eq = true;
+        for (std::size_t i = 0; i < row.size(); ++i) {
+          if (!valueEquals(m[i], row[i])) {
+            eq = false;
+            break;
+          }
+        }
+        if (eq) return true;
+      }
+      return false;
+    };
     std::vector<std::pair<std::string, std::string>> hits;  // (key, newEnc)
     for (auto& [k, row] : vis) {
-      if (!rowMatchesWhere(shadow, row, u.where, u.where_groups)) continue;
+      if (!isMatch(row)) continue;
       for (std::size_t i = 0; i < u.sets.size(); ++i) {
         const std::size_t ti = static_cast<std::size_t>(setIdx[i]);
         row[ti] = coerceValue(u.sets[i].second, sch.columns[ti].type,
@@ -419,6 +533,10 @@ Result Executor::execute(const std::string& sql) {
     const TableSchema& sch = it->second;
     Table shadow;
     shadow.columns = sch.columns;
+    (void)shadow;
+    std::set<std::string> needed;
+    collectWhereTables(d.where, d.where_groups, needed);
+    needed.erase(norm);
     auto snap = kv_.GetSnapshot();
     txn::Transaction rtxn = mvcc_.BeginRead();
     std::vector<std::pair<std::string, std::vector<Value>>> vis;
@@ -432,10 +550,69 @@ Result Executor::execute(const std::string& sql) {
         continue;
       }
     }
+    std::map<std::string, std::vector<std::vector<Value>>> extraRows;
+    std::map<std::string, const TableSchema*> extraSch;
+    for (auto& tn : needed) {
+      auto jt = tables_.find(tn);
+      if (jt == tables_.end()) continue;
+      extraSch[tn] = &jt->second;
+      std::vector<std::vector<Value>> rows;
+      for (const auto& [k, v] : snap->Scan(tablePrefix(tn))) {
+        (void)v;
+        auto mv = mvcc_.Read(rtxn, k);
+        if (!mv.has_value()) continue;
+        try {
+          rows.push_back(decodeRow(*mv, jt->second.columns.size()));
+        } catch (...) {
+          continue;
+        }
+      }
+      extraRows[tn] = std::move(rows);
+    }
     mvcc_.Commit(rtxn);
+    Database tmp;
+    tmp.execCreate(CreateTableStmt{d.table, sch.columns, false});
+    if (!vis.empty()) {
+      InsertStmt ins;
+      ins.table = d.table;
+      ins.rows.reserve(vis.size());
+      for (auto& [k, row] : vis) ins.rows.push_back(row);
+      tmp.execInsert(ins);
+    }
+    for (auto& [tn, schp] : extraSch) {
+      tmp.execCreate(CreateTableStmt{tn, schp->columns, false});
+      auto& rows = extraRows[tn];
+      if (!rows.empty()) {
+        InsertStmt ins;
+        ins.table = tn;
+        ins.rows = rows;
+        tmp.execInsert(ins);
+      }
+    }
+    SelectStmt sel;
+    sel.table = d.table;
+    sel.select_all = true;
+    sel.where = d.where;
+    sel.where_groups = d.where_groups;
+    Result matched = tmp.execSelect(sel);
     std::vector<std::string> keys;
     for (const auto& [k, row] : vis) {
-      if (!rowMatchesWhere(shadow, row, d.where, d.where_groups)) continue;
+      bool hit = false;
+      for (auto& m : matched.rows) {
+        if (m.size() != row.size()) continue;
+        bool eq = true;
+        for (std::size_t i = 0; i < row.size(); ++i) {
+          if (!valueEquals(m[i], row[i])) {
+            eq = false;
+            break;
+          }
+        }
+        if (eq) {
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) continue;
       keys.push_back(k);
     }
     if (keys.empty()) return {{}, {}, "DELETE 0", 0};
@@ -706,6 +883,19 @@ Result Executor::execSelect(const SelectStmt& s) {
   std::vector<std::vector<Value>> allRows = loadRows(norm, sch);
   std::vector<std::vector<Value>> allRRows;
   if (needRight) allRRows = loadRows(rnorm, *rsch);
+  // Subquery-Tabellen im selben Snapshot mitladen (unkorreliert -> konsistent).
+  std::set<std::string> needed;
+  collectSelectTables(s, needed);
+  needed.erase(norm);
+  if (s.has_join) needed.erase(rnorm);
+  std::map<std::string, std::vector<std::vector<Value>>> extraRows;
+  std::map<std::string, const TableSchema*> extraSch;
+  for (auto& tn : needed) {
+    auto jt = tables_.find(tn);
+    if (jt == tables_.end()) continue;  // tmp.execSelect wirft "unbekannt"
+    extraSch[tn] = &jt->second;
+    extraRows[tn] = loadRows(tn, jt->second);
+  }
   mvcc_.Commit(rtxn);
 
   // Filter/Projektion/JOIN an In-Memory-Database delegieren
@@ -724,6 +914,16 @@ Result Executor::execSelect(const SelectStmt& s) {
       InsertStmt ins;
       ins.table = s.join_table;
       ins.rows = allRRows;
+      tmp.execInsert(ins);
+    }
+  }
+  for (auto& [tn, schp] : extraSch) {
+    tmp.execCreate(CreateTableStmt{tn, schp->columns, false});
+    auto& rows = extraRows[tn];
+    if (!rows.empty()) {
+      InsertStmt ins;
+      ins.table = tn;
+      ins.rows = rows;
       tmp.execInsert(ins);
     }
   }

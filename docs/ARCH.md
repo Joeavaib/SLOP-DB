@@ -5,9 +5,10 @@
 > `ANFORDERUNGEN.md` (F1–F6, N1–N7, Phasen 0–3).
 >
 > V1 (s01–s20): Row-Kern + Stubs. V2 (s21–s26): echte Implementierungen —
-> siehe Kapitel 8 (HNSW-multi, PQ-N/IVF, WAL-Group-Commit, COL1-File, Raft-TCP).
+> siehe Kapitel 8 (HNSW-multi, PQ-N/IVF, WAL-Group-Commit, COL1/COL2-File, Raft-TCP).
 > Welle 8–10 (s38–s52): SQL-Aggregate/Session/Filter, Metrics/Backup/Kill-9,
 > Pager-Atomaritaet, HNSW/IVF-Skala, Auth/TLS — siehe Kapitel 9.
+> Welle 11–12: JOIN/DDL/COL2/SoA/Audit/TPC-H/Parallel-Build/Extended — siehe Kapitel 10.
 
 ## 1. Schichtenmodell
 
@@ -334,4 +335,178 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
   Sidecar (`stunnel`: `accept 5433 → connect 5432`, `envoy`-analog); Test
   `psql "sslmode=require" port 5433`; K8s nur auskommentierte Skizze
   (`tls-cert`-Secret-Volume, `stunnel`-Sidecar, `pgwire-tls`-Port 5433, nicht
-  deployed); Warnung: Auth-Hook ohne Sidecar = Klartext über Netz.
+   deployed); Warnung: Auth-Hook ohne Sidecar = Klartext über Netz.
+
+## 10. Welle 11–12 (alle STL/POSIX-only)
+
+### 10.1 JOIN — INNER, Hash vs. Nested-Loop (`sql/parser.h`, `src/sql/parser.cpp`)
+
+- Genau ein `INNER JOIN` pro `SELECT`: `FROM a [AS x] [INNER] JOIN b [AS y]
+  ON a.c = b.d [AND ...]` (`parser.h:13-16`, `parser.cpp:797-833`:
+  `Nur ein JOIN pro SELECT`, kein `LEFT/RIGHT/FULL/OUTER/CROSS`).
+- `t.c`-Refs in `SELECT/WHERE/ON/GROUP BY/ORDER BY`/Aggregat-Args
+  (`parser.h:21-23`, `parser.cpp:277-284`: `col | t.c`, nur ein Prefix).
+  Qualifizierer = Tabellenname oder Alias je Seite; unqualifiziert +
+  beidseitig vorhanden → `SqlError (ambiguous, t.c angeben)`
+  (`parser.cpp:1779-1811`, `1804-1806`); Self-Join braucht zwei Aliase.
+- Ausführung `execJoinRows` (`parser.cpp:2039-2042`): reine Equi-`ON`-Kette
+  über beide Seiten → Hash-Join über die kleinere Seite (Build/Probe,
+  `L.size() <= R.size()` vs. umgekehrt, `parser.cpp:2049-2101`), NULL-Keys
+  matchen nie (`parser.cpp:2055`); sonst Nested-Loop mit voller
+  `AND`-Auswertung (`parser.cpp:2112ff`). Output links-major
+  (`stable_sort` nach `(li,ri)` bei Links-Build).
+- `WHERE/GROUP BY/ORDER BY/LIMIT/OFFSET`/Aggregate danach auf Combined-Rows
+  `[links..., rechts...]` wie bisher (`parser.h:15-16`).
+
+### 10.2 COL2-Codec — Delta/FOR/Bitpacking (`columnar/store.h`, `src/columnar/store.cpp`)
+
+- `Save` schreibt `COL2`, `Load` liest `COL1` (Fallback) UND `COL2`
+  (`store.h:126-133`, `store.cpp:357-371/430`).
+- COL2-Int-Layout (`store.h:129-131`, `store.cpp:84-93`): Basis = `min`
+  (int64, Zonemap); `Delta_i = value_i - base` (mod 2^64);
+  `bitwidth = bit_width(max_delta)` (`ForBitWidth`, `0` = alle == min,
+  keine Worte); LSB-first bitgepackt (`PackForDeltas`, `store.cpp:101-118`),
+  `nwords = ceil(rows*bitwidth/64)`; `bitwidth==64` nur Offset 0.
+  Roundtrip exakt (`UnpackFor`, `store.cpp:120-149`).
+- File: `COL2 | u64 id | name | rows | min/max | bitwidth/nwords/Worte |
+  Dict-Strings` (`store.cpp:359-393`); `Load` mit `rows`-Mismatch-Guard
+  (`FOR`, `store.cpp:495`).
+- Grösse (Erwartung, keine Messung — Agenten-Abschaetzung): 1M monotone
+  Ints (z.B. `0..1M-1`, `max_delta ~ 1M` → `bitwidth = 20`) →
+  `1M*20 bit ≈ 2.5 MB` Int-Payload + Header/Dict. Allgemein
+  `rows*bitwidth/8` Bytes; `bitwidth==0` (konstant) → 0 Worte.
+
+### 10.3 SoA-Layout + `get()`-Semantik (`vector/hnsw.h`, `src/vector/hnsw.cpp`)
+
+- Primaer-Speicher flach: `data_flat_` (`N*dim` floats, Row-Major,
+  Zeile `id` ab `id*dim_`) + `norms_` parallel (Cosine), Invariante
+  `data_flat_.size() == size()*dim_` (`hnsw.h:283-286`).
+  Distanzkerne auf Buffer-Pointern (`row_ptr`, `hnsw.cpp:1017-1019`),
+  kein `Vector`-Umweg (`hnsw.h:33-36`).
+- `get(id)` gibt aus API-Gruenden weiter `const Vector&` zurück, backed
+  durch `thread_local`-Kopie-Puffer (`hnsw.h:37-45`, `hnsw.cpp:1021-1030`):
+  gültig nur bis zum naechsten `get()` auf DEMSELBEN Thread; zwei Refs
+  gleichzeitig halten ist UNSICHER → bei Bedarf kopieren
+  (`Vector v = idx.get(id);`). Nebenlaeufige `get()` auf VERSCHIEDENEN
+  Threads sicher; `add/clear/build` macht alte Kopien stale.
+
+### 10.4 Audit-Log — AUD1-Konvention auf WAL (`storage/wal.h`, `src/storage/wal.cpp`)
+
+- Normale WAL-Records mit Prefix `AUD1\n` + `esc(actor)\n + esc(action)\n +
+  esc(detail)` (`wal.h:37-52`, `wal.cpp:473`); Escaping pro Feld
+  `\\ → \\\\`, `\n → \\n`, strikter 5-Byte-Prefix-Match, sonst Nicht-Audit
+  → skip (`wal.h:51-52`, `wal.cpp:483-504`).
+- API: `append_audit(actor,action,detail)` (neue API only, `wal.h:94-98`),
+  `read_audit(from_lsn,max)` = `read_from` + `parse_audit`, Limit zaehlt
+  gefilterte Events (`wal.h:99-104`, `wal.cpp:520-527`); `parse_audit`
+  rein, kein Lock/Dateizugriff (`wal.h:60-64`).
+- Compliance-Vorstufe, KEIN Tamper-Schutz: ohne HMAC/Signatur/Kette,
+  faelschbar per Dateizugriff/`checkpoint()` — nur Filter-Konvention
+  (`wal.h:39-43`).
+
+### 10.5 TPC-H-Harness — Q1/Q6-Modi (`tools/bench.cpp`)
+
+- `RunSqlQ1` (`bench.cpp:289-329`): Columnar-`ScanSumLessThan`-Mikrobench
+  (Q1-Analogie `SUM(l_extendedprice) WHERE < threshold`), 5 Reps, CSV
+  `sql_q1` + stderr-Prüfsumme.
+- `RunTpch` über echten Executor (KV+MVCC-Pfad, `bench.cpp:331-336`,
+  `361-370`): deterministische `lineitem`-Tabelle (Seed 42, batched
+  `INSERT`s à 500, `bench.cpp:372-416`).
+- Q6 (`bench.cpp:419-461`): `SELECT SUM(price*disc) WHERE disc BETWEEN
+  0.05 AND 0.07 AND qty < 24 AND price >= 500 AND price < 5000 AND tax <=
+  0.05 AND shipdate BETWEEN 19940101 AND 19951231` (5x AND/Range,
+  Referenz-Summe + rel-Check `1e-9`, CSV `tpch_q6`).
+- Q1-Kern (`bench.cpp:463-466`): `SELECT rf, ls, SUM(qty), SUM(price),
+  SUM(price*disc), AVG(disc), COUNT(*) ... GROUP BY rf, ls ORDER BY rf, ls`
+  (Hash-Agg, kanonischer Hash über `valueToString`-Keys, CSV `tpch_q1`).
+
+### 10.6 DDL — UPDATE/DELETE/DROP via Tombstones (`sql/parser.h`, `src/sql/executor.cpp`)
+
+- Syntax (`parser.h:17-20`, `100-123`): `UPDATE t SET c=v [, ...] [WHERE
+  ...]` (SET-Literale typkoerziert, WHERE-DNF wie `SELECT`),
+  `DELETE FROM t [WHERE ...]` (ohne `WHERE` = alle), `DROP TABLE
+  [IF EXISTS] t` (kein `CASCADE/TRUNCATE`).
+- `UPDATE` (`executor.cpp:330-409`): Snapshot-Scan (KV-Key-Menge + nur
+  committed MVCC-Werte, kein KV-Fallback-Dirty-Read), `rowMatchesWhere`,
+  Treffer als neue Vollzeilen; WAL zuerst (Opcode `U`), dann KV-Batch,
+  dann eine Writer-Txn (MVCC-Commit, alte Version via `trx_end` abgelöst);
+  Message `UPDATE n`.
+- `DELETE` (`executor.cpp:411-473`): Treffer per Tombstone (`MVCC-Erase`
+  → `deleted`-Version, `SELECT` unsichtbar) + KV-Key hart entfernt; WAL
+  zuerst (Opcode `D`); Message `DELETE n`.
+- `DROP TABLE` (`executor.cpp:474-499`): Schema-Key + alle Row-Keys aus KV,
+  MVCC-Tombstones je Row-Key, Registry-Eintrag geloescht; WAL zuerst
+  (Opcode `T`); danach Tabelle unbekannt (`SqlError`, ausser
+  `IF EXISTS` → `DROP TABLE` 0).
+
+### 10.7 Parallel-Build — `build_parallel` (`vector/hnsw.h`, `src/vector/hnsw.cpp`)
+
+- Nur `<thread>/<mutex>/<atomic>`, kein OpenMP/TBB (`hnsw.h:168-177`);
+  `build()` = `build_parallel(1)` exakt alter Single-Pfad (`hnsw.cpp:723`).
+- Ablauf (`hnsw.h:170-177`, `hnsw.cpp:938-1010`): Level für ALLE Knoten
+  vorab sequentiell mit Seed 42 (identischer RNG-Strom → identische Level),
+  dann Knoten `1..N-1` als kontige Chunks auf Threads; ein `mutex` pro
+  Knoten-Link-Vektor + `entry_mtx` + `atomic` Fortschritt; nie zwei
+  Knoten-Locks gleichzeitig (deadlockfrei); Flach-Buffer in Parallelphase
+  read-only/groessenstabil.
+- Determinismus: gleiche Level + gleicher Algorithmus, aber Shrinks per
+  Mutex serialisiert mit scheduling-abhaengiger Reihenfolge → bei exakten
+  Distanz-Ties minimale Tie-Order-Abweichung möglich: Recall-Ziel ≥
+  Single-Stand, KEINE Bit-Identitaet (`hnsw.h:178-182`).
+- Fallback (`hnsw.cpp:981`): `n_threads<=1` oder `N < 512`
+  (`kParallelMinN`) → exakt Single-Pfad; `0` = `hardware_concurrency`
+  (min 4).
+- Speedup (Erwartung, keine Messung): bei grossen N (≫512) und
+  Core-Zahl `t` naeherungsweise `~t`-fach im Insert-Teil (Mutex nur kurz
+  um Link-Listen, Distanz auf stabilem Buffer); Single-Thread-Fallback
+  darunter ohne Regression.
+
+### 10.8 Extended-Protokoll minimal, parameterlos (`server/pgserver.h`, `src/server/pgserver.cpp`)
+
+- Pro Connection Statements+Portale (`pgserver.h:10-14`,
+  `pgserver.cpp:265-272`): `P → '1'` (ParseComplete, Query gespeichert),
+  `D(S/P) → T/n` ohne Execute (Projektions-Analyse Spalten+OIDs),
+  `B → '2'` (Portal, nur ohne Parameter), `E → T/D/C` wie Q-Pfad,
+  `S → Z`, `C(S/P) → '3'`.
+- Mit Parametern (`$n`/Bind-`nParams>0`) → `E 0A000 + Z` (`pgserver.h:14`,
+  `pgserver.cpp:930-997`); Parser/Codec-Guards
+  (`pgserver.cpp:285-385`: `Extended: ...`); Q-Sonderpfad `SELECT 1`
+  byte-identisch erhalten.
+
+### 10.9 Runbook-Ops (Welle 11–12)
+
+- Bench: `dbbench --tpch [N]` (Default 10000, Seed 42) + `sql_q1`-Modus
+  (`bench.cpp:15,289,361`); CSV `tpch_q1/tpch_q6` auf stdout, Summen/Hash
+  nach stderr; `test_bench`-kompatibel.
+- Audit: `append_audit`/`read_audit`/`parse_audit` sind WAL-local, kein
+  Daemon/Sidecar; Compliance-Hinweis aus 10.4 in Ops übernehmen (kein
+  Tamper-Schutz, `checkpoint()` kann Events verwerfen).
+- Backup/Restore/Metrics/Auth/TLS unverändert Kap. 9.5/9.6/9.10 +
+  `docs/RUNBOOK.md` Kap. 7–10; COL2-Files sind `part-*.col`-kompatibel
+  (Manifest-Zeilen unverändert, `Load` frisst COL1+COL2).
+
+### 10.10 Stale-Korrekturen zu Kap. 1/8/9 (mit Code-Beleg Datei:Zeile)
+
+- Kap. 1/6 „Mini-SQL nur `CREATE/INSERT/SELECT`" stale → korrekt:
+  `UPDATE/DELETE/DROP TABLE` + ein `INNER JOIN` vorhanden
+  (Beleg: `include/dbengine/sql/parser.h:13-20`,
+  `src/sql/executor.cpp:330,411,474`, `src/sql/parser.cpp:2042`).
+- Kap. 1/8.4 „COL1-File" stale → korrekt: `Save` schreibt `COL2`,
+  `Load` liest `COL1` (Fallback) UND `COL2`
+  (Beleg: `include/dbengine/columnar/store.h:127-128`).
+- Kap. 9.4 „Extended/COPY → `E(0A000)/Z`" stale → korrekt: Extended
+  minimal parameterlos `P/B/D/E/S/C` vorhanden (`P→1, B→2, S→Z, C→3`),
+  nur parametrisierte Pfade + `COPY`/Unbekannt → `E(0A000)`
+  (Beleg: `include/dbengine/server/pgserver.h:10-14`,
+  `src/server/pgserver.cpp:265-272,930-997`).
+- Kap. 8.1 „`build()` deterministischer Neuaufbau" unvollständig →
+  korrekt: `build()` = `build_parallel(1)`; `build_parallel` mit
+  Seed-42-Vor sampling, `kParallelMinN = 512`-Fallback, keine
+  Bit-Identitaet bei Ties
+  (Beleg: `src/vector/hnsw.cpp:723,938-981`,
+  `include/dbengine/vector/hnsw.h:168-185`).
+- Kap. 5 „HNSW-lite Single-Layer / SQ8-Stub" historisch → aktiv:
+  mehrschichtig (8.1), aktive Suche via `quant.h` (SQ8/PQ-N/IVF, 8.2/9.8),
+  SoA-Primärspeicher + `thread_local`-`get()` (10.3)
+  (Beleg: `include/dbengine/vector/hnsw.h:33-45,283-286`,
+  `src/vector/hnsw.cpp:1021-1030`).

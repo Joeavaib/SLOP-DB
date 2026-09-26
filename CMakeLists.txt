@@ -148,6 +148,21 @@ target_compile_options(test_pgserver PRIVATE -Wall -Wextra -Wpedantic)
 
 add_test(NAME pgserver COMMAND test_pgserver)
 
+# TLS opt-in (Default AUS, ohne OpenSSL): -DDBENGINE_WITH_TLS=ON schaltet bei
+# gefundenem OpenSSL den 'S'-Pfad + SSL_accept in pgserver frei; sonst bleibt
+# der PG-konforme 'N'-Fallback (STL-only, kein Link).
+find_package(OpenSSL QUIET)
+# TLS nur mit VOLLSTAENDIGEM OpenSSL (Libs + Header; manche Toolchains liefern
+# nur Libs — dann bleibt TLS sauber inaktiv statt halb-gebrochenem Build).
+if(DBENGINE_WITH_TLS)
+  if(OpenSSL_FOUND AND EXISTS "${OPENSSL_INCLUDE_DIR}/openssl/ssl.h")
+    target_compile_definitions(pgserver PUBLIC DBENGINE_WITH_TLS)
+    target_link_libraries(pgserver PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+  else()
+    message(WARNING "DBENGINE_WITH_TLS=ON aber OpenSSL unvollstaendig/nicht gefunden; TLS bleibt inaktiv")
+  endif()
+endif()
+
 # s14-clock: TSO/HLC + Commit-Wait + monoton Snapshots
 add_library(dbengine_clock STATIC src/txn/clock.cpp)
 target_include_directories(dbengine_clock PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

@@ -14,6 +14,13 @@
 //     S -> Z; C(S/P) -> '3'. Mit Parametern ($n/Bind-nParams>0) -> E 0A000+Z.
 //   'X' (Terminate) beendet die Connection sauber.
 //   Sonst (COPY/unbekannt) -> E(0A000)/Z, unveraendert.
+//   SSLRequest (len 8, Code 80877103, kein Typ-Byte) PG-konform:
+//     ohne TLS (Default, ohne DBENGINE_WITH_TLS oder ohne setTlsCert):
+//       ein Byte 'N' -> Client faellt auf Klartext zurueck, danach normaler
+//       Startup-Flow ueber denselben fd (statt FATAL wie frueher).
+//     mit TLS (DBENGINE_WITH_TLS + setTlsCert(key, cert)):
+//       ein Byte 'S' + SSL_accept auf gleichem fd, danach normaler
+//       Startup/Auth-Flow ueber TLS (R0/R3/28P01 unveraendert).
 
 #include <atomic>
 #include <map>
@@ -55,6 +62,15 @@ class PgServer {
   void setAuth(const std::map<std::string, std::string>& users);
   void setAuthRequired(bool required = false);
 
+  // TLS opt-in (PG-konform). setTlsCert(keyPath, certPath) aktiviert TLS:
+  //   SSLRequest -> 'S' + Server-Handshake, danach Startup/Auth ueber TLS.
+  //   Ohne Aufruf (Default): SSLRequest -> 'N' (Klartext-Fallback).
+  //   OpenSSL-Code ist hinter DBENGINE_WITH_TLS; ohne Define ist setTlsCert
+  //   ein No-Op (nur Pfade gespeichert) und es gilt immer der 'N'-Pfad,
+  //   STL-only, keine OpenSSL-Abhaengigkeit. Aktivierung nur via CMake
+  //   -DDBENGINE_WITH_TLS=ON mit gefundenem OpenSSL.
+  void setTlsCert(const std::string& keyPath, const std::string& certPath);
+
  private:
   void acceptLoop();
   void handleConn(int fd);
@@ -75,6 +91,13 @@ class PgServer {
   std::mutex authMu_;
   std::map<std::string, std::string> authUsers_;
   bool authRequired_ = false;
+  // TLS-Config (Pfade + Flag, Default aus). Wird pro SSLRequest unter
+  // tlsMu_ kopiert (handleConn-Threads). Handshake-Kontext wird pro
+  // Connection aufgebaut (kein geteilter SSL_CTX).
+  mutable std::mutex tlsMu_;
+  std::string tlsKeyPath_;
+  std::string tlsCertPath_;
+  bool tlsEnabled_ = false;
 };
 
 }  // namespace dbengine::pgserver

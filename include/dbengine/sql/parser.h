@@ -47,6 +47,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -87,6 +88,11 @@ struct InsertStmt {
   std::vector<std::vector<Value>> rows;
 };
 
+struct SelectStmt;  // forward fuer Condition::subquery
+
+// Max. Verschachtelungstiefe unkorrelierter Subqueries (Parser + Executor).
+inline constexpr int kMaxSubqueryDepth = 8;
+
 struct Condition {
   std::string column;  // "c" oder qualifiziert "t.c" (JOIN)
   std::string op;  // "=", "<>", "<", "<=", ">", ">=", "LIKE", "ILIKE",
@@ -95,6 +101,12 @@ struct Condition {
   Value value;              // Einzel-Literal bzw. BETWEEN-Untergrenze
   Value second;             // BETWEEN-Obergrenze (sonst NULL)
   std::vector<Value> list;  // IN-Wertliste (sonst leer)
+  // Unkorrelierte Subquery (nullptr = Literal/Liste):
+  // - "IN"/"NOT IN" + subquery = IN-Subquery (genau 1 Spalte, 0..n Zeilen,
+  //   einmal ausgefuehrt, NULL-Semantik wie IN-Liste).
+  // - Vergleichs-Op (=,<>,<,<=,>,>=) + subquery = Skalar (genau 1 Spalte,
+  //   0 Zeilen -> NULL, >1 Zeile -> SqlError).
+  std::shared_ptr<SelectStmt> subquery;
 };
 
 // UPDATE t SET c=v [, ...] [WHERE ...]: SET-Spalten sind unquoted

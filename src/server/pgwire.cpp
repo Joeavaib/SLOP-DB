@@ -40,6 +40,9 @@ StartupParams parseStartup(const uint8_t* data, std::size_t len) {
   if (msgLen != (int32_t)len)
     throw ProtoError("Startup: Laengenfeld passt nicht");
   if (proto == kSslRequestCode)
+    // Hinweis: PgServer beantwortet SSLRequest PG-konform ('N' ohne TLS,
+    // 'S' + Handshake mit TLS) und erreicht diesen Throw im Normalbetrieb
+    // nicht; direkter Codec-Gebrauch faellt hier weiterhin auf FATAL zurueck.
     throw ProtoError("SSLRequest: V1 ohne TLS (Server lehnt ab)");
   if (proto == kCancelRequestCode)
     throw ProtoError("CancelRequest: V1 nicht unterstuetzt");

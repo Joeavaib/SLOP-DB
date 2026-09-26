@@ -9,10 +9,12 @@
 #include <cstdint>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <regex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace dbengine::sql {
 namespace {
@@ -792,6 +794,9 @@ class Parser {
       }
     }
     expectKeyword("FROM");
+    if (peek().kind == TokKind::Symbol && peek().text == "(")
+      throw SqlError(
+          "FROM (SELECT ...) wird nicht unterstuetzt (keine Derived Tables)");
     s.table = parseIdent();
     s.table_alias = parseOptAlias();
     // Genau ein optionaler INNER JOIN: [INNER] JOIN u [AS y] ON ... [AND ...].
@@ -807,6 +812,9 @@ class Parser {
             "CROSS JOIN)");
       }
       s.has_join = true;
+      if (peek().kind == TokKind::Symbol && peek().text == "(")
+        throw SqlError(
+            "JOIN (SELECT ...) wird nicht unterstuetzt (keine Derived Tables)");
       s.join_table = parseIdent();
       s.join_alias = parseOptAlias();
       expectKeyword("ON");
@@ -1002,6 +1010,24 @@ class Parser {
       if (kw == "IN") {
         c.op = neg ? "NOT IN" : "IN";
         expectSymbol("(");
+        if (peekKeyword("SELECT")) {
+          // Unkorrelierte IN-Subquery: col IN (SELECT c FROM t2 [WHERE ...]).
+          if (subdepth_ >= kMaxSubqueryDepth)
+            throw SqlError("Subquery-Tiefe ueberschritten (max 8)");
+          expectKeyword("SELECT");
+          ++subdepth_;
+          SelectStmt sub;
+          try {
+            sub = parseSelect();
+          } catch (...) {
+            --subdepth_;
+            throw;
+          }
+          --subdepth_;
+          expectSymbol(")");
+          c.subquery = std::make_shared<SelectStmt>(std::move(sub));
+          return c;
+        }
         if (peek().kind == TokKind::Symbol && peek().text == ")")
           throw SqlError("IN-Liste darf nicht leer sein");
         while (true) {
@@ -1037,6 +1063,27 @@ class Parser {
       if (!ok) throw SqlError("Unbekannter Operator: " + t.text);
       c.op = t.text;
       if (c.op == "!=") c.op = "<>";
+      // Skalare Subquery: col =(SELECT ...) / Vergleiche gegen
+      // Single-Row-Single-Col-Subquery.
+      if (peek().kind == TokKind::Symbol && peek().text == "(" &&
+          peekKeyword("SELECT", 1)) {
+        if (subdepth_ >= kMaxSubqueryDepth)
+          throw SqlError("Subquery-Tiefe ueberschritten (max 8)");
+        expectSymbol("(");
+        expectKeyword("SELECT");
+        ++subdepth_;
+        SelectStmt sub;
+        try {
+          sub = parseSelect();
+        } catch (...) {
+          --subdepth_;
+          throw;
+        }
+        --subdepth_;
+        expectSymbol(")");
+        c.subquery = std::make_shared<SelectStmt>(std::move(sub));
+        return c;
+      }
       c.value = parseLiteral();
       return c;
     }
@@ -1045,6 +1092,7 @@ class Parser {
 
   std::vector<Token> toks_;
   std::size_t pos_ = 0;
+  int subdepth_ = 0;  // Verschachtelungstiefe von WHERE-Subqueries (max 8)
 };
 
 bool likeMatch(const std::string& s, const std::string& pat, bool ci) {
@@ -1107,6 +1155,8 @@ int compareValues(const Value& a, const Value& b) {
 
 bool evalCondition(const Table& t, const std::vector<Value>& row,
                    const Condition& c) {
+  if (c.subquery)
+    throw SqlError("Subquery ohne Ausfuehrungskontext (interner Fehler)");
   int idx = t.colIndex(c.column);
   if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
   const Value& v = row[(std::size_t)idx];
@@ -1846,6 +1896,8 @@ bool evalJoinOnCond(const JoinCtx& j, const std::vector<Value>& crow,
 // Aufloesung join-bewusst).
 bool evalJoinCondition(const JoinCtx& j, const std::vector<Value>& crow,
                        const Condition& c) {
+  if (c.subquery)
+    throw SqlError("Subquery ohne Ausfuehrungskontext (interner Fehler)");
   int idx = resolveJoinCol(j, c.column);
   const Value& v = crow[static_cast<std::size_t>(idx)];
   if (c.op == "IS NULL") return valueIsNull(v);
@@ -2011,6 +2063,252 @@ Value computeJoinAggregate(
     return any ? best : Value{std::monostate{}};
   }
   throw SqlError("Unbekannte Aggregatfunktion: " + a.func);
+}
+
+// ---------- Unkorrelierte Subqueries (IN + Skalar) ----------
+// Design: WHERE-Conditions tragen optional ein shared_ptr<SelectStmt>.
+// Ausfuehrung in Database::execSelect/Update/Delete: Subquery EINMAL
+// ausfuehren (IN -> Wertemenge, Skalar -> Einzelwert), dann Membership bzw.
+// Vergleich pro Zeile. Korrelierte Refs -> expliziter SqlError, Tiefe max 8.
+// Scope-Tracking via thread-lokalen Stack (keine Signaturaenderung der
+// bestehenden Eval-Funktionen).
+
+struct ScopeTable {
+  std::unordered_set<std::string> quals;  // lower: Tabellenname + Alias
+  const Table* table = nullptr;           // null wenn Tabelle (noch) unbekannt
+};
+struct Scope {
+  std::vector<ScopeTable> tables;  // 1 Eintrag single, 2 bei JOIN
+};
+thread_local std::vector<Scope> g_scopes;
+
+struct SubRes {
+  bool is_in = false;  // true = IN/NOT IN-Menge, false = Skalarwert
+  std::vector<Value> set;
+  Value scalar{std::monostate{}};
+};
+using SubMap = std::map<const SelectStmt*, SubRes>;
+
+struct ScopeGuard {
+  ~ScopeGuard() {
+    if (!g_scopes.empty()) g_scopes.pop_back();
+  }
+};
+
+void collectAggRefs(const std::shared_ptr<AggExpr>& e,
+                    std::vector<std::string>& out) {
+  if (!e) return;
+  if (e->kind == AggExpr::Kind::Column) {
+    out.push_back(e->column);
+    return;
+  }
+  if (e->kind == AggExpr::Kind::Binary) {
+    collectAggRefs(e->left, out);
+    collectAggRefs(e->right, out);
+  }
+}
+
+// Direkte Spaltenrefs eines SELECTs (ohne den Inhalt genesteter Subqueries;
+// deren Refs werden bei deren eigener Ausfuehrung mit erweitertem Stack
+// geprueft).
+void collectDirectRefs(const SelectStmt& s, std::vector<std::string>& out) {
+  for (auto& c : s.columns) out.push_back(c);
+  for (auto& g : s.group_by) out.push_back(g);
+  for (auto& a : s.aggregates) collectAggRefs(a.arg, out);
+  for (auto& c : s.where) out.push_back(c.column);
+  for (auto& gr : s.where_groups)
+    for (auto& c : gr) out.push_back(c.column);
+  for (auto& jc : s.join_on) {
+    out.push_back(jc.left);
+    if (jc.right_is_col) out.push_back(jc.right);
+  }
+  for (auto& o : s.order_by) {
+    if (o.is_agg)
+      collectAggRefs(o.agg.arg, out);
+    else if (!o.is_ordinal)
+      out.push_back(o.column);
+  }
+}
+
+bool resolvesInner(const Scope& inner, const std::string& ref) {
+  auto pos = ref.find('.');
+  if (pos != std::string::npos) {
+    std::string pre = foldIdent(ref.substr(0, pos));
+    for (auto& t : inner.tables)
+      if (t.quals.count(pre)) return true;
+    return false;
+  }
+  for (auto& t : inner.tables) {
+    if (t.table && t.table->colIndex(ref) >= 0) return true;
+  }
+  return false;
+}
+
+bool matchesOuter(const Scope& outer, const std::string& ref) {
+  auto pos = ref.find('.');
+  if (pos != std::string::npos) {
+    std::string pre = foldIdent(ref.substr(0, pos));
+    for (auto& t : outer.tables)
+      if (t.quals.count(pre)) return true;
+    return false;
+  }
+  for (auto& t : outer.tables) {
+    if (t.table && t.table->colIndex(ref) >= 0) return true;
+  }
+  return false;
+}
+
+// Eigene Refs gegen aeussere Scopes pruefen (korreliert -> expliziter Fehler).
+// Aufruf im Kind-Kontext: g_scopes enthaelt bereits alle aeusseren Queries.
+void validateNotCorrelated(const SelectStmt& sub, const Scope& inner) {
+  std::vector<std::string> refs;
+  collectDirectRefs(sub, refs);
+  for (auto& r : refs) {
+    if (resolvesInner(inner, r)) continue;
+    for (auto it = g_scopes.rbegin(); it != g_scopes.rend(); ++it) {
+      if (matchesOuter(*it, r))
+        throw SqlError(
+            "Korrelierte Subquery wird nicht unterstuetzt (Referenz: " + r +
+            ")");
+    }
+  }
+}
+
+Scope buildScopeFor(const Database& db, const SelectStmt& s) {
+  Scope sc;
+  auto lookup = [&](const std::string& t) -> const Table* {
+    if (!db.hasTable(t)) return nullptr;
+    try {
+      return &db.getTable(t);
+    } catch (...) {
+      return nullptr;
+    }
+  };
+  if (s.has_join) {
+    ScopeTable l, r;
+    l.quals.insert(foldIdent(s.table));
+    if (!s.table_alias.empty()) l.quals.insert(foldIdent(s.table_alias));
+    l.table = lookup(s.table);
+    r.quals.insert(foldIdent(s.join_table));
+    if (!s.join_alias.empty()) r.quals.insert(foldIdent(s.join_alias));
+    r.table = lookup(s.join_table);
+    sc.tables.push_back(std::move(l));
+    sc.tables.push_back(std::move(r));
+  } else {
+    ScopeTable e;
+    e.quals.insert(foldIdent(s.table));
+    if (!s.table_alias.empty()) e.quals.insert(foldIdent(s.table_alias));
+    e.table = lookup(s.table);
+    sc.tables.push_back(std::move(e));
+  }
+  return sc;
+}
+
+bool evalScalarCmp(const Value& v, const std::string& op, const Value& sv) {
+  if (valueIsNull(v) || valueIsNull(sv)) return false;
+  int cmp = compareValues(v, sv);
+  if (cmp == -2) return false;
+  if (op == "=") return cmp == 0;
+  if (op == "<>") return cmp != 0;
+  if (op == "<") return cmp < 0;
+  if (op == "<=") return cmp <= 0;
+  if (op == ">") return cmp > 0;
+  if (op == ">=") return cmp >= 0;
+  throw SqlError("Unbekannter Operator vor Subquery: " + op);
+}
+
+// Single-Table Condition mit Subquery-Kontext (ohne Subquery -> Altpfad).
+bool evalConditionSub(const Table& t, const std::vector<Value>& row,
+                      const Condition& c, const SubMap& m) {
+  if (!c.subquery) return evalCondition(t, row, c);
+  auto it = m.find(c.subquery.get());
+  if (it == m.end()) throw SqlError("Subquery nicht aufgeloest");
+  const SubRes& sr = it->second;
+  int idx = t.colIndex(c.column);
+  if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
+  const Value& v = row[static_cast<std::size_t>(idx)];
+  if (sr.is_in) {
+    bool is_not = (c.op == "NOT IN");
+    if (valueIsNull(v)) return false;
+    bool has_null = false;
+    for (auto& e : sr.set) {
+      if (valueIsNull(e)) {
+        has_null = true;
+        continue;
+      }
+      if (compareValues(v, e) == 0) return !is_not;
+    }
+    if (!is_not) return false;
+    return !has_null;
+  }
+  return evalScalarCmp(v, c.op, sr.scalar);
+}
+
+bool evalWhereSub(const Table& t, const std::vector<Value>& row,
+                  const std::vector<Condition>& where,
+                  const std::vector<std::vector<Condition>>& groups,
+                  const SubMap& m) {
+  if (!groups.empty()) {
+    for (auto& conj : groups) {
+      bool ok = true;
+      for (auto& c : conj) {
+        if (!evalConditionSub(t, row, c, m)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
+  for (auto& c : where)
+    if (!evalConditionSub(t, row, c, m)) return false;
+  return true;
+}
+
+bool evalJoinConditionSub(const JoinCtx& j, const std::vector<Value>& crow,
+                          const Condition& c, const SubMap& m) {
+  if (!c.subquery) return evalJoinCondition(j, crow, c);
+  auto it = m.find(c.subquery.get());
+  if (it == m.end()) throw SqlError("Subquery nicht aufgeloest");
+  const SubRes& sr = it->second;
+  int idx = resolveJoinCol(j, c.column);
+  const Value& v = crow[static_cast<std::size_t>(idx)];
+  if (sr.is_in) {
+    bool is_not = (c.op == "NOT IN");
+    if (valueIsNull(v)) return false;
+    bool has_null = false;
+    for (auto& e : sr.set) {
+      if (valueIsNull(e)) {
+        has_null = true;
+        continue;
+      }
+      if (compareValues(v, e) == 0) return !is_not;
+    }
+    if (!is_not) return false;
+    return !has_null;
+  }
+  return evalScalarCmp(v, c.op, sr.scalar);
+}
+
+bool evalJoinWhereSub(const JoinCtx& j, const std::vector<Value>& crow,
+                      const SelectStmt& s, const SubMap& m) {
+  if (!s.where_groups.empty()) {
+    for (auto& conj : s.where_groups) {
+      bool ok = true;
+      for (auto& c : conj) {
+        if (!evalJoinConditionSub(j, crow, c, m)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
+  for (auto& c : s.where)
+    if (!evalJoinConditionSub(j, crow, c, m)) return false;
+  return true;
 }
 
 // Hashbar? Nur reine Equi-Kette ("=" Spalte-zu-Spalte, je eine Seite).
@@ -2435,12 +2733,16 @@ Result execJoinGroupedAggregates(
 }
 
 // Join-Treiber: Join -> WHERE -> Gruppe/Aggregat/Plain -> ORDER/LIMIT.
-Result execJoinSelect(const JoinCtx& j, const SelectStmt& s) {
+// subs enthaelt einmalig aufgeloeste WHERE-Subqueries (leer = Altverhalten).
+Result execJoinSelect(const JoinCtx& j, const SelectStmt& s,
+                      const SubMap& subs = SubMap{}) {
   std::vector<std::vector<Value>> joined = execJoinRows(j, s);
   std::vector<std::vector<Value>> kept;
   kept.reserve(joined.size());
   for (auto& row : joined)
-    if (evalJoinWhere(j, row, s)) kept.push_back(row);
+    if (subs.empty() ? evalJoinWhere(j, row, s)
+                     : evalJoinWhereSub(j, row, s, subs))
+      kept.push_back(row);
   if (!s.group_by.empty()) {
     return execJoinGroupedAggregates(j, kept, s);
   }
@@ -2636,12 +2938,49 @@ Result Database::execUpdate(const UpdateStmt& s) {
     if (idx < 0) throw SqlError("Unbekannte Spalte: " + col);
     setIdx.push_back(idx);
   }
+  if (g_scopes.size() >= static_cast<std::size_t>(kMaxSubqueryDepth))
+    throw SqlError("Subquery-Tiefe ueberschritten (max 8)");
+  Scope outer;
+  ScopeTable e;
+  e.quals.insert(foldIdent(s.table));
+  e.table = &t;
+  outer.tables.push_back(std::move(e));
+  g_scopes.push_back(std::move(outer));
+  ScopeGuard guard;
+  SubMap subs;
+  auto resolve = [&](const Condition& c) {
+    if (!c.subquery) return;
+    if (subs.count(c.subquery.get())) return;
+    Result r = execSelect(*c.subquery);
+    if (r.columns.size() != 1)
+      throw SqlError("Subquery muss genau eine Spalte liefern");
+    SubRes sr;
+    if (c.op == "IN" || c.op == "NOT IN") {
+      sr.is_in = true;
+      for (auto& row : r.rows) sr.set.push_back(row[0]);
+    } else {
+      sr.is_in = false;
+      if (r.rows.empty())
+        sr.scalar = Value{std::monostate{}};
+      else if (r.rows.size() > 1)
+        throw SqlError("Skalar-Subquery liefert mehr als eine Zeile");
+      else
+        sr.scalar = r.rows[0][0];
+    }
+    subs[c.subquery.get()] = std::move(sr);
+  };
+  for (auto& c : s.where) resolve(c);
+  for (auto& gr : s.where_groups)
+    for (auto& c : gr) resolve(c);
   SelectStmt f;
   f.where = s.where;
   f.where_groups = s.where_groups;
   std::size_t n = 0;
   for (auto& row : t.rows) {
-    if (!evalWhere(t, row, f)) continue;
+    bool ok = subs.empty()
+                  ? evalWhere(t, row, f)
+                  : evalWhereSub(t, row, s.where, s.where_groups, subs);
+    if (!ok) continue;
     for (std::size_t i = 0; i < s.sets.size(); ++i) {
       const std::size_t ti = static_cast<std::size_t>(setIdx[i]);
       row[ti] = coerceTo(s.sets[i].second, t.columns[ti].type,
@@ -2656,13 +2995,51 @@ Result Database::execDelete(const DeleteStmt& s) {
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
   Table& t = it->second;
+  if (g_scopes.size() >= static_cast<std::size_t>(kMaxSubqueryDepth))
+    throw SqlError("Subquery-Tiefe ueberschritten (max 8)");
+  Scope outer;
+  ScopeTable e;
+  e.quals.insert(foldIdent(s.table));
+  e.table = &t;
+  outer.tables.push_back(std::move(e));
+  g_scopes.push_back(std::move(outer));
+  ScopeGuard guard;
+  SubMap subs;
+  auto resolve = [&](const Condition& c) {
+    if (!c.subquery) return;
+    if (subs.count(c.subquery.get())) return;
+    Result r = execSelect(*c.subquery);
+    if (r.columns.size() != 1)
+      throw SqlError("Subquery muss genau eine Spalte liefern");
+    SubRes sr;
+    if (c.op == "IN" || c.op == "NOT IN") {
+      sr.is_in = true;
+      for (auto& row : r.rows) sr.set.push_back(row[0]);
+    } else {
+      sr.is_in = false;
+      if (r.rows.empty())
+        sr.scalar = Value{std::monostate{}};
+      else if (r.rows.size() > 1)
+        throw SqlError("Skalar-Subquery liefert mehr als eine Zeile");
+      else
+        sr.scalar = r.rows[0][0];
+    }
+    subs[c.subquery.get()] = std::move(sr);
+  };
+  for (auto& c : s.where) resolve(c);
+  for (auto& gr : s.where_groups)
+    for (auto& c : gr) resolve(c);
   SelectStmt f;
   f.where = s.where;
   f.where_groups = s.where_groups;
   std::vector<std::vector<Value>> kept;
   kept.reserve(t.rows.size());
-  for (auto& row : t.rows)
-    if (!evalWhere(t, row, f)) kept.push_back(row);
+  for (auto& row : t.rows) {
+    bool ok = subs.empty()
+                  ? evalWhere(t, row, f)
+                  : evalWhereSub(t, row, s.where, s.where_groups, subs);
+    if (!ok) kept.push_back(row);
+  }
   std::size_t n = t.rows.size() - kept.size();
   t.rows = std::move(kept);
   return { {}, {}, "DELETE " + std::to_string(n), n };
@@ -2679,6 +3056,38 @@ Result Database::execDrop(const DropTableStmt& s) {
 }
 
 Result Database::execSelect(const SelectStmt& s) {
+  if (g_scopes.size() >= static_cast<std::size_t>(kMaxSubqueryDepth))
+    throw SqlError("Subquery-Tiefe ueberschritten (max 8)");
+  Scope my = buildScopeFor(*this, s);
+  validateNotCorrelated(s, my);
+  g_scopes.push_back(std::move(my));
+  ScopeGuard guard;
+  // WHERE-Subqueries je einmal ausfuehren (IN -> Menge, Skalar -> Wert).
+  SubMap subs;
+  auto resolve = [&](const Condition& c) {
+    if (!c.subquery) return;
+    if (subs.count(c.subquery.get())) return;
+    Result r = execSelect(*c.subquery);
+    if (r.columns.size() != 1)
+      throw SqlError("Subquery muss genau eine Spalte liefern");
+    SubRes sr;
+    if (c.op == "IN" || c.op == "NOT IN") {
+      sr.is_in = true;
+      for (auto& row : r.rows) sr.set.push_back(row[0]);
+    } else {
+      sr.is_in = false;
+      if (r.rows.empty())
+        sr.scalar = Value{std::monostate{}};
+      else if (r.rows.size() > 1)
+        throw SqlError("Skalar-Subquery liefert mehr als eine Zeile");
+      else
+        sr.scalar = r.rows[0][0];
+    }
+    subs[c.subquery.get()] = std::move(sr);
+  };
+  for (auto& c : s.where) resolve(c);
+  for (auto& gr : s.where_groups)
+    for (auto& c : gr) resolve(c);
   if (s.has_join) {
     auto lit = tables_.find(foldIdent(s.table));
     if (lit == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
@@ -2700,15 +3109,18 @@ Result Database::execSelect(const SelectStmt& s) {
           "JOIN t AS y ...)");
     if (s.join_on.empty())
       throw SqlError("JOIN ohne ON wird nicht unterstuetzt");
-    return execJoinSelect(j, s);
+    return execJoinSelect(j, s, subs);
   }
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
   const Table& t = it->second;
-  // Filter (AND bzw. DNF bei OR)
+  // Filter (AND bzw. DNF bei OR; ohne Subqueries exakt der Altpfad)
   std::vector<std::vector<Value>> kept;
   for (auto& row : t.rows) {
-    if (evalWhere(t, row, s)) kept.push_back(row);
+    bool ok = subs.empty()
+                  ? evalWhere(t, row, s)
+                  : evalWhereSub(t, row, s.where, s.where_groups, subs);
+    if (ok) kept.push_back(row);
   }
   if (!s.group_by.empty()) {
     return execGroupedAggregates(t, kept, s);

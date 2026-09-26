@@ -167,6 +167,14 @@ class ColumnarStore {
     size_t rows_scanned = 0;
   };
   ScanResult ScanSumLessThan(int64_t threshold) const;
+  // Paralleler Scan (Baseline: ScanSumLessThan bleibt unveraendert).
+  //  n_threads==0 -> hardware_concurrency (0->4 als Fallback), 1 -> Single-Pfad.
+  //  Ein Thread pro sealed Part (immutable, kein Lock) + aktiver Part im
+  //  Caller-Thread, Teilsummen via Futures, deterministisch in Part-Reihenfolge
+  //  kombiniert (sealed 0..N-1, dann aktiv). Fallback (byte-identisch):
+  //  n_threads<=1 oder Scan-Units<=1 -> ScanSumLessThan(threshold).
+  ScanResult ScanSumLessThanParallel(int64_t threshold,
+                                     unsigned n_threads = 0) const;
 
   bool ExportCsv(const std::string& path) const;
   bool ExportBinary(const std::string& path) const;

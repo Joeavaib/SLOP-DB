@@ -108,6 +108,8 @@ RaftGroup::RaftGroup(int shard_id, std::string range_start, std::string range_en
   for (int i = 0; i < kGroupSize; ++i) {
     Node n;
     n.id = i;
+    n.election_timeout_ms = election_timeout_for(i);
+    n.last_heartbeat_ms = 0;
     nodes_.push_back(std::move(n));
   }
   // Initiale Wahl, damit die Gruppe direkt einen Leader hat.
@@ -123,6 +125,7 @@ RaftGroup::RaftGroup(RaftGroup&& other) noexcept {
   term_ = other.term_;
   log_base_ = other.log_base_;
   autosave_path_ = std::move(other.autosave_path_);
+  auto_election_ = other.auto_election_;
 }
 
 RaftGroup& RaftGroup::operator=(RaftGroup&& other) noexcept {
@@ -134,6 +137,7 @@ RaftGroup& RaftGroup::operator=(RaftGroup&& other) noexcept {
     term_ = other.term_;
     log_base_ = other.log_base_;
     autosave_path_ = std::move(other.autosave_path_);
+    auto_election_ = other.auto_election_;
   }
   return *this;
 }
@@ -348,6 +352,19 @@ void RaftGroup::reviveNode(int node_id) {
   Node& n = nodes_[static_cast<std::size_t>(node_id)];
   n.alive = true;
   n.role = Role::Follower;
+  // Timer-Sync: revived Knoten auf max. Heartbeat der Lebenden ziehen, damit
+  // er im Auto-Modus nicht sofort spurious zur Wahl zwingt (kein Clock-Param
+  // hier, daher max-Heuristik; deterministisch, kein Einfluss auf Log/Commit).
+  std::uint64_t hb_max = n.last_heartbeat_ms;
+  for (const auto& m : nodes_) {
+    if (m.alive && m.id != node_id && m.last_heartbeat_ms > hb_max) {
+      hb_max = m.last_heartbeat_ms;
+    }
+  }
+  n.last_heartbeat_ms = hb_max;
+  if (n.election_timeout_ms < 150 || n.election_timeout_ms > 300) {
+    n.election_timeout_ms = election_timeout_for(node_id);
+  }
   // Catch-up: volles Leader-Log kopieren, commit angleichen, apply.
   if (leader_id_ >= 0 && leader_id_ != node_id) {
     const Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
@@ -357,6 +374,105 @@ void RaftGroup::reviveNode(int node_id) {
     n.commit_index = leader.commit_index;
     apply(n);
   }
+}
+
+// ---- sXX: Timer-Election (Fake-Clock, Opt-in) ------------------------------
+std::uint64_t RaftGroup::election_timeout_for(int node_id) noexcept {
+  // Deterministisch aus node_id, kein RNG. 150-300ms, je Knoten verschieden
+  // (Stagger gegen Split-Vote): id0=251, id1=167, id2=234, periodisch fort.
+  const long long v = static_cast<long long>(node_id) * 67LL + 101LL;
+  long long m = v % 151LL;
+  if (m < 0) m += 151LL;
+  return static_cast<std::uint64_t>(150LL + m);
+}
+
+void RaftGroup::enable_auto_election(std::uint64_t now_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto_election_ = true;
+  for (auto& n : nodes_) {
+    if (n.election_timeout_ms < 150 || n.election_timeout_ms > 300) {
+      n.election_timeout_ms = election_timeout_for(n.id);
+    }
+    if (n.alive) n.last_heartbeat_ms = now_ms;
+  }
+}
+
+void RaftGroup::disable_auto_election() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto_election_ = false;
+}
+
+bool RaftGroup::auto_election() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return auto_election_;
+}
+
+std::uint64_t RaftGroup::last_heartbeat_ms(int node_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (node_id < 0 || node_id >= static_cast<int>(nodes_.size())) return 0;
+  return nodes_[static_cast<std::size_t>(node_id)].last_heartbeat_ms;
+}
+
+std::uint64_t RaftGroup::election_timeout_ms(int node_id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (node_id < 0 || node_id >= static_cast<int>(nodes_.size())) return 0;
+  return nodes_[static_cast<std::size_t>(node_id)].election_timeout_ms;
+}
+
+void RaftGroup::heartbeat(int node_id, std::uint64_t now_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (node_id < 0 || node_id >= static_cast<int>(nodes_.size())) return;
+  nodes_[static_cast<std::size_t>(node_id)].last_heartbeat_ms = now_ms;
+}
+
+int RaftGroup::tick(std::uint64_t now_ms) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!auto_election_) return leader_id_;
+  int alive = 0;
+  for (const auto& n : nodes_) {
+    if (n.alive) ++alive;
+  }
+  const bool leader_alive =
+      leader_id_ >= 0 &&
+      leader_id_ < static_cast<int>(nodes_.size()) &&
+      nodes_[static_cast<std::size_t>(leader_id_)].alive;
+  // Timeout pruefen (saturierend gegen rueckwaertige Clock): nur lebende
+  // Nicht-Leader zaehlen; bei fehlendem Leader alle Lebenden.
+  bool expired = false;
+  for (const auto& n : nodes_) {
+    if (!n.alive) continue;
+    if (leader_alive && n.id == leader_id_) continue;
+    const std::uint64_t last = n.last_heartbeat_ms;
+    const std::uint64_t elapsed = (now_ms >= last) ? (now_ms - last) : 0;
+    if (elapsed >= n.election_timeout_ms) {
+      expired = true;
+      break;
+    }
+  }
+  if (expired) {
+    if (alive < 2) return leader_id_;  // kein Quorum: kein Commit, keine Wahl
+    int candidate = -1;
+    for (const auto& n : nodes_) {
+      if (n.alive) {
+        candidate = n.id;
+        break;
+      }
+    }
+    if (candidate < 0) return leader_id_;
+    ++term_;
+    electLocked(candidate);
+    for (auto& n : nodes_) {
+      if (n.alive) n.last_heartbeat_ms = now_ms;
+    }
+    return leader_id_;
+  }
+  if (leader_alive) {
+    // Leader-Heartbeat: nur Timer resyncen, KEIN Log-Eintrag/Commit-Touch.
+    for (auto& n : nodes_) {
+      if (n.alive) n.last_heartbeat_ms = now_ms;
+    }
+  }
+  return leader_id_;
 }
 
 std::uint64_t RaftGroup::commitIndex() const {
