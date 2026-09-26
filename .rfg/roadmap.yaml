@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 13 (production): Subqueries (IN/scalar), natives TLS optional (OpenSSL, default aus), Raft-Timer (Heartbeat/Wahl-Timeout), paralleler Columnar-Scan, Doku. Alles verifiziert."
+  statement: "C++ DB Engine Welle 14 (SQL-Speed): Executor-Streaming ohne Temp-DB-Kopie + Projektions-Pushdown, MVCC-Fast-Path bei Single-Version, Q1/Q6-Luecke zu SQLite/DuckDB deutlich kleiner. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -553,3 +553,40 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
     engine: implement
     want: "ARCH-Update Welle 11-12: JOIN/DDL/Subquery-Stand, Extended/Auth/TLS, Backup/Metrics/Runbook, Pager-Atomar, IVF, TPC-H-Zahlen; stale Aussagen korrigiert"
+  - id: s68-execperf
+    title: s68-execperf
+    paths:
+      - src/sql/executor.cpp
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "Executor-Streaming: Auswertung direkt auf Snapshot-Rows ohne Temp-DB-Kopie, Projektions-Pushdown (nur benoetigte Spalten dekodieren), gleiche Semantik/Tests gruene"
+  - id: s69-mvccfast
+    title: s69-mvccfast
+    paths:
+      - src/txn/mvcc.cpp
+      - include/dbengine/txn/mvcc.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"mvcc|executor|chaos\" --output-on-failure"
+    engine: implement
+    want: "MVCC-Fast-Path: Single-Version-Shortcut mit Sequenz-Check (Snapshot-Semantik erhalten), Versionssuche ohne Allokationen, Tests gruene"
+  - id: s70-colsql
+    title: s70-colsql
+    paths:
+      - src/sql/executor.cpp
+      - include/dbengine/sql/executor.h
+      - src/columnar/store.cpp
+      - include/dbengine/columnar/store.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|columnar\" --output-on-failure"
+    engine: implement
+    want: "HTAP-Scan-Replika: INSERT spiegelt in Columnar-Parts mit Commit-LSN-Tags, Snapshot-Scans lesen Replika (Teile > Snapshot unsichtbar), KV/MVCC bleibt Wahrheit, Tests gruene"
+  - id: s71-annscale
+    title: s71-annscale
+    paths:
+      - src/vector/hnsw.cpp
+      - include/dbengine/vector/hnsw.h
+      - src/vector/quant.cpp
+      - include/dbengine/vector/quant.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: "ANN-Skala: ef-Autotune per Default (N-abhaengig), IVF als Gross-Pfad verdrahtet + dokumentiert, Recall bei 100k uniform >= 0.8, Tests gruene"

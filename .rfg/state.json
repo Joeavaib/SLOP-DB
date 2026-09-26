@@ -66,7 +66,11 @@
     "s64-tlsnative",
     "s65-rafttimer",
     "s66-colpar",
-    "s67-docs1213"
+    "s67-docs1213",
+    "s68-execperf",
+    "s69-mvccfast",
+    "s70-colsql",
+    "s71-annscale"
   ],
   "verified": [
     "s07-index",
@@ -135,16 +139,20 @@
     "s64-tlsnative",
     "s65-rafttimer",
     "s66-colpar",
-    "s67-docs1213"
+    "s67-docs1213",
+    "s68-execperf",
+    "s69-mvccfast",
+    "s70-colsql",
+    "s71-annscale"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s67-docs1213-1790460459",
-    "step_id": "s67-docs1213",
-    "commit": "784c81d619c2314d553321baa34b3c13ea302e8e",
+    "id": "cp-s71-annscale-1790462083",
+    "step_id": "s71-annscale",
+    "commit": "1a1f645277a64c0908b70b0df6cfbfa77b6fddb9",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-26T22:07:39.012252+00:00"
+    "created_at": "2026-09-26T22:34:43.193736+00:00"
   },
   "checkpoints": [
     {
@@ -552,6 +560,34 @@
       "commit": "784c81d619c2314d553321baa34b3c13ea302e8e",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-26T22:07:39.012252+00:00"
+    },
+    {
+      "id": "cp-s68-execperf-1790461264",
+      "step_id": "s68-execperf",
+      "commit": "f0ca842553df6acd2fae4962d17fc127bfe236a0",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T22:21:04.130308+00:00"
+    },
+    {
+      "id": "cp-s69-mvccfast-1790461277",
+      "step_id": "s69-mvccfast",
+      "commit": "9511f826d42a48bc7f081d7c2e9d62d0a1827bc0",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T22:21:17.977282+00:00"
+    },
+    {
+      "id": "cp-s70-colsql-1790462065",
+      "step_id": "s70-colsql",
+      "commit": "85a081713cf969daead2bf26e0be0ed9cba4d377",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T22:34:25.780036+00:00"
+    },
+    {
+      "id": "cp-s71-annscale-1790462083",
+      "step_id": "s71-annscale",
+      "commit": "1a1f645277a64c0908b70b0df6cfbfa77b6fddb9",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T22:34:43.193736+00:00"
     }
   ],
   "claim_step": "",
