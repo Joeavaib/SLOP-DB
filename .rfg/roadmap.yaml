@@ -300,3 +300,11 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
     engine: implement
     want: "Entry-Diversifizierung: Multi-Start-Descent ueber obere Layer (deterministisch), Queries entkommen falschem Cluster, uniform-Recall >= Stand, clustered-Recall hoch"
+  - id: s37-hnswcross
+    title: s37-hnswcross
+    paths:
+      - src/vector/hnsw.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: "Cross-Cluster-Kanten beim Insert: deterministische Spread-Probes ergaenzen Beam-Kandidaten, diversifizierte Selektion behaelt Fernkanten, clustered-Recall hoch, uniform >= Stand"
