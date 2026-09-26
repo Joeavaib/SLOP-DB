@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 11 (production): JOIN (nested-loop+hash), Columnar-Codec (Delta/FOR/Bitpacking), SoA-Vektorlayout, WAL-Audit-Log, Doku Welle 8-10. Alles verifiziert."
+  statement: "C++ DB Engine Welle 12 (production): TPC-H-Harness Q1/Q6, DDL UPDATE/DELETE/DROP, paralleler HNSW-Build, Extended-Protokoll minimal, Runbook-Ops. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -471,3 +471,43 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
     engine: implement
     want: "ARCH-Update Welle 8-10: GROUP BY/Aggregate, Session, Metrics, Backup, Kill-9, Shrink, Probes, NVMe-Zahlen; stale Aussagen korrigiert"
+  - id: s58-tpch
+    title: s58-tpch
+    paths:
+      - tools/bench.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R bench --output-on-failure
+    engine: implement
+    want: "TPC-H-Harness: Q1- und Q6-Lauf auf generierter lineitem (100k), Timing + Summen-Check, alte Modi unveraendert"
+  - id: s59-ddl
+    title: s59-ddl
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+      - src/sql/executor.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "DDL/DML: UPDATE (SET+WHERE), DELETE (WHERE), DROP TABLE, via MVCC+Tombstones, alte Tests gruene"
+  - id: s60-parbuild
+    title: s60-parbuild
+    paths:
+      - src/vector/hnsw.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: "Paralleler HNSW-Build: deterministische Batch-Inserts mit std::thread (Fallback single), gleiche Topologie/Recall, Thread-Safety-Doku"
+  - id: s61-extended
+    title: s61-extended
+    paths:
+      - src/server/pgserver.cpp
+      - include/dbengine/server/pgserver.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
+    engine: implement
+    want: "Extended-Protokoll minimal: Parse/Bind/Describe/Execute/Sync fuer parameterlose Statements (Portal-Cache, RowDescription ohne Execute), alte Tests gruene"
+  - id: s62-runbookops
+    title: s62-runbookops
+    paths:
+      - docs/RUNBOOK.md
+      - k8s/statefulset.yaml
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "Runbook-Ops: Backup/Restore-, Metrics- und Auth-Anleitungen mit Kommandos, K8s Monitor-Annotations, Guard-Keywords erhalten"
