@@ -610,3 +610,11 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R btreekv --output-on-failure
     engine: implement
     want: "Pager-B-Tree-KV: geordnete Put/Get/Delete/Scan/Iterator persistent auf Pager-Pages (Split/Merge), Crash-Reopen konsistent, eigene Suite btreekv"
+  - id: s74-dbcli
+    title: s74-dbcli
+    paths:
+      - src/main.cpp
+      - CMakeLists.txt
+    verify: "cmake --build build -j4 && ./build/dbengine --help && ./build/dbengine /tmp/s74_smoke.db --exec \"CREATE TABLE t (a INT); INSERT INTO t VALUES (1); SELECT * FROM t;\" && rm -f /tmp/s74_smoke.db*"
+    engine: implement
+    want: "dbengine-CLI: open(foo.db) + --exec/--sql/REPL ueber Executor, Persistenz ueber Restart, --help, alte Tests gruene"
