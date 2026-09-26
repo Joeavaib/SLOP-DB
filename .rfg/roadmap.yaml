@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 8 (production-naeher): NVMe-Bench, Skalar-Aggregate (Q6 gruen), symmetrische Shrink-Heuristik, PGWire-Session echt, Metrics-Endpoint. Alles verifiziert, keine Regressionen."
+  statement: "C++ DB Engine Welle 9 (konkurrenzfaehig): GROUP BY + Hash-Agg (Q1-Kern), Backup-Coordinator offline, chaos_raft, echter Kill-9-Harness, ANN-Squared-Hotpath + adaptive Probes. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -349,3 +349,44 @@ steps:
     verify: cmake --build build -j4 && ./build/dbmetrics --selfcheck
     engine: implement
     want: "Metrics-Endpoint: TCP GET /metrics mit WAL/RAFT/Columnar/HNSW-Kennzahlen (Prometheus-Textformat), dbmetrics-Binary mit --selfcheck (ephemeral, asserted Keywords), STL/POSIX-only"
+  - id: s43-groupby
+    title: s43-groupby
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+      - src/sql/executor.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor\" --output-on-failure"
+    engine: implement
+    want: GROUP BY + Hash-Aggregation mit SUM/AVG/MIN/MAX/COUNT (Q1-Kern ohne ORDER BY), AS-Aliase, alte Tests gruene
+  - id: s44-backup
+    title: s44-backup
+    paths:
+      - src/server/backup.cpp
+      - include/dbengine/server/backup.h
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ./build/dbbackup --selfcheck
+    engine: implement
+    want: "Backup-Coordinator offline: flush+Save aller Engines + MANIFEST zuletzt (tmp+rename), restore mit Replay-Tail, dbbackup-Binary mit --selfcheck, STL/POSIX-only"
+  - id: s45-chaosraft
+    title: s45-chaosraft
+    paths:
+      - tests/test_raft.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R raft --output-on-failure
+    engine: implement
+    want: "chaos_raft: Save/Kill/Load + Snapshot + Failover-Sequenzen deterministisch (Seeds), Commit-Monotonie, Phantom-Freiheit, alte Tests gruene"
+  - id: s46-kill9
+    title: s46-kill9
+    paths:
+      - tests/test_wal.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R wal --output-on-failure
+    engine: implement
+    want: "Echter Kill-9-Harness: fork+kill -9 vor/nach flush und mitten in checkpoint, Reopen-Replay = Prefix-Modell, Verlust 0 nach flush, alte Tests gruene"
+  - id: s47-annfine
+    title: s47-annfine
+    paths:
+      - src/vector/hnsw.cpp
+      - src/vector/quant.cpp
+      - include/dbengine/vector/hnsw.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
+    engine: implement
+    want: "ANN-Feinschliff: squared-Hotpath ohne sqrt pro Kandidat, adaptive Query-Probes P=min(256,N/64), Recall >= Stand, kleine N deutlich schneller"

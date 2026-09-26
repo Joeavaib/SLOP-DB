@@ -41,7 +41,12 @@
     "s39-sumexpr",
     "s40-shrinksym",
     "s41-pgsession",
-    "s42-metrics"
+    "s42-metrics",
+    "s43-groupby",
+    "s44-backup",
+    "s45-chaosraft",
+    "s46-kill9",
+    "s47-annfine"
   ],
   "verified": [
     "s07-index",
@@ -85,16 +90,21 @@
     "s39-sumexpr",
     "s40-shrinksym",
     "s41-pgsession",
-    "s42-metrics"
+    "s42-metrics",
+    "s43-groupby",
+    "s44-backup",
+    "s45-chaosraft",
+    "s46-kill9",
+    "s47-annfine"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s42-metrics-1790430309",
-    "step_id": "s42-metrics",
-    "commit": "04ac9127f20a40da3e61916a268f435d4f8fa697",
+    "id": "cp-s47-annfine-1790431367",
+    "step_id": "s47-annfine",
+    "commit": "818d94fdb49171aeccc16194647f97405e7d4387",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-26T13:45:09.265428+00:00"
+    "created_at": "2026-09-26T14:02:47.771765+00:00"
   },
   "checkpoints": [
     {
@@ -327,6 +337,41 @@
       "commit": "04ac9127f20a40da3e61916a268f435d4f8fa697",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-26T13:45:09.265428+00:00"
+    },
+    {
+      "id": "cp-s43-groupby-1790431311",
+      "step_id": "s43-groupby",
+      "commit": "903af10a46e32dfe06639166c75a29ae722c5dd0",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T14:01:51.166558+00:00"
+    },
+    {
+      "id": "cp-s44-backup-1790431327",
+      "step_id": "s44-backup",
+      "commit": "4c91c7c0ff9c8a5eba847ddd8de2e910551bb9a1",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T14:02:07.071826+00:00"
+    },
+    {
+      "id": "cp-s45-chaosraft-1790431345",
+      "step_id": "s45-chaosraft",
+      "commit": "5d9e4657256babec801a1bf2cb7d7f4fa98b1cf1",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T14:02:25.997644+00:00"
+    },
+    {
+      "id": "cp-s46-kill9-1790431356",
+      "step_id": "s46-kill9",
+      "commit": "a2fa8a8d68c54d3299e0b0ba801d2a59f0250c5c",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T14:02:36.958435+00:00"
+    },
+    {
+      "id": "cp-s47-annfine-1790431367",
+      "step_id": "s47-annfine",
+      "commit": "818d94fdb49171aeccc16194647f97405e7d4387",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-26T14:02:47.771765+00:00"
     }
   ],
   "claim_step": "",
