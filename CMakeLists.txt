@@ -277,3 +277,17 @@ target_include_directories(test_db PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_db PRIVATE -Wall -Wextra -Wpedantic)
 
 add_test(NAME dbfile COMMAND test_db)
+
+# Phase-0-Herzstueck: persistenter B-Baum (BTreeKV) auf Pager-Pages,
+# Shadow-Paging-Commit (CoW-Knoten + atomarer Superblock-Flip)
+add_library(btreekv STATIC src/kv/btree.cpp)
+target_include_directories(btreekv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(btreekv PUBLIC pager)
+target_compile_options(btreekv PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_btree tests/test_btree.cpp)
+target_link_libraries(test_btree PRIVATE btreekv)
+target_include_directories(test_btree PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_btree PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME btreekv COMMAND test_btree)
