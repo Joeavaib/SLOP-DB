@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 9 (konkurrenzfaehig): GROUP BY + Hash-Agg (Q1-Kern), Backup-Coordinator offline, chaos_raft, echter Kill-9-Harness, ANN-Squared-Hotpath + adaptive Probes. Alles verifiziert."
+  statement: "C++ DB Engine Welle 10 (production): SQL-Filter+Sortierung (BETWEEN/IN/OR, ORDER BY/LIMIT), Auth-Hook hinter Flag, Pager-HGC atomar, IVF-Skalenpfad, TLS-Sidecar-Doku. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -390,3 +390,44 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"vector|quant\" --output-on-failure"
     engine: implement
     want: "ANN-Feinschliff: squared-Hotpath ohne sqrt pro Kandidat, adaptive Query-Probes P=min(256,N/64), Recall >= Stand, kleine N deutlich schneller"
+  - id: s48-sqlfilter
+    title: s48-sqlfilter
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "SQL-Filter+Sort: BETWEEN/IN/OR-Ketten, ORDER BY (multi, ASC/DESC) + LIMIT/OFFSET, alte Tests gruene"
+  - id: s49-authhook
+    title: s49-authhook
+    paths:
+      - src/server/pgserver.cpp
+      - include/dbengine/server/pgserver.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
+    engine: implement
+    want: "Auth-Hook hinter Flag: Env-Passwort-Map, 28P01 bei Fail, Default Trust-All (alte Tests gruene), Klartext-Warnung in Doku-Kommentar"
+  - id: s50-pagerfix
+    title: s50-pagerfix
+    paths:
+      - src/storage/pager.cpp
+      - include/dbengine/storage/pager.h
+      - tests/test_pager.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R pager --output-on-failure
+    engine: implement
+    want: "Pager atomar: store_image via tmp+rename+fsync, load_image mit Magic/CRC-Toleranz (Torn->Fehler statt Teilverlust), Test fuer Torn-Image, alte Tests gruene"
+  - id: s51-ivfscale
+    title: s51-ivfscale
+    paths:
+      - src/vector/quant.cpp
+      - include/dbengine/vector/quant.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R quant --output-on-failure
+    engine: implement
+    want: "IVF-Skalenpfad: Sample-Caps zu Prozent-Regel, residuales PQ-Training, IvfPq-Default-Helper (nlist/nprobe-Autotune), alte Tests gruene"
+  - id: s52-tlssidecar
+    title: s52-tlssidecar
+    paths:
+      - docs/RUNBOOK.md
+      - k8s/statefulset.yaml
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "TLS-Sidecar-Doku: stunnel/envoy-Terminierung vor 5432 als Anleitung, K8s cert-Volume + TLS-Port-Skizze, Klartext-Warnung, Guard-Keywords erhalten"
