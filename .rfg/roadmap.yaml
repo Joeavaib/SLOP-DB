@@ -625,3 +625,12 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R dbfile --output-on-failure && test -f docs/PHASE0-DUELL.md
     engine: implement
     want: "Persistenz-Duellbericht: foo.db-CLI vs SQLite-Datei bei 1M (Insert, Restart-Replay, SUM-Scan), Methodik + Zahlen + ehrliches Urteil in docs/PHASE0-DUELL.md"
+  - id: s76-mirrorckpt
+    title: s76-mirrorckpt
+    paths:
+      - src/sql/executor.cpp
+      - include/dbengine/sql/executor.h
+      - src/main.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|kv\" --output-on-failure"
+    engine: implement
+    want: "Mirror-Checkpoint: B-Tree-Spiegel des Latest-State, inkrementell pro Flush, Restart laedt Spiegel + nur WAL-Tail, alte Tests gruene"
