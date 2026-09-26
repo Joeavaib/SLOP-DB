@@ -8,15 +8,20 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include "dbengine/server/pgwire.h"
+#include "dbengine/sql/parser.h"
 
 namespace dbengine::pgserver {
 namespace {
@@ -111,9 +116,128 @@ bool isSelectOne(const std::string& q) {
   return u == "SELECT 1";
 }
 
+void putCString(std::vector<uint8_t>& out, const std::string& s) {
+  out.insert(out.end(), s.begin(), s.end());
+  out.push_back(0);
+}
+
+std::string toLowerStr(std::string s) {
+  for (auto& c : s)
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return s;
+}
+
+int32_t colTypeOid(dbengine::sql::ColType t) {
+  using dbengine::sql::ColType;
+  switch (t) {
+    case ColType::Int: return 23;     // INT4
+    case ColType::Double: return 701;  // FLOAT8
+    case ColType::Bool: return 16;     // BOOL
+    case ColType::Text:  // TEXT
+    default: return 25;
+  }
+}
+
+// Typed RowDescription (Layout byte-identisch zu pgwire::encodeRowDescription
+// fuer OID 25; erlaubt aber 23/701/16 pro Spalte, Format 0 fuer alle).
+std::vector<uint8_t> encodeRowDescriptionTyped(
+    const std::vector<std::string>& columns, const std::vector<int32_t>& oids) {
+  std::vector<uint8_t> body;
+  putInt32BE(body, static_cast<int32_t>(columns.size()));
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    putCString(body, columns[i]);
+    putInt32BE(body, 0);  // table OID
+    body.push_back(0);
+    body.push_back(0);  // attrno
+    putInt32BE(body, i < oids.size() ? oids[i] : 25);
+    body.push_back(0xFF);
+    body.push_back(0xFF);  // typlen -1
+    putInt32BE(body, -1);  // typmod
+    body.push_back(0);
+    body.push_back(0);  // format 0 (text)
+  }
+  std::vector<uint8_t> out;
+  out.push_back('T');
+  putInt32BE(out, static_cast<int32_t>(body.size() + 4));
+  out.insert(out.end(), body.begin(), body.end());
+  return out;
+}
+
+// DataRow aus Values (Text-Encoding via valueToString, NULL als -1).
+std::vector<uint8_t> encodeDataRowValues(
+    const std::vector<dbengine::sql::Value>& row) {
+  std::vector<uint8_t> body;
+  body.push_back(static_cast<uint8_t>((row.size() >> 8) & 0xFF));
+  body.push_back(static_cast<uint8_t>(row.size() & 0xFF));
+  for (const auto& v : row) {
+    if (dbengine::sql::valueIsNull(v)) {
+      putInt32BE(body, -1);
+    } else {
+      std::string s = dbengine::sql::valueToString(v);
+      putInt32BE(body, static_cast<int32_t>(s.size()));
+      body.insert(body.end(), s.begin(), s.end());
+    }
+  }
+  std::vector<uint8_t> out;
+  out.push_back('D');
+  putInt32BE(out, static_cast<int32_t>(body.size() + 4));
+  out.insert(out.end(), body.begin(), body.end());
+  return out;
+}
+
+// OID-Aufloesung: SELECT -> Schema-Typen via Executor::schemaOf (COUNT(*) = 23),
+// Fallback: Werttyp der ersten Zeile, sonst 25. Kein Throw.
+std::vector<int32_t> resolveOids(const dbengine::sql::Result& r,
+                                 const std::string& q,
+                                 dbengine::sql::Executor& ex) {
+  std::vector<int32_t> oids(r.columns.size(), 25);
+  bool viaSchema = false;
+  try {
+    dbengine::sql::Statement st = dbengine::sql::parseStatement(q);
+    if (const auto* sel = std::get_if<dbengine::sql::SelectStmt>(&st)) {
+      if (sel->count_star) {
+        if (!oids.empty()) oids[0] = 23;
+        return oids;
+      }
+      const dbengine::sql::TableSchema* sch = ex.schemaOf(sel->table);
+      if (sch != nullptr) {
+        for (std::size_t i = 0; i < r.columns.size(); ++i) {
+          std::string want = toLowerStr(r.columns[i]);
+          for (const auto& cd : sch->columns) {
+            if (toLowerStr(cd.name) == want) {
+              oids[i] = colTypeOid(cd.type);
+              break;
+            }
+          }
+        }
+        viaSchema = true;
+      }
+    }
+  } catch (...) {
+    // Fallback unten
+  }
+  if (viaSchema) return oids;
+  if (!r.rows.empty()) {
+    const auto& first = r.rows[0];
+    std::size_t n = std::min(oids.size(), first.size());
+    for (std::size_t i = 0; i < n; ++i) {
+      const auto& v = first[i];
+      if (std::holds_alternative<int64_t>(v))
+        oids[i] = 23;
+      else if (std::holds_alternative<double>(v))
+        oids[i] = 701;
+      else if (std::holds_alternative<bool>(v))
+        oids[i] = 16;
+      else
+        oids[i] = 25;
+    }
+  }
+  return oids;
+}
+
 }  // namespace
 
-PgServer::PgServer() = default;
+PgServer::PgServer() : executor_(kv_, mvcc_, nullptr) {}
 
 PgServer::~PgServer() { stop(); }
 
@@ -206,7 +330,9 @@ void PgServer::handleConn(int fd) {
     return;
   }
 
-  // 3) Loop: Q -> T+D+C+Z (SELECT 1) | C+Z (sonst), X -> close.
+  // 3) Loop: Q -> T+D+C+Z (SELECT) | C+Z (INSERT/CREATE),
+  //         E+Z bei Executor-Fehler (Conn bleibt offen). X -> close.
+  //         Extended/COPY (nicht Q/X) -> E(0A000)+Z, unveraendert.
   while (true) {
     char type = 0;
     std::vector<uint8_t> msg;
@@ -229,6 +355,7 @@ void PgServer::handleConn(int fd) {
         if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
         continue;
       }
+      // Sonderpfad: byte-identisch T(?column?)/D("1")/C(SELECT 1).
       if (isSelectOne(*q)) {
         auto t = dbengine::pgwire::encodeRowDescription({"?column?"});
         auto d = dbengine::pgwire::encodeDataRow({"1"});
@@ -238,8 +365,48 @@ void PgServer::handleConn(int fd) {
         if (!sendAll(fd, d)) break;
         if (!sendAll(fd, c)) break;
         if (!sendAll(fd, z)) break;
+        continue;
+      }
+      // Session: Q-String an die server-eigene Executor-Instanz.
+      dbengine::sql::Result res;
+      std::vector<int32_t> oids;
+      std::string tag;
+      try {
+        std::lock_guard<std::mutex> lk(execMu_);
+        res = executor_.execute(*q);
+        oids = resolveOids(res, *q, executor_);
+        tag = res.message;
+      } catch (const dbengine::sql::SqlError& e) {
+        auto err = dbengine::pgwire::encodeError("ERROR", "42601", e.what());
+        if (!sendAll(fd, err)) break;
+        if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+        continue;
+      } catch (const std::exception& e) {
+        auto err = dbengine::pgwire::encodeError("ERROR", "0A000", e.what());
+        if (!sendAll(fd, err)) break;
+        if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+        continue;
+      }
+      if (!res.columns.empty()) {
+        auto t = encodeRowDescriptionTyped(res.columns, oids);
+        if (!sendAll(fd, t)) break;
+        bool ok = true;
+        for (const auto& row : res.rows) {
+          auto d = encodeDataRowValues(row);
+          if (!sendAll(fd, d)) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) break;
+        if (tag.empty()) tag = "SELECT " + std::to_string(res.rows.size());
+        auto c = dbengine::pgwire::encodeCommandComplete(tag);
+        auto z = dbengine::pgwire::encodeReadyForQuery('I');
+        if (!sendAll(fd, c)) break;
+        if (!sendAll(fd, z)) break;
       } else {
-        auto c = dbengine::pgwire::encodeCommandComplete("SELECT 0");
+        if (tag.empty()) tag = "SELECT 0";
+        auto c = dbengine::pgwire::encodeCommandComplete(tag);
         auto z = dbengine::pgwire::encodeReadyForQuery('I');
         if (!sendAll(fd, c)) break;
         if (!sendAll(fd, z)) break;

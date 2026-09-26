@@ -79,6 +79,14 @@ class Tokenizer {
         ++pos_;
         out.push_back(
             {c == '*' ? TokKind::Star : TokKind::Symbol, std::move(t)});
+      } else if (c == '+' || c == '-' || c == '/') {
+        // Arithmetik-Ops (Q6). Kommentare ("--"/"/*") wurden oben in
+        // skipWsAndComments bereits konsumiert, daher ist ein einzelnes
+        // '-'/'/' hier sicher ein Operator. Negative Literale werden in
+        // parseLiteral() via fuehrendem Vorzeichen-Symbol erkannt.
+        std::string t(1, c);
+        ++pos_;
+        out.push_back({TokKind::Symbol, std::move(t)});
       } else if (c == '<' || c == '>' || c == '!') {
         std::string t(1, c);
         ++pos_;
@@ -389,18 +397,232 @@ class Parser {
     throw SqlError("Erwartet Literal (Zahl, String, NULL, TRUE/FALSE)");
   }
 
+  static bool isAggFuncName(const std::string& name) {
+    std::string u = toUpper(name);
+    return u == "SUM" || u == "AVG" || u == "MIN" || u == "MAX" ||
+           u == "COUNT";
+  }
+  // Aggregat-Start? Ident(SUM/AVG/MIN/MAX/COUNT) gefolgt von '('.
+  bool peekAggregate() const {
+    const Token& t = peek();
+    if (t.kind != TokKind::Ident) return false;
+    if (!isAggFuncName(t.text)) return false;
+    const Token& n = peek(1);
+    return n.kind == TokKind::Symbol && n.text == "(";
+  }
+  bool peekMul() const {
+    const Token& t = peek();
+    return t.kind == TokKind::Star ||
+           (t.kind == TokKind::Symbol && t.text == "*");
+  }
+
+  Aggregate parseAggregate() {
+    Token f = next();  // Func-Name (Ident, bereits geprueft)
+    std::string func = toUpper(f.text);
+    expectSymbol("(");
+    Aggregate a;
+    a.func = func;
+    const Token& t = peek();
+    if (t.kind == TokKind::Star ||
+        (t.kind == TokKind::Symbol && t.text == "*")) {
+      if (func != "COUNT")
+        throw SqlError("Nur COUNT(*) unterstuetzt, kein " + func + "(*)");
+      ++pos_;
+      expectSymbol(")");
+      a.star = true;
+      a.display = "COUNT(*)";
+      return a;
+    }
+    auto arg = parseAggAddSub();
+    expectSymbol(")");
+    a.star = false;
+    a.arg = std::move(arg);
+    a.display = func + "(" + a.arg->display + ")";
+    return a;
+  }
+
+  // Grammatik (Precedence, links-assoziativ):
+  //   addsub := muldiv (('+'|'-') muldiv)*
+  //   muldiv := unary (('*'|'/') unary)*
+  //   unary  := ('+'|'-') unary | primary
+  //   primary:= '(' addsub ')' | Zahl | Spalte | NULL/TRUE/FALSE
+  std::shared_ptr<AggExpr> parseAggAddSub() {
+    auto left = parseAggMulDiv();
+    while (true) {
+      const Token& t = peek();
+      if (t.kind == TokKind::Symbol && (t.text == "+" || t.text == "-")) {
+        char op = t.text[0];
+        ++pos_;
+        auto right = parseAggMulDiv();
+        auto n = std::make_shared<AggExpr>();
+        n->kind = AggExpr::Kind::Binary;
+        n->op = op;
+        n->left = std::move(left);
+        n->right = std::move(right);
+        n->display =
+            n->left->display + std::string(1, op) + n->right->display;
+        left = std::move(n);
+      } else {
+        break;
+      }
+    }
+    return left;
+  }
+
+  std::shared_ptr<AggExpr> parseAggMulDiv() {
+    auto left = parseAggUnary();
+    while (true) {
+      bool isMul = peekMul();
+      const Token& t = peek();
+      bool isDiv = (t.kind == TokKind::Symbol && t.text == "/");
+      if (!isMul && !isDiv) break;
+      char op = isMul ? '*' : '/';
+      ++pos_;
+      auto right = parseAggUnary();
+      auto n = std::make_shared<AggExpr>();
+      n->kind = AggExpr::Kind::Binary;
+      n->op = op;
+      n->left = std::move(left);
+      n->right = std::move(right);
+      n->display = n->left->display + std::string(1, op) + n->right->display;
+      left = std::move(n);
+    }
+    return left;
+  }
+
+  std::shared_ptr<AggExpr> parseAggUnary() {
+    const Token& t = peek();
+    if (t.kind == TokKind::Symbol && (t.text == "+" || t.text == "-")) {
+      char op = t.text[0];
+      ++pos_;
+      auto operand = parseAggUnary();
+      if (op == '+') {
+        auto n = std::make_shared<AggExpr>(*operand);
+        n->display = "+" + operand->display;
+        return n;
+      }
+      // unaeres Minus: numerische Literale direkt falten ...
+      if (operand->kind == AggExpr::Kind::Literal) {
+        if (auto* iv = std::get_if<int64_t>(&operand->literal)) {
+          auto n = std::make_shared<AggExpr>();
+          n->kind = AggExpr::Kind::Literal;
+          n->literal = Value{-(*iv)};
+          n->display = "-" + operand->display;
+          return n;
+        }
+        if (auto* dv = std::get_if<double>(&operand->literal)) {
+          auto n = std::make_shared<AggExpr>();
+          n->kind = AggExpr::Kind::Literal;
+          n->literal = Value{-(*dv)};
+          n->display = "-" + operand->display;
+          return n;
+        }
+      }
+      // ... sonst 0 - operand (DOUBLE-Semantik, NULL propagiert).
+      auto zero = std::make_shared<AggExpr>();
+      zero->kind = AggExpr::Kind::Literal;
+      zero->literal = Value{(int64_t)0};
+      zero->display = "0";
+      auto n = std::make_shared<AggExpr>();
+      n->kind = AggExpr::Kind::Binary;
+      n->op = '-';
+      n->left = std::move(zero);
+      n->right = std::move(operand);
+      n->display = "-" + n->right->display;
+      return n;
+    }
+    return parseAggPrimary();
+  }
+
+  std::shared_ptr<AggExpr> parseAggPrimary() {
+    const Token& t = peek();
+    if (t.kind == TokKind::Symbol && t.text == "(") {
+      ++pos_;
+      auto inner = parseAggAddSub();
+      expectSymbol(")");
+      auto n = std::make_shared<AggExpr>(*inner);
+      n->display = "(" + inner->display + ")";
+      return n;
+    }
+    if (t.kind == TokKind::Integer || t.kind == TokKind::Float) {
+      Token u = next();
+      auto n = std::make_shared<AggExpr>();
+      n->kind = AggExpr::Kind::Literal;
+      if (u.kind == TokKind::Integer)
+        n->literal = Value{(int64_t)std::stoll(u.text)};
+      else
+        n->literal = Value{std::stod(u.text)};
+      n->display = u.text;
+      return n;
+    }
+    if (t.kind == TokKind::Ident || t.kind == TokKind::QuotedIdent) {
+      // TRUE/FALSE/NULL als Literal zulassen (Evaluierung -> Skip/Fehlerpfad)
+      if (t.kind == TokKind::Ident) {
+        std::string u = toUpper(t.text);
+        if (u == "NULL" || u == "TRUE" || u == "FALSE") {
+          Token w = next();
+          auto n = std::make_shared<AggExpr>();
+          n->kind = AggExpr::Kind::Literal;
+          if (u == "NULL")
+            n->literal = Value{std::monostate{}};
+          else
+            n->literal = Value{(u == "TRUE")};
+          n->display = u;
+          (void)w;
+          return n;
+        }
+      }
+      std::string col = parseIdent();  // foldet unquoted nach lowercase
+      auto n = std::make_shared<AggExpr>();
+      n->kind = AggExpr::Kind::Column;
+      n->column = col;
+      n->display = col;
+      return n;
+    }
+    throw SqlError("Erwartet Spalte, Zahl oder '(' in Aggregat-Argument");
+  }
+
   SelectStmt parseSelect() {
     SelectStmt s;
     // Projektion
     if (matchSymbol("*")) {
       s.select_all = true;
-    } else if (peekKeyword("COUNT")) {
-      ++pos_;
-      expectSymbol("(");
-      if (!(matchSymbol("*"))) throw SqlError("Nur COUNT(*) in V1");
-      expectSymbol(")");
-      s.select_all = false;
-      s.count_star = true;
+    } else if (peekAggregate()) {
+      // Legacy-Pfad exakt erhalten: alleiniges COUNT(*) -> count_star.
+      bool legacy = false;
+      if (peekKeyword("COUNT")) {
+        const Token& t1 = peek(1);
+        const Token& t2 = peek(2);
+        const Token& t3 = peek(3);
+        const Token& t4 = peek(4);
+        bool paren = (t1.kind == TokKind::Symbol && t1.text == "(");
+        bool star = (t2.kind == TokKind::Star ||
+                     (t2.kind == TokKind::Symbol && t2.text == "*"));
+        bool close = (t3.kind == TokKind::Symbol && t3.text == ")");
+        bool fromAfter = (t4.kind == TokKind::Ident &&
+                          toUpper(t4.text) == "FROM");
+        if (paren && star && close && fromAfter) legacy = true;
+      }
+      if (legacy) {
+        ++pos_;
+        expectSymbol("(");
+        if (!(matchSymbol("*"))) throw SqlError("Nur COUNT(*) in V1");
+        expectSymbol(")");
+        s.select_all = false;
+        s.count_star = true;
+      } else {
+        s.select_all = false;
+        s.count_star = false;
+        while (true) {
+          if (!peekAggregate())
+            throw SqlError(
+                "Ohne GROUP BY: Aggregate (SUM/AVG/MIN/MAX/COUNT) und Spalten "
+                "nicht mischbar");
+          s.aggregates.push_back(parseAggregate());
+          if (matchSymbol(",")) continue;
+          break;
+        }
+      }
     } else {
       s.select_all = false;
       while (true) {
@@ -593,6 +815,130 @@ Value coerceTo(const Value& v, ColType type, const std::string& col) {
   return v;
 }
 
+// ---------- Skalare Aggregate (ohne GROUP BY) ----------
+
+double aggToDouble(const Value& v) {
+  if (auto* i = std::get_if<int64_t>(&v)) return static_cast<double>(*i);
+  if (auto* d = std::get_if<double>(&v)) return *d;
+  throw SqlError("Aggregat-Ausdruck braucht numerische Operanden");
+}
+
+// Wert eines Aggregat-Arguments fuer eine Row. Wirft SqlError bei unbekannter
+// Spalte; Division durch 0 -> NULL (kein Fehler, Zeile wird geskippt).
+Value evalAggExprNode(const Table& t, const std::vector<Value>& row,
+                      const AggExpr& e) {
+  switch (e.kind) {
+    case AggExpr::Kind::Column: {
+      int idx = t.colIndex(e.column);
+      if (idx < 0) throw SqlError("Unbekannte Spalte: " + e.column);
+      return row[static_cast<std::size_t>(idx)];
+    }
+    case AggExpr::Kind::Literal:
+      return e.literal;
+    case AggExpr::Kind::Binary: {
+      Value lv = evalAggExprNode(t, row, *e.left);
+      Value rv = evalAggExprNode(t, row, *e.right);
+      if (valueIsNull(lv) || valueIsNull(rv))
+        return Value{std::monostate{}};
+      if (std::holds_alternative<std::string>(lv) ||
+          std::holds_alternative<std::string>(rv) ||
+          std::holds_alternative<bool>(lv) ||
+          std::holds_alternative<bool>(rv))
+        throw SqlError("Aggregat-Ausdruck braucht numerische Operanden");
+      double a = aggToDouble(lv);
+      double b = aggToDouble(rv);
+      switch (e.op) {
+        case '+':
+          return Value{a + b};
+        case '-':
+          return Value{a - b};
+        case '*':
+          return Value{a * b};
+        case '/':
+          if (b == 0.0) return Value{std::monostate{}};
+          return Value{a / b};
+        default:
+          break;
+      }
+      throw SqlError("Unbekannter Operator in Aggregat");
+    }
+  }
+  throw SqlError("Ungueltiger Aggregat-Ausdruck");
+}
+
+void requireNumericForSumAvg(const Value& v, const std::string& func) {
+  if (std::holds_alternative<std::string>(v) ||
+      std::holds_alternative<bool>(v))
+    throw SqlError(func + " braucht numerische Operanden");
+}
+
+// Ein-Zeilen-Result. Empty-Set: COUNT->0, Rest NULL. Sonst NULL-Skip.
+Result execScalarAggregates(const Table& t,
+                            const std::vector<std::vector<Value>>& kept,
+                            const SelectStmt& s) {
+  Result r;
+  r.columns.reserve(s.aggregates.size());
+  for (auto& a : s.aggregates) r.columns.push_back(a.display);
+  std::vector<Value> out;
+  out.reserve(s.aggregates.size());
+  for (auto& a : s.aggregates) {
+    if (a.star) {  // COUNT(*) in Multi-Aggregat-Liste
+      out.emplace_back(static_cast<int64_t>(kept.size()));
+    } else if (a.func == "COUNT") {
+      int64_t c = 0;
+      for (auto& row : kept) {
+        Value v = evalAggExprNode(t, row, *a.arg);
+        if (!valueIsNull(v)) ++c;
+      }
+      out.emplace_back(c);
+    } else if (a.func == "SUM") {
+      bool any = false;
+      double sum = 0.0;
+      for (auto& row : kept) {
+        Value v = evalAggExprNode(t, row, *a.arg);
+        if (valueIsNull(v)) continue;
+        requireNumericForSumAvg(v, "SUM");
+        sum += aggToDouble(v);
+        any = true;
+      }
+      out.push_back(any ? Value{sum} : Value{std::monostate{}});
+    } else if (a.func == "AVG") {
+      double sum = 0.0;
+      int64_t n = 0;
+      for (auto& row : kept) {
+        Value v = evalAggExprNode(t, row, *a.arg);
+        if (valueIsNull(v)) continue;
+        requireNumericForSumAvg(v, "AVG");
+        sum += aggToDouble(v);
+        ++n;
+      }
+      out.push_back(n > 0 ? Value{sum / static_cast<double>(n)}
+                          : Value{std::monostate{}});
+    } else if (a.func == "MIN" || a.func == "MAX") {
+      bool any = false;
+      Value best{std::monostate{}};
+      for (auto& row : kept) {
+        Value v = evalAggExprNode(t, row, *a.arg);
+        if (valueIsNull(v)) continue;
+        if (!any) {
+          best = v;
+          any = true;
+        } else {
+          int cmp = compareValues(v, best);
+          if (a.func == "MIN" ? (cmp < 0) : (cmp > 0)) best = v;
+        }
+      }
+      out.push_back(any ? best : Value{std::monostate{}});
+    } else {
+      throw SqlError("Unbekannte Aggregatfunktion: " + a.func);
+    }
+  }
+  r.rows.push_back(std::move(out));
+  r.message = "SELECT 1";
+  r.affected = 1;
+  return r;
+}
+
 }  // namespace
 
 // ---------- Oeffentliche API ----------
@@ -740,6 +1086,13 @@ Result Database::execSelect(const SelectStmt& s) {
   if (s.count_star) {
     return { {"count"}, { {Value{(int64_t)kept.size()}} },
              "SELECT 1", std::size_t{1} };
+  }
+  if (!s.aggregates.empty()) {
+    if (!s.columns.empty() || s.select_all)
+      throw SqlError(
+          "Ohne GROUP BY: Aggregate (SUM/AVG/MIN/MAX/COUNT) und Spalten nicht "
+          "mischbar");
+    return execScalarAggregates(t, kept, s);
   }
   // Projektion
   std::vector<int> idxs;

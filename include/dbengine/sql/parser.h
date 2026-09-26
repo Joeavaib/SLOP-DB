@@ -65,11 +65,33 @@ struct Condition {
   Value value;
 };
 
+// Arithmetischer Ausdruck als Aggregat-Argument (Q6): Spalte | Literal |
+// binaer links-assoziativ mit Precedence (*,/ vor +,-), Klammern erlaubt.
+// Auswertung in DOUBLE, NULL propagiert (Zeile wird geskippt).
+struct AggExpr {
+  enum class Kind { Column, Literal, Binary };
+  Kind kind = Kind::Column;
+  std::string column;                    // Kind::Column (lower-gefoldet)
+  Value literal = Value{std::monostate{}};  // Kind::Literal
+  char op = 0;                           // Kind::Binary: '+','-','*','/'
+  std::shared_ptr<AggExpr> left;
+  std::shared_ptr<AggExpr> right;
+  std::string display;  // kanonisch ohne Spaces, z.B. "price*(1-disc)"
+};
+
+struct Aggregate {
+  std::string func;  // upper: "SUM","AVG","MIN","MAX","COUNT"
+  bool star = false;                     // nur COUNT(*)
+  std::shared_ptr<AggExpr> arg;          // null bei star
+  std::string display;  // z.B. "SUM(price*disc)", "COUNT(*)"
+};
+
 struct SelectStmt {
   std::string table;
   std::vector<std::string> columns;  // leer + select_all = "*"
   bool select_all = true;
-  bool count_star = false;
+  bool count_star = false;  // legacy: alleiniges COUNT(*) (Verhalten fixiert)
+  std::vector<Aggregate> aggregates;  // nicht-leer => skalares Aggregat ohne GROUP BY
   std::vector<Condition> where;  // AND-verknuepft
 };
 

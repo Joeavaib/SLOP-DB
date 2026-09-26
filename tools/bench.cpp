@@ -3,11 +3,15 @@
 // Human-Readable geht nach stderr. Optional --csv PATH schreibt CSV zusaetzlich.
 // Graceful degrade: jede Engine ist per __has_include guard optional; fehlt ein
 // Header, wird der Bench uebersprungen (CSV-Zeile mit 0 + Hinweis auf stderr).
+// WAL-Durability: --data-dir DIR misst sustained append-Throughput (ops/s) +
+// p50/p95-flush-Latenz via Wal::append_many + flush in Batches auf DIR/dbbench.wal.
+// CSV-Zeilen: wal_durable_puts + wal_flush_p95. Ohne --data-dir: exakt wie bisher.
 //
 // CLI:
 //   dbbench [--kv-puts N] [--sql-q1 [--sql-rows R]] [--ann N,d,k]
-//           [--csv PATH] [--smoke] [--help]
+//           [--csv PATH] [--data-dir DIR] [--smoke] [--help]
 //   dbbench --smoke  => klein: kv=1000, sql-rows=1000, ann=1000,16,10
+//   dbbench --data-dir DIR => nur WAL-Bench auf DIR (mit anderen Flags kombinierbar)
 //   Ohne Bench-Flags => Default: kv=10000, sql-q1 (50000 rows), ann=1000,64,10.
 
 #include <algorithm>
@@ -15,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -37,13 +42,19 @@
 #define BENCH_HAVE_COLUMNAR 1
 #include "dbengine/columnar/store.h"
 #endif
+#if __has_include("dbengine/storage/wal.h")
+#define BENCH_HAVE_WAL 1
+#include "dbengine/storage/wal.h"
+#endif
 #else
 // Compiler ohne __has_include: alles voraussetzen.
 #define BENCH_HAVE_KV 1
 #define BENCH_HAVE_VECTOR 1
 #define BENCH_HAVE_COLUMNAR 1
+#define BENCH_HAVE_WAL 1
 #include "dbengine/columnar/store.h"
 #include "dbengine/kv.h"
+#include "dbengine/storage/wal.h"
 #include "dbengine/vector/hnsw.h"
 #endif
 
@@ -103,6 +114,8 @@ struct Config {
   long long ann_n = 0, ann_d = 0, ann_k = 0;
   bool smoke = false;
   std::string csv_path;
+  std::string data_dir;
+  bool has_data_dir = false;
   bool help = false;
   std::string error;
 };
@@ -155,6 +168,15 @@ Config ParseArgs(int argc, char** argv) {
       c.do_ann = true;
     } else if (a == "--csv") {
       if (!need_val(c.csv_path)) return c;
+    } else if (a == "--data-dir") {
+      std::string v;
+      if (!need_val(v)) return c;
+      if (v.empty()) {
+        c.error = "invalid --data-dir value: empty";
+        return c;
+      }
+      c.data_dir = v;
+      c.has_data_dir = true;
     } else {
       c.error = "unknown arg: " + a;
       return c;
@@ -170,7 +192,7 @@ Config ParseArgs(int argc, char** argv) {
     c.ann_d = 16;
     c.ann_k = 10;
   }
-  if (!c.do_kv && !c.do_sql && !c.do_ann && c.error.empty() && !c.help) {
+  if (!c.do_kv && !c.do_sql && !c.do_ann && !c.has_data_dir && c.error.empty() && !c.help) {
     // Default: alles, mittlere Groesse.
     c.do_kv = true;
     c.kv_puts = 10000;
@@ -187,7 +209,7 @@ Config ParseArgs(int argc, char** argv) {
 void Usage(const char* prog) {
   std::fprintf(stderr,
                "usage: %s [--kv-puts N] [--sql-q1 [--sql-rows R]] "
-               "[--ann N,d,k] [--csv PATH] [--smoke]\n",
+               "[--ann N,d,k] [--csv PATH] [--data-dir DIR] [--smoke]\n",
                prog);
 }
 
@@ -335,6 +357,107 @@ BenchRow RunAnn(long long n, long long dim, long long k) {
   return row;
 }
 
+// ---- WAL-Durability-Bench (append_many + flush in Batches auf <dir>) ---------
+// Misst sustained append-Throughput (ops/s) + p50/p95-flush-Latenz (ms).
+// CSV: wal_durable_puts (ops/s, p95) + wal_flush_p95 (flushes/s, p95);
+// p50 geht human-readable nach stderr. Fehler -> err gesetzt, leere Rows,
+// kein Throw ausserhalb (main gibt nonzero exit zurueck).
+#ifdef BENCH_HAVE_WAL
+std::vector<BenchRow> RunWalDurable(const std::string& dir, std::string& err) {
+  std::vector<BenchRow> out;
+  err.clear();
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::file_status st = fs::status(dir, ec);
+  if (ec) {
+    err = "data-dir cannot stat '" + dir + "': " + ec.message();
+    return out;
+  }
+  if (!fs::is_directory(st)) {
+    err = "data-dir is not a directory: " + dir;
+    return out;
+  }
+  // Schreibprobe (faengt unbeschreibbares Dir ohne Crash ab).
+  {
+    fs::path probe = fs::path(dir) / ".dbbench_probe.tmp";
+    std::ofstream pf(probe, std::ios::out | std::ios::trunc);
+    if (!pf) {
+      err = "data-dir not writable: " + dir;
+      return out;
+    }
+    pf << "probe\n";
+    pf.flush();
+    if (!pf) {
+      err = "data-dir not writable: " + dir;
+      return out;
+    }
+  }
+  (void)fs::remove(fs::path(dir) / ".dbbench_probe.tmp", ec);
+  ec.clear();
+
+  fs::path wal_path = fs::path(dir) / "dbbench.wal";
+  (void)fs::remove(wal_path, ec);  // sauberer Start (best effort)
+  ec.clear();
+  try {
+    dbengine::storage::Wal wal(wal_path.string());
+    wal.open();
+    const long long kTotal = 5000;
+    const long long kBatch = 50;
+    std::vector<double> flush_ms;
+    flush_ms.reserve(static_cast<size_t>((kTotal + kBatch - 1) / kBatch));
+    auto t0 = std::chrono::steady_clock::now();
+    for (long long base = 0; base < kTotal; base += kBatch) {
+      long long cur =
+          std::min(kBatch, kTotal - base);
+      std::vector<std::string> batch;
+      batch.reserve(static_cast<size_t>(cur));
+      for (long long i = 0; i < cur; ++i) {
+        char tmp[96];
+        std::snprintf(tmp, sizeof(tmp), "wal-bench:%08lld:",
+                      base + i);
+        std::string s(tmp);
+        if (s.size() < 128) s.append(128 - s.size(), 'x');
+        batch.push_back(std::move(s));
+      }
+      wal.append_many(batch);
+      auto fs0 = std::chrono::steady_clock::now();
+      wal.flush();
+      auto fs1 = std::chrono::steady_clock::now();
+      flush_ms.push_back(
+          std::chrono::duration<double, std::milli>(fs1 - fs0).count());
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    wal.close();
+    (void)fs::remove(wal_path, ec);  // Aufräumen (best effort)
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+    if (secs <= 0) secs = 1e-9;
+    double throughput =
+        static_cast<double>(kTotal) / secs;  // durable ops/s
+    double flush_per_sec =
+        static_cast<double>(flush_ms.size()) / secs;
+    double p50 = Percentile(flush_ms, 0.50);
+    double p95 = Percentile(flush_ms, 0.95);
+    std::fprintf(stderr,
+                 "wal_durable_puts: N=%lld batch=%lld file=%s "
+                 "throughput=%.1f ops/s flush_p50=%.4fms flush_p95=%.4fms "
+                 "flushes=%.1f/s\n",
+                 kTotal, kBatch, wal_path.c_str(), throughput, p50, p95,
+                 flush_per_sec);
+    out.push_back(BenchRow{"wal_durable_puts", throughput, p95});
+    out.push_back(BenchRow{"wal_flush_p95", flush_per_sec, p95});
+  } catch (const std::exception& e) {
+    err = std::string("wal bench failed: ") + e.what();
+    (void)fs::remove(wal_path, ec);
+    out.clear();
+  } catch (...) {
+    err = "wal bench failed: unknown error";
+    (void)fs::remove(wal_path, ec);
+    out.clear();
+  }
+  return out;
+}
+#endif
+
 void EmitCsv(const std::vector<BenchRow>& rows, std::ostream& out) {
   out << "op,throughput,lat_p95\n";
   for (auto& r : rows) out << r.op << "," << r.throughput << "," << r.lat_p95_ms << "\n";
@@ -357,6 +480,22 @@ int main(int argc, char** argv) {
   if (c.do_kv) rows.push_back(RunKvPuts(c.kv_puts));
   if (c.do_sql) rows.push_back(RunSqlQ1(c.sql_rows));
   if (c.do_ann) rows.push_back(RunAnn(c.ann_n, c.ann_d, c.ann_k));
+  if (c.has_data_dir) {
+#ifdef BENCH_HAVE_WAL
+    std::string wal_err;
+    std::vector<BenchRow> wal_rows = RunWalDurable(c.data_dir, wal_err);
+    if (!wal_err.empty()) {
+      std::fprintf(stderr, "dbbench: %s\n", wal_err.c_str());
+      return 1;
+    }
+    rows.insert(rows.end(), wal_rows.begin(), wal_rows.end());
+#else
+    std::fprintf(stderr,
+                 "dbbench: --data-dir unsupported "
+                 "(dbengine/storage/wal.h missing)\n");
+    return 1;
+#endif
+  }
 
   EmitCsv(rows, std::cout);
   if (!c.csv_path.empty()) {

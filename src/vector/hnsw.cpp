@@ -378,54 +378,112 @@ std::vector<int> HnswIndex::select_neighbors(
 void HnswIndex::shrink_layer(int id, int lc, int max_m) {
   auto& nb = links_[id][lc];
   if (static_cast<int>(nb.size()) <= max_m) return;
-  // EIN Distanz-Scan mit gecachten Scores; kein zweiter Re-Scan im Compare
-  // (frueher rief die finale Sortierung dist_to_stored pro Vergleich neu auf:
-  // O(max_m log max_m) zusaetzliche Distanzberechnungen pro Shrink).
-  std::vector<std::pair<float, int>> scored;
+  if (max_m <= 0) {
+    nb.clear();
+    return;
+  }
+  // Symmetrische Diversitaets-Heuristik (Paper Alg. 3, wie select_neighbors):
+  // Reziproke Kanten duerfen nicht auf Top-mm-naechste gestutzt werden — das
+  // loescht genau die Fernkanten, die Spread-Probes legen (geclustert
+  // ef-Sweep flach). Stattdessen: ein Distanz-Scan mit gecachten Scores,
+  // sortiert nach (dist, id), Kandidat nur wenn dist(q,e) <= min_s dist(e,s)
+  // (strikter <-Vergleich: Tie behaelt den Kandidaten, deterministisch,
+  // gleiche Metrik wie Suche/Insert), Auffuellung bis max_m mit naechsten
+  // Verworfenen (Grad-Caps erhalten). Paar-Distanzen dist(e,s) nur beim Build.
+  // nb danach in Heuristik-Reihenfolge (erste = naechste).
+  std::vector<SearchHit> scored;
   scored.reserve(nb.size());
-  for (int v : nb) scored.emplace_back(dist_to_stored(data_[id], v), v);
-  std::nth_element(scored.begin(), scored.begin() + max_m, scored.end(),
-                   [](const auto& a, const auto& b) {
-                     if (a.first != b.first) return a.first < b.first;
-                     return a.second < b.second;
-                   });
-  std::sort(scored.begin(), scored.begin() + max_m,
-            [](const auto& a, const auto& b) {
-              if (a.first != b.first) return a.first < b.first;
-              return a.second < b.second;
-            });
+  for (int v : nb) scored.push_back({v, dist_to_stored(data_[id], v)});
+  std::sort(scored.begin(), scored.end(), [](const SearchHit& a,
+                                             const SearchHit& b) {
+    if (a.dist != b.dist) return a.dist < b.dist;
+    return a.id < b.id;
+  });
+  std::vector<SearchHit> picked;
+  picked.reserve(static_cast<size_t>(max_m));
+  std::vector<char> is_picked(scored.size(), 0);
+  for (size_t i = 0; i < scored.size() && static_cast<int>(picked.size()) < max_m;
+       ++i) {
+    bool keep = true;
+    for (const auto& p : picked) {
+      const float d_es =
+          dispatch_distance(data_[scored[i].id], data_[p.id], metric_);
+      if (d_es < scored[i].dist) {
+        keep = false;
+        break;
+      }
+    }
+    if (keep) {
+      picked.push_back(scored[i]);
+      is_picked[i] = 1;
+    }
+  }
+  for (size_t i = 0; i < scored.size() && static_cast<int>(picked.size()) < max_m;
+       ++i) {
+    if (!is_picked[i]) {
+      picked.push_back(scored[i]);
+      is_picked[i] = 1;
+    }
+  }
   nb.clear();
-  for (int t = 0; t < max_m; ++t) nb.push_back(scored[t].second);
-  // nb ist damit (dist, id)-sortiert; kein weiterer Sortierdurchgang noetig.
+  nb.reserve(picked.size());
+  for (const auto& h : picked) nb.push_back(h.id);
 }
 
 void HnswIndex::shrink_layer_after_add(int id, int lc, int max_m, int fresh_id,
                                        float fresh_dist) {
   auto& nb = links_[id][lc];
   if (static_cast<int>(nb.size()) <= max_m) return;
-  // Wie shrink_layer, aber die frisch gelegte Kante (id<->fresh_id) bringt
-  // ihren Score aus der Kandidatensuche mit (Metrik symmetrisch) und wird
-  // nicht neu berechnet.
-  std::vector<std::pair<float, int>> scored;
+  if (max_m <= 0) {
+    nb.clear();
+    return;
+  }
+  // Wie shrink_layer (symmetrische Alg.-3-Heuristik), aber die frisch gelegte
+  // Kante (id<->fresh_id) bringt ihren Score aus der Kandidatensuche mit
+  // (Metrik symmetrisch) und wird nicht neu berechnet; Rest via
+  // dist_to_stored (ein Scan, gecachte Scores).
+  std::vector<SearchHit> scored;
   scored.reserve(nb.size());
   for (int v : nb) {
     if (v == fresh_id)
-      scored.emplace_back(fresh_dist, v);
+      scored.push_back({v, fresh_dist});
     else
-      scored.emplace_back(dist_to_stored(data_[id], v), v);
+      scored.push_back({v, dist_to_stored(data_[id], v)});
   }
-  std::nth_element(scored.begin(), scored.begin() + max_m, scored.end(),
-                   [](const auto& a, const auto& b) {
-                     if (a.first != b.first) return a.first < b.first;
-                     return a.second < b.second;
-                   });
-  std::sort(scored.begin(), scored.begin() + max_m,
-            [](const auto& a, const auto& b) {
-              if (a.first != b.first) return a.first < b.first;
-              return a.second < b.second;
-            });
+  std::sort(scored.begin(), scored.end(), [](const SearchHit& a,
+                                             const SearchHit& b) {
+    if (a.dist != b.dist) return a.dist < b.dist;
+    return a.id < b.id;
+  });
+  std::vector<SearchHit> picked;
+  picked.reserve(static_cast<size_t>(max_m));
+  std::vector<char> is_picked(scored.size(), 0);
+  for (size_t i = 0; i < scored.size() && static_cast<int>(picked.size()) < max_m;
+       ++i) {
+    bool keep = true;
+    for (const auto& p : picked) {
+      const float d_es =
+          dispatch_distance(data_[scored[i].id], data_[p.id], metric_);
+      if (d_es < scored[i].dist) {
+        keep = false;
+        break;
+      }
+    }
+    if (keep) {
+      picked.push_back(scored[i]);
+      is_picked[i] = 1;
+    }
+  }
+  for (size_t i = 0; i < scored.size() && static_cast<int>(picked.size()) < max_m;
+       ++i) {
+    if (!is_picked[i]) {
+      picked.push_back(scored[i]);
+      is_picked[i] = 1;
+    }
+  }
   nb.clear();
-  for (int t = 0; t < max_m; ++t) nb.push_back(scored[t].second);
+  nb.reserve(picked.size());
+  for (const auto& h : picked) nb.push_back(h.id);
 }
 
 std::vector<SearchHit> HnswIndex::search_layer(const Vector& q, int entry_id,

@@ -135,7 +135,7 @@ add_test(NAME raft COMMAND test_raft)
 # s12-pgserver: TCPServer (POSIX, 127.0.0.1 ephemeral) + pgwire codec
 add_library(pgserver STATIC src/server/pgserver.cpp)
 target_include_directories(pgserver PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(pgserver PUBLIC sql)
+target_link_libraries(pgserver PUBLIC sql executor dbengine_mvcc dbengine_kv dbengine_wal)
 target_compile_options(pgserver PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(test_pgserver tests/test_pgserver.cpp)
@@ -184,7 +184,7 @@ add_test(NAME executor COMMAND test_executor)
 # s18-bench: Bench-Harness (KV-Throughput, SQL Q1, ANN Recall/Latenz, CSV)
 add_executable(dbbench tools/bench.cpp)
 target_include_directories(dbbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(dbbench PRIVATE dbengine_kv dbengine_vector columnar)
+target_link_libraries(dbbench PRIVATE dbengine_kv dbengine_vector columnar dbengine_wal)
 target_compile_options(dbbench PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(test_bench tests/test_bench.cpp)
@@ -235,3 +235,9 @@ target_compile_definitions(test_docs PRIVATE DBENGINE_SOURCE_DIR="${CMAKE_CURREN
 target_compile_options(test_docs PRIVATE -Wall -Wextra -Wpedantic)
 
 add_test(NAME docs COMMAND test_docs)
+
+# metrics: Prometheus-Textformat ueber TCP (127.0.0.1 ephemeral) + dbmetrics --selfcheck/--port
+add_executable(dbmetrics src/server/metrics.cpp)
+target_include_directories(dbmetrics PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dbmetrics PRIVATE dbengine_wal dbengine_kv dbengine_raft columnar dbengine_vector)
+target_compile_options(dbmetrics PRIVATE -Wall -Wextra -Wpedantic)
