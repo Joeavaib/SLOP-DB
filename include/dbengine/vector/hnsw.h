@@ -24,8 +24,11 @@
 //     + Disk-Tiering (s10-columnar).
 //
 // Thread-Safety: Lese-Operationen (search/brute_force) sind const & neben-
-// laeufig sicher nach build(). add()/build()/clear() sind nicht nebenlaeufig
-// sicher (Single-Thread, wie bisher).
+// laeufig sicher nach build()/build_parallel(). add()/build()/
+// build_parallel()/clear() sind nicht nebenlaeufig sicher (Single-Caller,
+// exklusiv — kein gleichzeitiges add/search waehrend eines Builds, wie
+// bisher). build_parallel() nutzt intern <thread>/<mutex>/<atomic> (kein
+// OpenMP/TBB); nach dem Join gilt dieselbe const-Lesesicherheit.
 //
 // SoA-Layout (s-perf): Vektordaten liegen in EINEM flachen float-Buffer
 // (Groesse N*dim, Row-Major, Zugriff id*dim+d). norms_ bleibt parallel
@@ -41,8 +44,10 @@
 // sich); das entspricht sinngemaess der bisherigen Realloc-Semantik
 // (Referenzen in vector<Vector> waren ueber Wachstum ebenfalls instabil).
 
+#include <atomic>
 #include <cstddef>
 #include <functional>
+#include <mutex>
 #include <random>
 #include <vector>
 
@@ -158,7 +163,26 @@ class HnswIndex {
   // Baut den Mehrschicht-Graphen inkrementell (O(N log N)): deterministisch
   // mit Seed 42, Level-Sampling, efConstruction-Beam pro Insert.
   // Nach build() ist sofortiges add() ohne Rebuild moeglich.
+  // Implementiert als build_parallel(1) (exakt der alte Single-Pfad).
   void build();
+  // Paralleler Batch-Build (nur <thread>/<mutex>/<atomic>, kein OpenMP/TBB):
+  // n_threads==0 -> hardware_concurrency, 1 -> exakt der Single-Pfad von
+  // build(). Ablauf: Level fuer ALLE Knoten vorab sequentiell mit Seed 42
+  // ziehen (identischer RNG-Strom wie build(), daher identische Level), dann
+  // Knoten 1..N-1 in Index-Reihenfolge als kontige Chunks auf die Threads
+  // verteilen. Synchronisation: ein std::mutex pro Knoten-Link-Vektor (kurz
+  // gehalten: Nachbarlisten-Kopie beim Lesen, Rueckkanten-Update + Shrink
+  // beim Schreiben), ein Mutex fuer entry_/max_level_, ein atomic<int>
+  // Fortschrittszaehler. Spread-Probes/Heuristik (select_neighbors_ptr) und
+  // Shrink-Code werden unveraendert wiederverwendet.
+  // Determinismus: gleiche Level + gleicher Kandidaten-Suchalgorithmus;
+  // nebenlaeufige Shrinks desselben Knotens sind per Mutex serialisiert,
+  // aber ihre Reihenfolge ist scheduling-abhaengig — bei exakten
+  // Distanz-Ties kann die Tie-Order minimal abweichen. Daher: Recall-Ziel
+  // >= Single-Pfad-Stand, aber KEINE Bit-Identitaet des Graphen.
+  // Fallback: n_threads<=1 oder N < 512 -> exakt der alte Single-Pfad.
+  // Exklusiv wie build() (kein gleichzeitiges add/search waehrenddessen).
+  void build_parallel(unsigned n_threads = 0);
   [[nodiscard]] bool built() const;
 
   // --- Lesepfad ---
@@ -214,6 +238,24 @@ class HnswIndex {
   int greedy_closest(const Vector& q, int entry_id, int lc) const;
   int greedy_closest_ptr(const float* q, int entry_id, int lc) const;
   void insert_node(int id);
+  // --- paralleler Batch-Build (nur via build_parallel genutzt) ---
+  // Gleiche Insert-Logik wie insert_node (Spread-Probes, Heuristik, Shrink),
+  // aber: entry_-Snapshot/update unter entry_mtx, Nachbarlisten-Zugriffe
+  // unter link_mtx[knoten] (Lesen = kurze Kopie, Schreiben = Update+Shrink
+  // unter demselben Lock; nie zwei Knoten-Locks gleichzeitig -> deadlockfrei),
+  // Fortschritt via done (relaxed). shrink_layer*/select_neighbors_ptr werden
+  // wiederverwendet (Aufrufer haelt den Knoten-Lock; Distanzen lesen nur den
+  // waehrend des Builds stabilen Flach-Buffer). data_flat_/norms_/levels_
+  // sind in der Parallelphase read-only (vorab dimensioniert).
+  void insert_node_parallel(int id, std::vector<std::mutex>& link_mtx,
+                            std::mutex& entry_mtx, std::atomic<int>& done);
+  // Wie search_layer_ptr/greedy_closest_ptr, aber Nachbar-Expansion ueber
+  // kurze Kopie unter link_mtx[u] (flacher Buffer waechst parallel nicht).
+  [[nodiscard]] std::vector<SearchHit> search_layer_ptr_locked(
+      const float* q, int entry_id, int ef, int lc,
+      std::vector<std::mutex>& link_mtx) const;
+  int greedy_closest_ptr_locked(const float* q, int entry_id, int lc,
+                                std::vector<std::mutex>& link_mtx) const;
   // select_neighbors arbeitet in-place auf dem uebergebenen (owned)
   // Kandidatenvektor (keine Kopie-Flut): HNSW-Diversitaets-Heuristik
   // (Paper Alg. 3) — Kandidat nur, wenn naeher am Insert als an bereits

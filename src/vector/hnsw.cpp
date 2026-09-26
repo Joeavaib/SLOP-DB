@@ -4,11 +4,14 @@
 #include "dbengine/vector/hnsw.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <queue>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #if defined(__x86_64__)
@@ -717,7 +720,222 @@ void HnswIndex::insert_node(int id) {
   built_ = true;
 }
 
-void HnswIndex::build() {
+void HnswIndex::build() { build_parallel(1); }
+
+// Mindestgroesse, ab der sich Threads lohnen (Insert ~10^2-10^3 Distanzen;
+// darunter dominiert Thread-/Lock-Overhead). Darunter exakt Single-Pfad.
+constexpr int kParallelMinN = 512;
+
+std::vector<SearchHit> HnswIndex::search_layer_ptr_locked(
+    const float* q, int entry_id, int ef, int lc,
+    std::vector<std::mutex>& link_mtx) const {
+  // Bit-gleiche Beam-Logik wie search_layer_ptr; einziger Unterschied: die
+  // Nachbar-Expansion kopiert links_[u][lc] kurz unter link_mtx[u], damit ein
+  // gleichzeitiger Rueckkanten-Update+Shrink desselben Knotens nicht mit der
+  // Iteration ract (links_ selbst ist vorab dimensioniert, kein Wachstum).
+  using Cand = std::pair<float, int>;
+  const int n = static_cast<int>(norms_.size());
+  if (n == 0 || entry_id < 0 || entry_id >= n) return {};
+  auto [seen, mark] = acquire_visited(n);
+  std::vector<Cand> frontier;
+  frontier.reserve(static_cast<size_t>(2 * ef + 8));
+  std::vector<Cand> top;
+  top.reserve(static_cast<size_t>(ef + 1));
+  const float d0 = dist2_to_stored_ptr(q, entry_id);
+  frontier.emplace_back(d0, entry_id);
+  seen[entry_id] = mark;
+  top.emplace_back(d0, entry_id);
+  auto is_better = [](const Cand& a, const Cand& b) {
+    if (a.first != b.first) return a.first < b.first;
+    return a.second < b.second;
+  };
+  std::vector<int> nbrs;
+  while (!frontier.empty()) {
+    const float d_u = frontier.front().first;
+    const int u = frontier.front().second;
+    if (static_cast<int>(top.size()) >= ef && d_u > top.front().first) break;
+    std::pop_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
+    frontier.pop_back();
+    if (u < 0 || u >= static_cast<int>(links_.size())) continue;
+    nbrs.clear();
+    {
+      std::lock_guard<std::mutex> lk(link_mtx[static_cast<size_t>(u)]);
+      if (lc >= static_cast<int>(links_[u].size())) continue;
+      nbrs = links_[u][lc];
+    }
+    for (int v : nbrs) {
+      if (v < 0 || v >= n) continue;
+      if (seen[v] == mark) continue;
+      seen[v] = mark;
+      const float d_v = dist2_to_stored_ptr(q, v);
+      frontier.emplace_back(d_v, v);
+      std::push_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
+      if (static_cast<int>(top.size()) < ef) {
+        top.emplace_back(d_v, v);
+        std::push_heap(top.begin(), top.end(), std::less<Cand>());
+      } else if (is_better(Cand(d_v, v), top.front())) {
+        std::pop_heap(top.begin(), top.end(), std::less<Cand>());
+        top.back() = Cand(d_v, v);
+        std::push_heap(top.begin(), top.end(), std::less<Cand>());
+      }
+    }
+  }
+  std::vector<SearchHit> out;
+  out.reserve(top.size());
+  for (const auto& c : top) out.push_back({c.second, c.first});
+  std::sort(out.begin(), out.end(), [](const SearchHit& a, const SearchHit& b) {
+    if (a.dist != b.dist) return a.dist < b.dist;
+    return a.id < b.id;
+  });
+  return out;
+}
+
+int HnswIndex::greedy_closest_ptr_locked(const float* q, int entry_id, int lc,
+                                         std::vector<std::mutex>& link_mtx) const {
+  int cur = entry_id;
+  float cur_d = dist2_to_stored_ptr(q, cur);
+  bool improved = true;
+  std::vector<int> nbrs;
+  while (improved) {
+    improved = false;
+    if (cur < 0 || cur >= static_cast<int>(links_.size())) break;
+    nbrs.clear();
+    {
+      std::lock_guard<std::mutex> lk(link_mtx[static_cast<size_t>(cur)]);
+      if (lc >= static_cast<int>(links_[cur].size())) break;
+      nbrs = links_[cur][lc];
+    }
+    for (int v : nbrs) {
+      const float d = dist2_to_stored_ptr(q, v);
+      if (d < cur_d || (d == cur_d && v < cur)) {
+        cur_d = d;
+        cur = v;
+        improved = true;
+      }
+    }
+  }
+  return cur;
+}
+
+void HnswIndex::insert_node_parallel(int id,
+                                     std::vector<std::mutex>& link_mtx,
+                                     std::mutex& entry_mtx,
+                                     std::atomic<int>& done) {
+  // Gleiche Stufen wie insert_node (Greedy-Descent, Beam + Spread-Probes,
+  // select_neighbors-Heuristik, bidirektionale Verlinkung + Shrink):
+  // eigene Kantenliste wird exklusiv publiziert (eigene id, aber Leser
+  // kopieren unter demselben Lock), fremde Rueckkanten + Shrink unter
+  // link_mtx[nb] (serialisiert gleichzeitige Shrinks desselben Knotens).
+  const int lv = levels_[id];
+  // Flacher Buffer waechst in der Parallelphase nicht -> qrow stabil.
+  const float* qrow = row_ptr(id);
+  int cur;
+  int start_max;
+  {
+    std::lock_guard<std::mutex> lk(entry_mtx);
+    cur = entry_;
+    start_max = max_level_;
+  }
+  // 1) Greedy-Descent von Top bis lv+1.
+  for (int lc = start_max; lc > lv; --lc)
+    cur = greedy_closest_ptr_locked(qrow, cur, lc, link_mtx);
+  // 2) Pro Layer <= lv: Kandidaten via Beam, bidirektional verlinken.
+  const int top_lc = std::min(lv, start_max);
+  for (int lc = top_lc; lc >= 0; --lc) {
+    auto cand =
+        search_layer_ptr_locked(qrow, cur, ef_construction_, lc, link_mtx);
+    cand.erase(std::remove_if(cand.begin(), cand.end(),
+                              [&](const SearchHit& h) { return h.id == id; }),
+               cand.end());
+    // Deterministische Spread-Probes (identisch zu insert_node).
+    if (id > 0) {
+      constexpr int kSpreadK = 8;
+      constexpr int kSpreadTake = 3;
+      int probe_ids[kSpreadK];
+      int nprobe = 0;
+      for (int j = 0; j < kSpreadK; ++j) {
+        const int pid = static_cast<int>(
+            (static_cast<long long>(id) * (j + 1)) / (kSpreadK + 1));
+        if (pid < 0 || pid >= id) continue;
+        if (pid >= static_cast<int>(levels_.size())) continue;
+        if (levels_[pid] < lc) continue;
+        bool dup = false;
+        for (int t = 0; t < nprobe; ++t) {
+          if (probe_ids[t] == pid) {
+            dup = true;
+            break;
+          }
+        }
+        if (dup) continue;
+        bool in_cand = false;
+        for (const auto& h : cand) {
+          if (h.id == pid) {
+            in_cand = true;
+            break;
+          }
+        }
+        if (in_cand) continue;
+        probe_ids[nprobe++] = pid;
+      }
+      if (nprobe > 0) {
+        std::pair<float, int> scored[kSpreadK];
+        for (int t = 0; t < nprobe; ++t)
+          scored[t] = {dist2_to_stored_ptr(qrow, probe_ids[t]),
+                       probe_ids[t]};
+        std::sort(scored, scored + nprobe, [](const auto& a, const auto& b) {
+          if (a.first != b.first) return a.first < b.first;
+          return a.second < b.second;
+        });
+        const int take = nprobe < kSpreadTake ? nprobe : kSpreadTake;
+        for (int t = 0; t < take; ++t)
+          cand.push_back(SearchHit{scored[t].second, scored[t].first});
+      }
+    }
+    const int max_m = (lc == 0) ? 2 * m_ : m_;
+    const int best_cand = cand.empty() ? -1 : cand.front().id;
+    auto sel = select_neighbors_ptr(qrow, cand, max_m);
+    if (sel.empty() && best_cand >= 0) sel.push_back(best_cand);
+    if (sel.empty()) {
+      int best = -1;
+      float best_d = 0.0f;
+      for (int j = 0; j < id; ++j) {
+        const float d = dist2_to_stored_ptr(qrow, j);
+        if (best < 0 || d < best_d) {
+          best = j;
+          best_d = d;
+        }
+      }
+      if (best >= 0) sel.push_back(best);
+    }
+    {
+      std::lock_guard<std::mutex> lk(link_mtx[static_cast<size_t>(id)]);
+      links_[id][lc] = sel;
+    }
+    for (size_t k = 0; k < sel.size(); ++k) {
+      const int nb = sel[k];
+      std::lock_guard<std::mutex> lk(link_mtx[static_cast<size_t>(nb)]);
+      auto& back = links_[nb][lc];
+      if (std::find(back.begin(), back.end(), id) == back.end())
+        back.push_back(id);
+      if (k < cand.size() && cand[k].id == nb)
+        shrink_layer_after_add(nb, lc, max_m, id, cand[k].dist);
+      else
+        shrink_layer(nb, lc, max_m);
+    }
+    if (best_cand >= 0) cur = best_cand;
+    else if (!sel.empty()) cur = sel.front();
+  }
+  {
+    std::lock_guard<std::mutex> lk(entry_mtx);
+    if (lv > max_level_) {
+      max_level_ = lv;
+      entry_ = id;
+    }
+  }
+  done.fetch_add(1, std::memory_order_relaxed);
+}
+
+void HnswIndex::build_parallel(unsigned n_threads) {
   const int n = static_cast<int>(norms_.size());
   if (n == 0) {
     links_.clear();
@@ -735,11 +953,13 @@ void HnswIndex::build() {
       if (static_cast<int>(links_[i].size()) != levels_[i] + 1) ok = false;
     if (ok) return;
   }
-  // Deterministischer Neuaufbau: Seed zuruecksetzen, Level neu ziehen.
+  // Deterministischer Neuaufbau: Seed zuruecksetzen, Level VORAB sequentiell
+  // neu ziehen — identischer RNG-Strom wie bisheriges build(), daher
+  // identische Level unabhaengig von der Threadzahl.
   rng_.seed(42);
   levels_.assign(n, 0);
   links_.clear();
-  links_.reserve(n);
+  links_.reserve(static_cast<size_t>(n));
   for (int i = 0; i < n; ++i) {
     levels_[i] = random_level();
     links_.emplace_back(static_cast<size_t>(levels_[i]) + 1);
@@ -752,10 +972,41 @@ void HnswIndex::build() {
     entry_ = 0;
     return;
   }
-  // Knoten 0: Entry.
-  entry_ = 0;
-  max_level_ = levels_[0];
-  for (int i = 1; i < n; ++i) insert_node(i);
+  unsigned t = n_threads;
+  if (t == 0) {
+    t = std::thread::hardware_concurrency();
+    if (t == 0) t = 4;
+  }
+  // Fallback: exakt der alte Single-Pfad (auch via build() -> (1)).
+  if (t <= 1 || n < kParallelMinN) {
+    entry_ = 0;
+    max_level_ = levels_[0];
+    for (int i = 1; i < n; ++i) insert_node(i);
+    built_ = true;
+    return;
+  }
+  if (t > static_cast<unsigned>(n - 1)) t = static_cast<unsigned>(n - 1);
+  // links_/levels_/data_flat_ sind ab hier groessenstabil (kein add/clear
+  // waehrend des Builds): Locks nur um Link-Listen, nie um den Flach-Buffer.
+  std::vector<std::mutex> link_mtx(static_cast<size_t>(n));
+  std::mutex entry_mtx;
+  std::atomic<int> done{0};
+  // Knoten 1..N-1 in Index-Reihenfolge als kontige Chunks (statisch ->
+  // deterministische Zuordnung; Rest-Interleaving dokumentiert unscharf).
+  const int span = n - 1;
+  const int t_int = static_cast<int>(t);
+  const int chunk = (span + t_int - 1) / t_int;
+  std::vector<std::thread> workers;
+  workers.reserve(t);
+  for (int w = 0; w < t_int; ++w) {
+    const int lo = 1 + w * chunk;
+    const int hi = std::min(n, lo + chunk);
+    workers.emplace_back([this, lo, hi, &link_mtx, &entry_mtx, &done]() {
+      for (int id = lo; id < hi; ++id)
+        insert_node_parallel(id, link_mtx, entry_mtx, done);
+    });
+  }
+  for (auto& th : workers) th.join();
   built_ = true;
 }
 

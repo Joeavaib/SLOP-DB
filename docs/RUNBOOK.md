@@ -120,3 +120,82 @@ psql "host=127.0.0.1 port=5433 sslmode=require" -c "SELECT 1;"
 Warnung: ohne TLS (direkt auf Port 5432 oder Auth-Hook ohne Sidecar) laufen
 Auth-Daten im Klartext übers Netz — Auth-Hook nur mit TLS-Sidecar davor in
 nicht-vertrauenswürdigen Netzen betreiben.
+
+## 8. Backup / Restore (dbbackup, offline, single-shard)
+
+Tool: `./build/dbbackup` (Quelle: `src/server/backup.cpp`, Binary-Ziel
+`dbbackup` in `CMakeLists.txt`). Limitation laut CLI-Hilfe: offline,
+single-shard, kein PITR (s. `backup.h`).
+
+```sh
+./build/dbbackup --selfcheck
+./build/dbbackup --backup --wal /data/wal.log --out /backup/dbengine-2026-09-26
+./build/dbbackup --backup --wal /data/wal.log --out /backup/dbengine-full \
+  --col /data/columnar --raft-log /data/raft.log --raft-snap /data/raft.snap
+./build/dbbackup --restore --in /backup/dbengine-2026-09-26 --wal /data/wal.log
+./build/dbbackup --restore --in /backup/dbengine-full --wal /data/wal.log \
+  --col /data/columnar
+```
+
+Flags belegt aus `Usage()` in `src/server/backup.cpp`:
+
+- `--selfcheck` (allein, ohne weitere Args)
+- `--backup --wal <src.wal> --out <backupdir>`
+  `[--col <coldir>] [--raft-log <f>] [--raft-snap <f>]`
+- `--restore --in <backupdir> --wal <dst.wal> [--col <dstdir>]`
+
+Ablauf: Backup flusht das WAL, speichert Columnar (`columnar/`) + Raft-Log/
+Snapshot, kopiert das WAL und schreibt das MANIFEST zuletzt (atomar via
+`tmp+rename+fsync`); Restore prüft MANIFEST zuerst und verifiziert
+WAL-max-LSN, Raft-commit und Columnar-Rows (siehe `BackupCoordinator::Backup` /
+`Restore` in `src/server/backup.cpp`).
+
+## 9. Metrics (dbmetrics, Prometheus-Textformat)
+
+Tool: `./build/dbmetrics` (Quelle: `src/server/metrics.cpp`, Binary-Ziel
+`dbmetrics` in `CMakeLists.txt`). Server bindet `127.0.0.1`, Endpunkt
+`GET /metrics` (andere Pfade → `404 not found`).
+
+```sh
+./build/dbmetrics --selfcheck          # ephemeral Port + Scrape + Asserts
+./build/dbmetrics --port 9090          # Dauerbetrieb (Demo-Snapshot)
+curl http://127.0.0.1:9090/metrics
+```
+
+Flags belegt aus `main()` / Usage in `src/server/metrics.cpp`:
+`--selfcheck`, `--port <n>` (`0..65535`; Usage: `[--selfcheck] [--port <n>]`).
+`--selfcheck --port <n>` nutzt den festen Port statt ephemeral.
+
+Beispiel-Metriken (belegt aus `MetricsServer::render` in
+`src/server/metrics.cpp`, Felder in `include/dbengine/server/metrics.h`):
+
+```text
+dbengine_wal_durable_lsn 3
+dbengine_wal_next_lsn 4
+dbengine_wal_appends_total 3
+dbengine_wal_flushes_total 1
+dbengine_raft_commit_index 2
+dbengine_raft_log_size 2
+dbengine_raft_alive_count 1
+dbengine_raft_leader_id 0
+dbengine_raft_term 1
+dbengine_columnar_total_rows 4
+dbengine_columnar_sealed_parts 1
+dbengine_hnsw_size 4
+dbengine_hnsw_dim 4
+dbengine_hnsw_max_level 1
+dbengine_kv_keys 3
+dbengine_kv_sequence 3
+```
+
+(Werte: Demo-Snapshot aus `BuildDemoSnapshot` in `src/server/metrics.cpp`;
+Produktiv füllt der Aufrufer `Snapshot` aus den Live-Stores.)
+
+## 10. Auth (nur programmatisch, kein CLI-Flag)
+
+Ehrlicher Stand (belegt aus `src/server/pgserver.cpp`): Auth existiert nur
+programmatisch via `PgServer::setAuth(users)` (`std::map<std::string,
+std::string>`) und `PgServer::setAuthRequired(bool)` — es gibt derzeit
+**kein CLI-Flag** (kein `--auth`-o.ä. in `src/server/`). Empfehlung:
+Auth-Hook nur hinter TLS-Sidecar betreiben (s. Abschnitt 7), Credentials
+nie ohne Sidecar übers Netz schicken.

@@ -327,6 +327,195 @@ Result Executor::execute(const std::string& sql) {
     return execCreate(std::get<CreateTableStmt>(st));
   if (std::holds_alternative<InsertStmt>(st))
     return execInsert(std::get<InsertStmt>(st));
+  if (std::holds_alternative<UpdateStmt>(st)) {
+    // UPDATE: sichtbare Zeilen matchen (Snapshot wie execSelect), Treffer als
+    // neue Vollzeilen schreiben (KV-Put + neue MVCC-Version, alte Version via
+    // trx_end abgeloest). WAL zuerst (Opcode 'U'), dann KV-Batch, dann
+    // MVCC-Commit (eine Writer-Txn). Reads unveraendert (Snapshot-Semantik).
+    const UpdateStmt& u = std::get<UpdateStmt>(st);
+    const std::string norm = normalizeTable(u.table);
+    auto it = tables_.find(norm);
+    if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + u.table);
+    const TableSchema& sch = it->second;
+    std::vector<int> setIdx;
+    setIdx.reserve(u.sets.size());
+    for (const auto& [col, val] : u.sets) {
+      (void)val;
+      int idx = schemaColIndex(sch.columns, col);
+      if (idx < 0) throw SqlError("Unbekannte Spalte: " + col);
+      setIdx.push_back(idx);
+    }
+    Table shadow;
+    shadow.columns = sch.columns;
+    auto snap = kv_.GetSnapshot();
+    txn::Transaction rtxn = mvcc_.BeginRead();
+    std::vector<std::pair<std::string, std::vector<Value>>> vis;
+    for (const auto& [k, v] : snap->Scan(tablePrefix(norm))) {
+      (void)v;  // Key-Menge aus KV, Wert NUR aus MVCC (kein Dirty-Read)
+      auto mv = mvcc_.Read(rtxn, k);
+      if (!mv.has_value()) continue;  // Tombstone/ung committed -> unsichtbar
+      try {
+        vis.emplace_back(k, decodeRow(*mv, sch.columns.size()));
+      } catch (...) {
+        continue;
+      }
+    }
+    mvcc_.Commit(rtxn);
+    // Matching erst nach Commit des Read-Snapshots (Fehler aus WHERE
+    // hinterlassen keine offene Read-Txn).
+    std::vector<std::pair<std::string, std::string>> hits;  // (key, newEnc)
+    for (auto& [k, row] : vis) {
+      if (!rowMatchesWhere(shadow, row, u.where, u.where_groups)) continue;
+      for (std::size_t i = 0; i < u.sets.size(); ++i) {
+        const std::size_t ti = static_cast<std::size_t>(setIdx[i]);
+        row[ti] = coerceValue(u.sets[i].second, sch.columns[ti].type,
+                              sch.columns[ti].name);
+      }
+      hits.emplace_back(k, encodeRow(row));
+    }
+    if (hits.empty()) return {{}, {}, "UPDATE 0", 0};
+    if (wal_ != nullptr) {
+      for (const auto& [k, enc] : hits) {
+        std::string payload;
+        payload += 'U';
+        payload += kWalSep;
+        payload += norm;
+        payload += kWalSep;
+        payload += walEscape(k);
+        payload += kWalSep;
+        payload += enc;
+        wal_->append(payload);
+      }
+      wal_->flush();
+    }
+    {
+      kv::WriteBatch batch;
+      for (const auto& [k, enc] : hits) batch.Put(k, enc);
+      if (!kv_.Write(batch)) throw SqlError("KV-Write fehlgeschlagen");
+    }
+    {
+      txn::Transaction w = mvcc_.BeginWriteBlocking();
+      for (const auto& [k, enc] : hits) {
+        if (!mvcc_.Write(w, k, enc)) {
+          mvcc_.Abort(w);
+          throw SqlError("MVCC-Write fehlgeschlagen");
+        }
+      }
+      if (!mvcc_.Commit(w)) throw SqlError("MVCC-Commit fehlgeschlagen");
+    }
+    return {{},
+            {},
+            "UPDATE " + std::to_string(hits.size()),
+            hits.size()};
+  }
+  if (std::holds_alternative<DeleteStmt>(st)) {
+    // DELETE: Treffer per Tombstone loeschen (MVCC-Erase -> deleted Version,
+    // SELECT unsichtbar, COUNT sinkt) + KV-Key hart entfernen. WAL zuerst
+    // (Opcode 'D'), dann KV-Batch, dann MVCC-Commit.
+    const DeleteStmt& d = std::get<DeleteStmt>(st);
+    const std::string norm = normalizeTable(d.table);
+    auto it = tables_.find(norm);
+    if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + d.table);
+    const TableSchema& sch = it->second;
+    Table shadow;
+    shadow.columns = sch.columns;
+    auto snap = kv_.GetSnapshot();
+    txn::Transaction rtxn = mvcc_.BeginRead();
+    std::vector<std::pair<std::string, std::vector<Value>>> vis;
+    for (const auto& [k, v] : snap->Scan(tablePrefix(norm))) {
+      (void)v;
+      auto mv = mvcc_.Read(rtxn, k);
+      if (!mv.has_value()) continue;
+      try {
+        vis.emplace_back(k, decodeRow(*mv, sch.columns.size()));
+      } catch (...) {
+        continue;
+      }
+    }
+    mvcc_.Commit(rtxn);
+    std::vector<std::string> keys;
+    for (const auto& [k, row] : vis) {
+      if (!rowMatchesWhere(shadow, row, d.where, d.where_groups)) continue;
+      keys.push_back(k);
+    }
+    if (keys.empty()) return {{}, {}, "DELETE 0", 0};
+    if (wal_ != nullptr) {
+      for (const auto& k : keys) {
+        std::string payload;
+        payload += 'D';
+        payload += kWalSep;
+        payload += norm;
+        payload += kWalSep;
+        payload += walEscape(k);
+        wal_->append(payload);
+      }
+      wal_->flush();
+    }
+    {
+      kv::WriteBatch batch;
+      for (const auto& k : keys) batch.Delete(k);
+      if (!kv_.Write(batch)) throw SqlError("KV-Write fehlgeschlagen");
+    }
+    {
+      txn::Transaction w = mvcc_.BeginWriteBlocking();
+      for (const auto& k : keys) {
+        if (!mvcc_.Erase(w, k)) {
+          mvcc_.Abort(w);
+          throw SqlError("MVCC-Write fehlgeschlagen");
+        }
+      }
+      if (!mvcc_.Commit(w)) throw SqlError("MVCC-Commit fehlgeschlagen");
+    }
+    return {{},
+            {},
+            "DELETE " + std::to_string(keys.size()),
+            keys.size()};
+  }
+  if (std::holds_alternative<DropTableStmt>(st)) {
+    // DROP TABLE: Schema-Key + alle Row-Keys aus KV entfernen, MVCC-Tombstones
+    // je Row-Key, Registry-Eintrag loeschen. Danach ist die Tabelle fuer
+    // SELECT/INSERT/UPDATE/DELETE unbekannt (SqlError). WAL zuerst
+    // (Opcode 'T'), dann KV, dann MVCC, dann Registry.
+    const DropTableStmt& d = std::get<DropTableStmt>(st);
+    const std::string norm = normalizeTable(d.table);
+    auto it = tables_.find(norm);
+    if (it == tables_.end()) {
+      if (d.if_exists) return {{}, {}, "DROP TABLE", 0};
+      throw SqlError("Tabelle unbekannt: " + d.table);
+    }
+    auto snap = kv_.GetSnapshot();
+    std::vector<std::string> keys;
+    for (const auto& [k, v] : snap->Scan(tablePrefix(norm))) {
+      (void)v;
+      keys.push_back(k);
+    }
+    if (wal_ != nullptr) {
+      std::string payload;
+      payload += 'T';
+      payload += kWalSep;
+      payload += norm;
+      wal_->append(payload);
+      wal_->flush();
+    }
+    {
+      kv::WriteBatch batch;
+      for (const auto& k : keys) batch.Delete(k);
+      batch.Delete("sql/__schema/" + norm);
+      if (!kv_.Write(batch)) throw SqlError("KV-Write fehlgeschlagen");
+    }
+    if (!keys.empty()) {
+      txn::Transaction w = mvcc_.BeginWriteBlocking();
+      for (const auto& k : keys) {
+        if (!mvcc_.Erase(w, k)) {
+          mvcc_.Abort(w);
+          throw SqlError("MVCC-Write fehlgeschlagen");
+        }
+      }
+      if (!mvcc_.Commit(w)) throw SqlError("MVCC-Commit fehlgeschlagen");
+    }
+    tables_.erase(it);
+    return {{}, {}, "DROP TABLE", 0};
+  }
   return execSelect(std::get<SelectStmt>(st));
 }
 
@@ -596,6 +785,81 @@ std::size_t Executor::recover() {
           ++recover_applied_;
         } else {
           ++recover_skipped_;
+        }
+      } catch (...) {
+        ++recover_skipped_;
+      }
+    } else if (parts[0] == "U" && parts.size() == 4) {
+      // UPDATE-Replay: mechanisch wie INSERT (last-wins KV-Put + neue
+      // MVCC-Version). Ohne Schema nicht replaybar -> Skip.
+      try {
+        if (applyInsertRecord(parts[1], walUnescape(parts[2]), parts[3])) {
+          ++recover_applied_;
+        } else {
+          ++recover_skipped_;
+        }
+      } catch (...) {
+        ++recover_skipped_;
+      }
+    } else if (parts[0] == "D" && parts.size() == 3) {
+      // DELETE-Replay: KV-Key entfernen + MVCC-Tombstone. Ohne Schema -> Skip.
+      try {
+        const std::string norm = normalizeTable(parts[1]);
+        if (tables_.find(norm) == tables_.end()) {
+          ++recover_skipped_;
+        } else {
+          const std::string key = walUnescape(parts[2]);
+          kv_.Delete(key);
+          txn::Transaction w = mvcc_.BeginWriteBlocking();
+          if (mvcc_.Erase(w, key) && mvcc_.Commit(w)) {
+            ++recover_applied_;
+          } else {
+            mvcc_.Abort(w);
+            ++recover_skipped_;
+          }
+        }
+      } catch (...) {
+        ++recover_skipped_;
+      }
+    } else if (parts[0] == "T" && parts.size() == 2) {
+      // DROP-Replay (idempotent): alle Row-Keys + Schema-Key aus KV
+      // entfernen, MVCC-Tombstones je Row-Key, Registry-Eintrag loeschen.
+      try {
+        const std::string norm = normalizeTable(parts[1]);
+        auto kvs = kv_.Scan(tablePrefix(norm));
+        kv::WriteBatch batch;
+        std::vector<std::string> keys;
+        keys.reserve(kvs.size());
+        for (auto& [k, v] : kvs) {
+          (void)v;
+          batch.Delete(k);
+          keys.push_back(k);
+        }
+        batch.Delete("sql/__schema/" + norm);
+        if (!kv_.Write(batch)) {
+          ++recover_skipped_;
+        } else {
+          bool ok = true;
+          if (!keys.empty()) {
+            txn::Transaction w = mvcc_.BeginWriteBlocking();
+            for (auto& k : keys) {
+              if (!mvcc_.Erase(w, k)) {
+                ok = false;
+                break;
+              }
+            }
+            if (ok) {
+              ok = mvcc_.Commit(w);
+            } else {
+              mvcc_.Abort(w);
+            }
+          }
+          tables_.erase(norm);
+          if (ok) {
+            ++recover_applied_;
+          } else {
+            ++recover_skipped_;
+          }
         }
       } catch (...) {
         ++recover_skipped_;

@@ -14,6 +14,10 @@
 //     ON a.c = b.d [AND a.e = b.f ...] (genau ein INNER JOIN; Equi-ON per
 //     Hash-Join ueber die kleinere Seite, sonst Nested-Loop; WHERE/GROUP BY/
 //     ORDER BY/LIMIT/OFFSET danach auf den Combined-Rows wie bisher).
+//   UPDATE t SET c = v [, ...] [WHERE ...]  (WHERE-DNF wie SELECT;
+//     SET-Werte sind Literale wie in INSERT, typkoerziert pro Spalte)
+//   DELETE FROM t [WHERE ...]
+//   DROP TABLE [IF EXISTS] t  (kein CASCADE, kein TRUNCATE)
 //   Qualifizierte Refs `t.c` (Tabelle oder Alias als Prefix) in SELECT, WHERE,
 //     ON, GROUP BY, ORDER BY und Aggregat-Argumenten; unqualifiziert + in
 //     beiden Tabellen vorhanden -> SqlError (ambiguous).
@@ -34,7 +38,7 @@
 // Aggregat-Ausdruck oder 1-basiertes Positions-Ordinal (PG). Sortierung +
 // LIMIT/OFFSET werden nach Filter/Gruppierung/Aggregation angewendet.
 // NULL-Platzierung PG-konform (Default ASC->NULLS LAST, DESC->NULLS FIRST).
-// V2-Luecken (bewusst): LEFT/RIGHT/FULL/OUTER/CROSS JOIN, UPDATE/DELETE,
+// V2-Luecken (bewusst): LEFT/RIGHT/FULL/OUTER/CROSS JOIN, TRUNCATE/CASCADE,
 // Indexe, Typcheck streng, Prepared Statements / Extended Protocol.
 
 #include <cstdint>
@@ -43,6 +47,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -90,6 +95,31 @@ struct Condition {
   Value value;              // Einzel-Literal bzw. BETWEEN-Untergrenze
   Value second;             // BETWEEN-Obergrenze (sonst NULL)
   std::vector<Value> list;  // IN-Wertliste (sonst leer)
+};
+
+// UPDATE t SET c=v [, ...] [WHERE ...]: SET-Spalten sind unquoted
+// lowercase-gefoldet, Werte Literale (Zahl/String/NULL/TRUE/FALSE/DEFAULT,
+// wie parseLiteral in INSERT). WHERE-DNF wie SelectStmt (where XOR
+// where_groups).
+struct UpdateStmt {
+  std::string table;
+  std::vector<std::pair<std::string, Value>> sets;
+  std::vector<Condition> where;  // AND-verknuepft; bei OR leer (s. where_groups)
+  std::vector<std::vector<Condition>> where_groups;  // DNF bei OR, sonst leer
+};
+
+// DELETE FROM t [WHERE ...]: WHERE-DNF wie UpdateStmt. Ohne WHERE sind alle
+// Zeilen betroffen.
+struct DeleteStmt {
+  std::string table;
+  std::vector<Condition> where;
+  std::vector<std::vector<Condition>> where_groups;
+};
+
+// DROP TABLE [IF EXISTS] t: genau eine Tabelle, kein CASCADE/TRUNCATE.
+struct DropTableStmt {
+  std::string table;
+  bool if_exists = false;
 };
 
 // Arithmetischer Ausdruck als Aggregat-Argument (Q6): Spalte | Literal |
@@ -180,8 +210,8 @@ struct SelectStmt {
   int64_t offset = 0;  // >= 0 (negativ -> SqlError)
 };
 
-using Statement =
-    std::variant<CreateTableStmt, InsertStmt, SelectStmt>;
+using Statement = std::variant<CreateTableStmt, InsertStmt, SelectStmt,
+                                  UpdateStmt, DeleteStmt, DropTableStmt>;
 
 struct Result {
   std::vector<std::string> columns;
@@ -196,6 +226,14 @@ struct Table {
   int colIndex(const std::string& name) const;  // -1 wenn unbekannt
 };
 
+// Single-Table WHERE-Match (DNF wie SelectStmt: ohne OR gilt `where` (AND),
+// mit OR gelten `where_groups`). Selbe Condition-Auswertung wie SELECT
+// (inkl. SqlError bei unbekannter Spalte). Auch vom KV/MVCC-Executor fuer
+// UPDATE/DELETE nutzbar.
+bool rowMatchesWhere(const Table& t, const std::vector<Value>& row,
+                     const std::vector<Condition>& where,
+                     const std::vector<std::vector<Condition>>& where_groups);
+
 // In-Memory Executor. Falls spaeter include/dbengine/kv/kv.h existiert, kann
 // Database als Frontend vor einen KVStore gesetzt werden (Tabellen-Praefix
 // "sql/<table>/..."); aktuell bewusst ohne harte kv-Abhaengigkeit (Fallback).
@@ -208,6 +246,9 @@ class Database {
   Result execCreate(const CreateTableStmt& s);
   Result execInsert(const InsertStmt& s);
   Result execSelect(const SelectStmt& s);
+  Result execUpdate(const UpdateStmt& s);
+  Result execDelete(const DeleteStmt& s);
+  Result execDrop(const DropTableStmt& s);
 
   bool hasTable(const std::string& name) const;
   const Table& getTable(const std::string& name) const;
@@ -217,6 +258,7 @@ class Database {
 };
 
 Statement parseStatement(const std::string& sql);
-std::string statementKind(const Statement& s);  // "CREATE"/"INSERT"/"SELECT"
+std::string statementKind(
+    const Statement& s);  // "CREATE"/"INSERT"/"SELECT"/"UPDATE"/"DELETE"/"DROP"
 
 }  // namespace dbengine::sql

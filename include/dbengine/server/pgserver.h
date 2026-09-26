@@ -7,8 +7,13 @@
 //   Q sonst -> Session an server-eigener Executor-Instanz:
 //     SELECT -> T(Spalten+OIDs)/D*(Text, NULL=-1)/C(SELECT n)/Z
 //     INSERT/CREATE -> C(tag)/Z; Executor-Fehler -> E(42601/0A000)/Z (offen).
+//   Extended minimal parameterlos (pro Connection: Statements+Portale):
+//     P -> '1' (ParseComplete, Query gespeichert); D(S/P) -> T/n ohne Execute
+//       (Projektions-Analyse: Spaltennamen+OIDs aus Schema/Parser);
+//     B -> '2' (Portal angelegt, nur ohne Parameter); E -> T/D/C wie Q-Pfad;
+//     S -> Z; C(S/P) -> '3'. Mit Parametern ($n/Bind-nParams>0) -> E 0A000+Z.
 //   'X' (Terminate) beendet die Connection sauber.
-//   Nicht-Q/X (Extended/COPY) -> E(0A000)/Z, unveraendert.
+//   Sonst (COPY/unbekannt) -> E(0A000)/Z, unveraendert.
 
 #include <atomic>
 #include <map>

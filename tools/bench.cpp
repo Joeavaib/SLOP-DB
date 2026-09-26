@@ -9,14 +9,17 @@
 //
 // CLI:
 //   dbbench [--kv-puts N] [--sql-q1 [--sql-rows R]] [--ann N,d,k]
-//           [--csv PATH] [--data-dir DIR] [--smoke] [--help]
+//           [--csv PATH] [--data-dir DIR] [--tpch [N]] [--smoke] [--help]
 //   dbbench --smoke  => klein: kv=1000, sql-rows=1000, ann=1000,16,10
 //   dbbench --data-dir DIR => nur WAL-Bench auf DIR (mit anderen Flags kombinierbar)
+//   dbbench --tpch [N] => TPC-H-like lineitem (Default 10000, Seed 42) ueber
+//     echten Executor (KV+MVCC): Q6 + Q1-Kern, CSV-Zeilen tpch_q1/tpch_q6.
 //   Ohne Bench-Flags => Default: kv=10000, sql-q1 (50000 rows), ann=1000,64,10.
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -26,6 +29,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <variant>
 #include <vector>
 
 // ---- optionale Engine-Header (graceful degrade) -----------------------------
@@ -46,15 +50,24 @@
 #define BENCH_HAVE_WAL 1
 #include "dbengine/storage/wal.h"
 #endif
+#if __has_include("dbengine/sql/executor.h") && \
+    __has_include("dbengine/txn/mvcc.h")
+#define BENCH_HAVE_TPCH 1
+#include "dbengine/sql/executor.h"
+#include "dbengine/txn/mvcc.h"
+#endif
 #else
 // Compiler ohne __has_include: alles voraussetzen.
 #define BENCH_HAVE_KV 1
 #define BENCH_HAVE_VECTOR 1
 #define BENCH_HAVE_COLUMNAR 1
 #define BENCH_HAVE_WAL 1
+#define BENCH_HAVE_TPCH 1
 #include "dbengine/columnar/store.h"
 #include "dbengine/kv.h"
+#include "dbengine/sql/executor.h"
 #include "dbengine/storage/wal.h"
+#include "dbengine/txn/mvcc.h"
 #include "dbengine/vector/hnsw.h"
 #endif
 
@@ -112,6 +125,8 @@ struct Config {
   long long sql_rows = 50000;
   bool do_ann = false;
   long long ann_n = 0, ann_d = 0, ann_k = 0;
+  bool do_tpch = false;
+  long long tpch_rows = 10000;
   bool smoke = false;
   std::string csv_path;
   std::string data_dir;
@@ -166,6 +181,31 @@ Config ParseArgs(int argc, char** argv) {
         return c;
       }
       c.do_ann = true;
+    } else if (a == "--tpch" || a.rfind("--tpch=", 0) == 0) {
+      long long v = 10000;
+      if (a.rfind("--tpch=", 0) == 0) {
+        std::string vs = a.substr(8);
+        bool ok = false;
+        v = ParseLong(vs, ok);
+        if (!ok || v <= 0) {
+          c.error = "invalid --tpch value: " + vs;
+          return c;
+        }
+      } else if (i + 1 < argc && argv[i + 1][0] != '\0' &&
+                 argv[i + 1][0] != '-') {
+        // Optionales Positions-Argument: nur konsumieren wenn positiv numerisch,
+        // sonst Fehler (kein stilles Ignorieren von Tippfehlern).
+        bool ok = false;
+        long long vv = ParseLong(argv[i + 1], ok);
+        if (!ok || vv <= 0) {
+          c.error = std::string("invalid --tpch value: ") + argv[i + 1];
+          return c;
+        }
+        v = vv;
+        ++i;
+      }
+      c.do_tpch = true;
+      c.tpch_rows = v;
     } else if (a == "--csv") {
       if (!need_val(c.csv_path)) return c;
     } else if (a == "--data-dir") {
@@ -192,7 +232,7 @@ Config ParseArgs(int argc, char** argv) {
     c.ann_d = 16;
     c.ann_k = 10;
   }
-  if (!c.do_kv && !c.do_sql && !c.do_ann && !c.has_data_dir && c.error.empty() && !c.help) {
+  if (!c.do_kv && !c.do_sql && !c.do_ann && !c.do_tpch && !c.has_data_dir && c.error.empty() && !c.help) {
     // Default: alles, mittlere Groesse.
     c.do_kv = true;
     c.kv_puts = 10000;
@@ -209,7 +249,8 @@ Config ParseArgs(int argc, char** argv) {
 void Usage(const char* prog) {
   std::fprintf(stderr,
                "usage: %s [--kv-puts N] [--sql-q1 [--sql-rows R]] "
-               "[--ann N,d,k] [--csv PATH] [--data-dir DIR] [--smoke]\n",
+               "[--ann N,d,k] [--csv PATH] [--data-dir DIR] [--tpch [N]] "
+               "[--smoke]\n",
                prog);
 }
 
@@ -286,6 +327,216 @@ BenchRow RunSqlQ1(long long rows) {
 #endif
   return row;
 }
+
+// ---- TPC-H-like Bench ueber echten Executor (KV+MVCC-Pfad) ------------------
+// Deterministische lineitem-Tabelle (Seed 42), Muster wie RunSqlQ1:
+// einmal aufbauen (batched INSERTs), dann je Query kReps Scans messen.
+//   Q6: SELECT SUM(price*disc) WHERE <5x AND-Range> (skalares Aggregat).
+//   Q1-Kern: SELECT rf, ls, SUM/AVG/COUNT ... GROUP BY rf, ls (Hash-Agg).
+// CSV: tpch_q1 + tpch_q6 (rows/s, p95 ms/scan). Details (Summe/Ref/Hash)
+// human-readable nach stderr (stdout bleibt reines CSV fuer test_bench).
+#ifdef BENCH_HAVE_TPCH
+std::uint64_t Fnv1a64(const std::string& s,
+                      std::uint64_t h = 1469598103934665603ULL) {
+  for (unsigned char ch : s) {
+    h ^= static_cast<std::uint64_t>(ch);
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+double TpchValueToDouble(const dbengine::sql::Value& v, bool& ok) {
+  if (auto* d = std::get_if<double>(&v)) {
+    ok = true;
+    return *d;
+  }
+  if (auto* n = std::get_if<int64_t>(&v)) {
+    ok = true;
+    return static_cast<double>(*n);
+  }
+  ok = false;
+  return 0.0;
+}
+
+std::vector<BenchRow> RunTpch(long long rows) {
+  BenchRow q1{"tpch_q1", 0.0, 0.0};
+  BenchRow q6{"tpch_q6", 0.0, 0.0};
+  try {
+    dbengine::kv::KVStore kv;
+    dbengine::txn::MvccStore mvcc;
+    dbengine::sql::Executor ex(kv, mvcc, nullptr);
+    ex.execute(
+        "CREATE TABLE lineitem (orderkey INT, qty INT, price DOUBLE, "
+        "disc DOUBLE, tax DOUBLE, rf TEXT, ls TEXT, shipdate INT)");
+
+    // Deterministische Generierung (Seed 42). Spannen so gewaehlt, dass die
+    // Q6-Praedikate unten selektiv, aber nicht leer sind.
+    std::mt19937 rng(42u);
+    std::uniform_int_distribution<int> qty_d(1, 50);
+    std::uniform_int_distribution<int> price_cents_d(1000, 1000000);
+    std::uniform_int_distribution<int> disc_pct_d(0, 10);
+    std::uniform_int_distribution<int> tax_pct_d(0, 8);
+    std::uniform_int_distribution<int> rf_d(0, 2);
+    std::uniform_int_distribution<int> ls_d(0, 1);
+    std::uniform_int_distribution<int> yr_d(1992, 1998);
+    std::uniform_int_distribution<int> mo_d(1, 12);
+    std::uniform_int_distribution<int> da_d(1, 28);
+    const char* const rfs[3] = {"A", "N", "R"};
+    const char* const lss[2] = {"O", "F"};
+
+    // Referenz-Summe fuer Q6 (identische Praedikate wie q6_sql unten).
+    double ref_q6 = 0.0;
+    const long long kBatch = 500;
+    for (long long base = 0; base < rows; base += kBatch) {
+      long long cur = std::min(kBatch, rows - base);
+      std::string sql = "INSERT INTO lineitem VALUES ";
+      sql.reserve(static_cast<size_t>(cur * 64 + 32));
+      for (long long i = 0; i < cur; ++i) {
+        long long idx = base + i;
+        long long orderkey = idx + 1;
+        long long qty = static_cast<long long>(qty_d(rng));
+        double price = static_cast<double>(price_cents_d(rng)) / 100.0;
+        double disc = static_cast<double>(disc_pct_d(rng)) / 100.0;
+        double tax = static_cast<double>(tax_pct_d(rng)) / 100.0;
+        const char* rf = rfs[rf_d(rng)];
+        const char* ls = lss[ls_d(rng)];
+        int shipdate = yr_d(rng) * 10000 + mo_d(rng) * 100 + da_d(rng);
+        bool pass = (disc >= 0.05 && disc <= 0.07) && (qty < 24) &&
+                    (price >= 500.0) && (price < 5000.0) && (tax <= 0.05) &&
+                    (shipdate >= 19940101 && shipdate <= 19951231);
+        if (pass) ref_q6 += price * disc;
+        char row[128];
+        std::snprintf(row, sizeof(row),
+                      "%s(%lld,%lld,%.2f,%.2f,%.2f,'%s','%s',%d)",
+                      (i == 0 ? "" : ","), orderkey, qty, price, disc, tax,
+                      rf, ls, shipdate);
+        sql += row;
+      }
+      ex.execute(sql);
+    }
+
+    constexpr int kReps = 5;
+    // Q6: 5x AND (6 Range-Praedikate).
+    const std::string q6_sql =
+        "SELECT SUM(price*disc) FROM lineitem WHERE disc BETWEEN 0.05 AND "
+        "0.07 AND qty < 24 AND price >= 500.0 AND price < 5000.0 AND tax <= "
+        "0.05 AND shipdate BETWEEN 19940101 AND 19951231";
+    {
+      std::vector<double> lat_ms;
+      lat_ms.reserve(kReps);
+      double sum = 0.0;
+      auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < kReps; ++r) {
+        auto s = std::chrono::steady_clock::now();
+        dbengine::sql::Result res = ex.execute(q6_sql);
+        auto e = std::chrono::steady_clock::now();
+        lat_ms.push_back(
+            std::chrono::duration<double, std::milli>(e - s).count());
+        if (!res.rows.empty() && !res.rows[0].empty() &&
+            !dbengine::sql::valueIsNull(res.rows[0][0])) {
+          bool ok = false;
+          sum = TpchValueToDouble(res.rows[0][0], ok);
+          if (!ok) sum = 0.0;
+        } else {
+          sum = 0.0;  // keine Treffer -> SUM NULL/0
+        }
+      }
+      auto t1 = std::chrono::steady_clock::now();
+      double secs = std::chrono::duration<double>(t1 - t0).count();
+      if (secs <= 0) secs = 1e-9;
+      q6.throughput = (static_cast<double>(rows) * kReps) / secs;
+      q6.lat_p95_ms = Percentile(lat_ms, 0.95);
+      double denom = std::max(1.0, std::fabs(ref_q6));
+      double rel = std::fabs(sum - ref_q6) / denom;
+      std::uint64_t h = Fnv1a64(std::to_string(sum));
+      if (rel > 1e-9) {
+        std::fprintf(stderr, "tpch_q6: WRONG SUM got=%.6f want=%.6f rel=%.3g\n",
+                     sum, ref_q6, rel);
+      }
+      std::fprintf(stderr,
+                   "tpch_q6: rows=%lld sum=%.6f ref=%.6f hash=%016llx "
+                   "throughput=%.1f rows/s p95=%.4fms/scan\n",
+                   rows, sum, ref_q6, (unsigned long long)h, q6.throughput,
+                   q6.lat_p95_ms);
+    }
+
+    // Q1-Kern: GROUP BY rf, ls + SUM/AVG/COUNT.
+    const std::string q1_sql =
+        "SELECT rf, ls, SUM(qty), SUM(price), SUM(price*disc), AVG(disc), "
+        "COUNT(*) FROM lineitem GROUP BY rf, ls ORDER BY rf, ls";
+    {
+      std::vector<double> lat_ms;
+      lat_ms.reserve(kReps);
+      std::uint64_t h = 0;
+      long long groups = 0;
+      long long counted = 0;
+      auto t0 = std::chrono::steady_clock::now();
+      for (int r = 0; r < kReps; ++r) {
+        auto s = std::chrono::steady_clock::now();
+        dbengine::sql::Result res = ex.execute(q1_sql);
+        auto e = std::chrono::steady_clock::now();
+        lat_ms.push_back(
+            std::chrono::duration<double, std::milli>(e - s).count());
+        // Kanonischer Hash: Zeilen sortieren (ORDER BY macht es stabil,
+        // Sortierung hier macht den Check robust gegen Plan-Aenderungen).
+        std::vector<std::string> keys;
+        keys.reserve(res.rows.size());
+        for (auto& row : res.rows) {
+          std::string k;
+          for (size_t c = 0; c < row.size(); ++c) {
+            if (c) k += '|';
+            k += dbengine::sql::valueToString(row[c]);
+          }
+          keys.push_back(std::move(k));
+        }
+        std::sort(keys.begin(), keys.end());
+        std::string cat;
+        for (auto& k : keys) {
+          cat += k;
+          cat += ';';
+        }
+        h = Fnv1a64(cat);
+        groups = static_cast<long long>(res.rows.size());
+        counted = 0;
+        for (auto& row : res.rows) {
+          if (row.size() >= 7 &&
+              !dbengine::sql::valueIsNull(row[6])) {
+            bool ok = false;
+            double c = TpchValueToDouble(row[6], ok);
+            if (ok) counted += static_cast<long long>(c);
+          }
+        }
+      }
+      auto t1 = std::chrono::steady_clock::now();
+      double secs = std::chrono::duration<double>(t1 - t0).count();
+      if (secs <= 0) secs = 1e-9;
+      q1.throughput = (static_cast<double>(rows) * kReps) / secs;
+      q1.lat_p95_ms = Percentile(lat_ms, 0.95);
+      if (groups <= 0 || groups > 6 || counted != rows) {
+        std::fprintf(stderr,
+                     "tpch_q1: CHECK groups=%lld counted=%lld want_rows=%lld\n",
+                     groups, counted, rows);
+      }
+      std::fprintf(stderr,
+                   "tpch_q1: rows=%lld groups=%lld counted=%lld hash=%016llx "
+                   "throughput=%.1f rows/s p95=%.4fms/scan\n",
+                   rows, groups, counted, (unsigned long long)h,
+                   q1.throughput, q1.lat_p95_ms);
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "tpch: FAILED %s\n", e.what());
+  } catch (...) {
+    std::fprintf(stderr, "tpch: FAILED unknown error\n");
+  }
+  return std::vector<BenchRow>{q1, q6};
+}
+#else
+std::vector<BenchRow> RunTpch(long long) {
+  std::fprintf(stderr, "tpch: SKIPPED (dbengine/sql/executor.h missing)\n");
+  return std::vector<BenchRow>{{"tpch_q1", 0.0, 0.0},
+                               {"tpch_q6", 0.0, 0.0}};
+}
+#endif
 
 // ---- ANN-Bench (HNSW-lite vs Brute-Force Recall) ------------------------------
 BenchRow RunAnn(long long n, long long dim, long long k) {
@@ -480,6 +731,10 @@ int main(int argc, char** argv) {
   if (c.do_kv) rows.push_back(RunKvPuts(c.kv_puts));
   if (c.do_sql) rows.push_back(RunSqlQ1(c.sql_rows));
   if (c.do_ann) rows.push_back(RunAnn(c.ann_n, c.ann_d, c.ann_k));
+  if (c.do_tpch) {
+    std::vector<BenchRow> tpch_rows = RunTpch(c.tpch_rows);
+    rows.insert(rows.end(), tpch_rows.begin(), tpch_rows.end());
+  }
   if (c.has_data_dir) {
 #ifdef BENCH_HAVE_WAL
     std::string wal_err;

@@ -187,7 +187,7 @@ add_test(NAME executor COMMAND test_executor)
 # s18-bench: Bench-Harness (KV-Throughput, SQL Q1, ANN Recall/Latenz, CSV)
 add_executable(dbbench tools/bench.cpp)
 target_include_directories(dbbench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(dbbench PRIVATE dbengine_kv dbengine_vector columnar dbengine_wal)
+target_link_libraries(dbbench PRIVATE dbengine_kv dbengine_vector columnar dbengine_wal executor dbengine_mvcc sql)
 target_compile_options(dbbench PRIVATE -Wall -Wextra -Wpedantic)
 
 add_executable(test_bench tests/test_bench.cpp)

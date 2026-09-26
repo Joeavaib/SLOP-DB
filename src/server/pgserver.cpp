@@ -262,6 +262,419 @@ std::vector<int32_t> resolveOids(const dbengine::sql::Result& r,
   return oids;
 }
 
+// ---- Extended-Protokoll minimal (parameterlos) ---------------------------
+// Pro-Connection State: preparedStmts[name]=query, portals[name]=query.
+// Parse -> '1', Bind -> '2', Describe -> T/n (ohne Execute), Execute ->
+// T/D/C wie Q-Pfad, Sync -> Z, Close -> '3'. Mit Parametern -> E 0A000.
+
+std::vector<uint8_t> encodeParseComplete() { return {'1', 0, 0, 0, 4}; }
+
+std::vector<uint8_t> encodeBindComplete() { return {'2', 0, 0, 0, 4}; }
+
+std::vector<uint8_t> encodeCloseComplete() { return {'3', 0, 0, 0, 4}; }
+
+std::vector<uint8_t> encodeNoData() { return {'n', 0, 0, 0, 4}; }
+
+uint16_t getUint16BE(const uint8_t* p) {
+  return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) |
+                               static_cast<uint16_t>(p[1]));
+}
+
+std::string readCStringExt(const std::vector<uint8_t>& msg, std::size_t& pos) {
+  if (pos >= msg.size())
+    throw dbengine::pgwire::ProtoError("Extended: Position ausserhalb");
+  std::size_t start = pos;
+  while (pos < msg.size() && msg[pos] != 0) ++pos;
+  if (pos >= msg.size())
+    throw dbengine::pgwire::ProtoError("Extended: unterminierter String");
+  std::string s(reinterpret_cast<const char*>(msg.data() + start),
+                pos - start);
+  ++pos;  // NUL
+  return s;
+}
+
+int32_t getI32At(const std::vector<uint8_t>& msg, std::size_t pos) {
+  if (pos + 4 > msg.size())
+    throw dbengine::pgwire::ProtoError("Extended: Paket zu kurz (i32)");
+  return getInt32BE(msg.data() + pos);
+}
+
+uint16_t getU16At(const std::vector<uint8_t>& msg, std::size_t pos) {
+  if (pos + 2 > msg.size())
+    throw dbengine::pgwire::ProtoError("Extended: Paket zu kurz (i16)");
+  return getUint16BE(msg.data() + pos);
+}
+
+// '$' + Ziffer ausserhalb von '...'-Literalen ('' = escape) -> Parameter.
+bool containsDollarParam(const std::string& q) {
+  bool inStr = false;
+  for (std::size_t i = 0; i < q.size(); ++i) {
+    char c = q[i];
+    if (inStr) {
+      if (c == '\'') {
+        if (i + 1 < q.size() && q[i + 1] == '\'')
+          ++i;
+        else
+          inStr = false;
+      }
+    } else {
+      if (c == '\'')
+        inStr = true;
+      else if (c == '$' && i + 1 < q.size() &&
+               std::isdigit(static_cast<unsigned char>(q[i + 1])))
+        return true;
+    }
+  }
+  return false;
+}
+
+struct ParseMsg {
+  std::string stmt;
+  std::string query;
+  uint16_t numParams = 0;
+};
+
+ParseMsg parseParseMsg(const std::vector<uint8_t>& msg) {
+  if (msg.empty() || msg[0] != 'P')
+    throw dbengine::pgwire::ProtoError("Parse: falscher Typ");
+  std::size_t pos = 5;
+  ParseMsg out;
+  out.stmt = readCStringExt(msg, pos);
+  out.query = readCStringExt(msg, pos);
+  out.numParams = getU16At(msg, pos);
+  pos += 2;
+  if (pos + static_cast<std::size_t>(out.numParams) * 4 != msg.size())
+    throw dbengine::pgwire::ProtoError("Parse: Laenge passt nicht");
+  return out;
+}
+
+struct BindMsg {
+  std::string portal;
+  std::string stmt;
+  uint16_t numParams = 0;
+};
+
+BindMsg parseBindMsg(const std::vector<uint8_t>& msg) {
+  if (msg.empty() || msg[0] != 'B')
+    throw dbengine::pgwire::ProtoError("Bind: falscher Typ");
+  std::size_t pos = 5;
+  BindMsg out;
+  out.portal = readCStringExt(msg, pos);
+  out.stmt = readCStringExt(msg, pos);
+  uint16_t nFmt = getU16At(msg, pos);
+  pos += 2;
+  if (pos + static_cast<std::size_t>(nFmt) * 2 > msg.size())
+    throw dbengine::pgwire::ProtoError("Bind: Format-Codes zu kurz");
+  pos += static_cast<std::size_t>(nFmt) * 2;
+  out.numParams = getU16At(msg, pos);
+  pos += 2;
+  // Parameter-Werte ueberspringen (fuer Validierung; Inhalt egal, >0 -> 0A000).
+  for (uint16_t i = 0; i < out.numParams; ++i) {
+    int32_t plen = getI32At(msg, pos);
+    pos += 4;
+    if (plen == -1) continue;
+    if (plen < -1)
+      throw dbengine::pgwire::ProtoError("Bind: negative Param-Laenge");
+    if (pos + static_cast<std::size_t>(plen) > msg.size())
+      throw dbengine::pgwire::ProtoError("Bind: Param-Wert zu kurz");
+    pos += static_cast<std::size_t>(plen);
+  }
+  uint16_t nRes = getU16At(msg, pos);
+  pos += 2;
+  if (pos + static_cast<std::size_t>(nRes) * 2 != msg.size())
+    throw dbengine::pgwire::ProtoError("Bind: Laenge passt nicht");
+  return out;
+}
+
+struct DescribeMsg {
+  char kind = 0;  // 'S' oder 'P'
+  std::string name;
+};
+
+DescribeMsg parseDescribeMsg(const std::vector<uint8_t>& msg) {
+  if (msg.empty() || msg[0] != 'D')
+    throw dbengine::pgwire::ProtoError("Describe: falscher Typ");
+  if (msg.size() < 7)
+    throw dbengine::pgwire::ProtoError("Describe: Paket zu kurz");
+  DescribeMsg out;
+  out.kind = static_cast<char>(msg[5]);
+  std::size_t pos = 6;
+  out.name = readCStringExt(msg, pos);
+  if (pos != msg.size())
+    throw dbengine::pgwire::ProtoError("Describe: Laenge passt nicht");
+  return out;
+}
+
+struct ExecuteMsg {
+  std::string portal;
+};
+
+ExecuteMsg parseExecuteMsg(const std::vector<uint8_t>& msg) {
+  if (msg.empty() || msg[0] != 'E')
+    throw dbengine::pgwire::ProtoError("Execute: falscher Typ");
+  std::size_t pos = 5;
+  ExecuteMsg out;
+  out.portal = readCStringExt(msg, pos);
+  if (pos + 4 != msg.size())
+    throw dbengine::pgwire::ProtoError("Execute: Laenge passt nicht");
+  return out;
+}
+
+struct CloseMsg {
+  char kind = 0;
+  std::string name;
+};
+
+CloseMsg parseCloseMsg(const std::vector<uint8_t>& msg) {
+  if (msg.empty() || msg[0] != 'C')
+    throw dbengine::pgwire::ProtoError("Close: falscher Typ");
+  if (msg.size() < 7)
+    throw dbengine::pgwire::ProtoError("Close: Paket zu kurz");
+  CloseMsg out;
+  out.kind = static_cast<char>(msg[5]);
+  std::size_t pos = 6;
+  out.name = readCStringExt(msg, pos);
+  if (pos != msg.size())
+    throw dbengine::pgwire::ProtoError("Close: Laenge passt nicht");
+  return out;
+}
+
+// Spaltentyp-Lookup single-table: ggf. "t.c" -> "c" (Prefix tolerant).
+int singleColIndex(const dbengine::sql::TableSchema& sch,
+                   const std::string& ref) {
+  std::string col = ref;
+  std::size_t dot = ref.find('.');
+  if (dot != std::string::npos) col = ref.substr(dot + 1);
+  std::string want = toLowerStr(col);
+  for (std::size_t i = 0; i < sch.columns.size(); ++i) {
+    if (toLowerStr(sch.columns[i].name) == want) return static_cast<int>(i);
+  }
+  return -1;
+}
+
+// Join-Lookup: gibt (Schema, Index). Wirft SqlError bei unknown/ambiguous.
+void joinColLookup(const dbengine::sql::TableSchema& lsch,
+                   const dbengine::sql::TableSchema& rsch,
+                   const std::string& lEff, const std::string& rEff,
+                   const std::string& lTable, const std::string& rTable,
+                   const std::string& ref, const dbengine::sql::TableSchema*& oSch,
+                   int& oIdx) {
+  std::string pre, col;
+  std::size_t dot = ref.find('.');
+  if (dot == std::string::npos) {
+    pre.clear();
+    col = ref;
+  } else {
+    pre = ref.substr(0, dot);
+    col = ref.substr(dot + 1);
+  }
+  auto colIdx = [&](const dbengine::sql::TableSchema& sch,
+                    const std::string& c) -> int {
+    std::string want = toLowerStr(c);
+    for (std::size_t i = 0; i < sch.columns.size(); ++i) {
+      if (toLowerStr(sch.columns[i].name) == want) return static_cast<int>(i);
+    }
+    return -1;
+  };
+  if (!pre.empty()) {
+    bool lm = (toLowerStr(pre) == toLowerStr(lEff)) ||
+              (toLowerStr(pre) == toLowerStr(lTable));
+    bool rm = (toLowerStr(pre) == toLowerStr(rEff)) ||
+              (toLowerStr(pre) == toLowerStr(rTable));
+    if (lm && rm)
+      throw dbengine::sql::SqlError("Mehrdeutiger Tabellen-Prefix: " + pre);
+    if (lm) {
+      int idx = colIdx(lsch, col);
+      if (idx < 0)
+        throw dbengine::sql::SqlError("Unbekannte Spalte: " + ref);
+      oSch = &lsch;
+      oIdx = idx;
+      return;
+    }
+    if (rm) {
+      int idx = colIdx(rsch, col);
+      if (idx < 0)
+        throw dbengine::sql::SqlError("Unbekannte Spalte: " + ref);
+      oSch = &rsch;
+      oIdx = idx;
+      return;
+    }
+    throw dbengine::sql::SqlError("Unbekannter Tabellen-Prefix: " + pre);
+  }
+  int li = colIdx(lsch, col);
+  int ri = colIdx(rsch, col);
+  if (li >= 0 && ri >= 0)
+    throw dbengine::sql::SqlError("Mehrdeutige Spalte: " + col);
+  if (li >= 0) {
+    oSch = &lsch;
+    oIdx = li;
+    return;
+  }
+  if (ri >= 0) {
+    oSch = &rsch;
+    oIdx = ri;
+    return;
+  }
+  throw dbengine::sql::SqlError("Unbekannte Spalte: " + ref);
+}
+
+// Aggregat-OID: COUNT->23, AVG->701, sonst Spaltentyp oder Literaltyp, sonst 25.
+int32_t aggOid(const dbengine::sql::Aggregate& a,
+               const dbengine::sql::TableSchema* lsch,
+               const dbengine::sql::TableSchema* rsch, const std::string& lEff,
+               const std::string& rEff, const std::string& lTable,
+               const std::string& rTable, bool isJoin) {
+  std::string func;
+  func.reserve(a.func.size());
+  for (char c : a.func)
+    func += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  if (a.star || func == "COUNT") return 23;
+  if (func == "AVG") return 701;
+  if (a.arg != nullptr &&
+      a.arg->kind == dbengine::sql::AggExpr::Kind::Column) {
+    const std::string& ref = a.arg->column;
+    try {
+      if (isJoin && lsch != nullptr && rsch != nullptr) {
+        const dbengine::sql::TableSchema* oSch = nullptr;
+        int oIdx = -1;
+        joinColLookup(*lsch, *rsch, lEff, rEff, lTable, rTable, ref, oSch,
+                      oIdx);
+        return colTypeOid(oSch->columns[static_cast<std::size_t>(oIdx)].type);
+      }
+      if (lsch != nullptr) {
+        int idx = singleColIndex(*lsch, ref);
+        if (idx >= 0)
+          return colTypeOid(
+              lsch->columns[static_cast<std::size_t>(idx)].type);
+      }
+    } catch (...) {
+    }
+    return 25;
+  }
+  if (a.arg != nullptr &&
+      a.arg->kind == dbengine::sql::AggExpr::Kind::Literal) {
+    const auto& v = a.arg->literal;
+    if (std::holds_alternative<int64_t>(v)) return 23;
+    if (std::holds_alternative<double>(v)) return 701;
+    if (std::holds_alternative<bool>(v)) return 16;
+    return 25;
+  }
+  return 25;
+}
+
+// Projektions-Analyse OHNE Execute. Rueckgabe true = Spalten vorhanden
+// (cols/oids gefuellt), false = NoData (DDL / INSERT ohne Projektion).
+// Wirft SqlError bei unbekannter Tabelle/Spalte. Caller haelt execMu_.
+bool describeProjection(const std::string& q, dbengine::sql::Executor& ex,
+                        std::vector<std::string>& cols,
+                        std::vector<int32_t>& oids) {
+  cols.clear();
+  oids.clear();
+  if (isSelectOne(q)) {
+    cols = {"?column?"};
+    oids = {25};
+    return true;
+  }
+  dbengine::sql::Statement st = dbengine::sql::parseStatement(q);
+  if (!std::holds_alternative<dbengine::sql::SelectStmt>(st)) return false;
+  const auto& sel = std::get<dbengine::sql::SelectStmt>(st);
+  if (sel.count_star) {
+    cols = {"count"};
+    oids = {23};
+    return true;
+  }
+  const dbengine::sql::TableSchema* lsch = nullptr;
+  const dbengine::sql::TableSchema* rsch = nullptr;
+  std::string lEff, rEff;
+  if (sel.has_join) {
+    lsch = ex.schemaOf(sel.table);
+    const std::string lnorm = dbengine::sql::Executor::normalizeTable(sel.table);
+    const std::string rnorm =
+        dbengine::sql::Executor::normalizeTable(sel.join_table);
+    if (lnorm == rnorm) {
+      rsch = lsch;
+    } else {
+      rsch = ex.schemaOf(sel.join_table);
+    }
+    if (lsch == nullptr)
+      throw dbengine::sql::SqlError("Tabelle unbekannt: " + sel.table);
+    if (rsch == nullptr)
+      throw dbengine::sql::SqlError("Tabelle unbekannt: " + sel.join_table);
+    lEff = sel.table_alias.empty() ? sel.table : sel.table_alias;
+    rEff = sel.join_alias.empty() ? sel.join_table : sel.join_alias;
+  } else {
+    lsch = ex.schemaOf(sel.table);
+    if (lsch == nullptr)
+      throw dbengine::sql::SqlError("Tabelle unbekannt: " + sel.table);
+  }
+  if (sel.select_all) {
+    if (sel.has_join) {
+      for (const auto& c : lsch->columns) {
+        cols.push_back(c.name);
+        oids.push_back(colTypeOid(c.type));
+      }
+      for (const auto& c : rsch->columns) {
+        cols.push_back(c.name);
+        oids.push_back(colTypeOid(c.type));
+      }
+    } else {
+      for (const auto& c : lsch->columns) {
+        cols.push_back(c.name);
+        oids.push_back(colTypeOid(c.type));
+      }
+    }
+    return true;
+  }
+  // Explizite Projektion in SELECT-Reihenfolge (items bevorzugt).
+  std::vector<dbengine::sql::SelectItem> items = sel.items;
+  if (items.empty()) {
+    for (std::size_t i = 0; i < sel.columns.size(); ++i)
+      items.push_back(dbengine::sql::SelectItem{false, i});
+    for (std::size_t i = 0; i < sel.aggregates.size(); ++i)
+      items.push_back(dbengine::sql::SelectItem{true, i});
+  }
+  cols.reserve(items.size());
+  oids.reserve(items.size());
+  for (const auto& it : items) {
+    if (it.is_agg) {
+      if (it.index >= sel.aggregates.size())
+        throw dbengine::sql::SqlError("Ungueltige Projektion (Aggregat)");
+      const auto& a = sel.aggregates[it.index];
+      cols.push_back(a.alias.empty() ? a.display : a.alias);
+      oids.push_back(
+          aggOid(a, lsch, rsch, lEff, rEff, sel.table, sel.join_table,
+                 sel.has_join));
+    } else {
+      if (it.index >= sel.columns.size())
+        throw dbengine::sql::SqlError("Ungueltige Projektion (Spalte)");
+      const std::string& ref = sel.columns[it.index];
+      std::string alias;
+      if (it.index < sel.column_aliases.size()) alias = sel.column_aliases[it.index];
+      if (sel.has_join) {
+        const dbengine::sql::TableSchema* oSch = nullptr;
+        int oIdx = -1;
+        joinColLookup(*lsch, *rsch, lEff, rEff, sel.table, sel.join_table, ref,
+                      oSch, oIdx);
+        const std::string& base =
+            oSch->columns[static_cast<std::size_t>(oIdx)].name;
+        cols.push_back(alias.empty() ? base : alias);
+        oids.push_back(
+            colTypeOid(oSch->columns[static_cast<std::size_t>(oIdx)].type));
+      } else {
+        int idx = singleColIndex(*lsch, ref);
+        if (idx < 0)
+          throw dbengine::sql::SqlError("Unbekannte Spalte: " + ref);
+        const std::string& base =
+            lsch->columns[static_cast<std::size_t>(idx)].name;
+        cols.push_back(alias.empty() ? base : alias);
+        oids.push_back(
+            colTypeOid(lsch->columns[static_cast<std::size_t>(idx)].type));
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 PgServer::PgServer() : executor_(kv_, mvcc_, nullptr) {}
@@ -412,7 +825,28 @@ void PgServer::handleConn(int fd) {
 
   // 3) Loop: Q -> T+D+C+Z (SELECT) | C+Z (INSERT/CREATE),
   //         E+Z bei Executor-Fehler (Conn bleibt offen). X -> close.
-  //         Extended/COPY (nicht Q/X) -> E(0A000)+Z, unveraendert.
+  //         Extended minimal parameterlos: P->1, D->T/n, B->2, E->T/D/C,
+  //         S->Z, C->3; mit Parametern -> E(0A000)+Z. Sonst E(0A000)+Z.
+  // Per-Connection State: prepared Statements + Portale (Name -> Query).
+  std::map<std::string, std::string> prepStmts;
+  std::map<std::string, std::string> portals;
+  bool extNeedSync = false;
+  bool extErrZ = false;
+  auto sendExtError = [&](const std::string& code, const std::string& what,
+                          bool& brk) -> bool {
+    auto err = dbengine::pgwire::encodeError("ERROR", code, what);
+    if (!sendAll(fd, err)) {
+      brk = true;
+      return false;
+    }
+    if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) {
+      brk = true;
+      return false;
+    }
+    extErrZ = true;
+    extNeedSync = false;
+    return true;
+  };
   while (true) {
     char type = 0;
     std::vector<uint8_t> msg;
@@ -493,7 +927,264 @@ void PgServer::handleConn(int fd) {
       }
       continue;
     }
-    // Unbekannter Typ in V1: Error + ReadyForQuery, Connection bleibt offen.
+    if (type == 'P') {  // Parse: stmt\0 query\0 i16 nParams (i32 OIDs)
+      bool brk = false;
+      try {
+        ParseMsg pm = parseParseMsg(msg);
+        if (pm.numParams != 0 || containsDollarParam(pm.query)) {
+          if (!sendExtError("0A000",
+                            "extended mit Parametern nicht unterstuetzt",
+                            brk)) {
+            break;
+          }
+          if (brk) break;
+          continue;
+        }
+        try {
+          // Sonderfall wie im Q-Pfad: SELECT 1 braucht kein FROM.
+          if (!isSelectOne(pm.query)) {
+            (void)dbengine::sql::parseStatement(pm.query);
+          }
+        } catch (const dbengine::sql::SqlError& e) {
+          if (!sendExtError("42601", e.what(), brk)) break;
+          if (brk) break;
+          continue;
+        } catch (const std::exception& e) {
+          if (!sendExtError("0A000", e.what(), brk)) break;
+          if (brk) break;
+          continue;
+        }
+        prepStmts[pm.stmt] = pm.query;
+        if (!sendAll(fd, encodeParseComplete())) break;
+        extNeedSync = true;
+        extErrZ = false;
+      } catch (const std::exception& e) {
+        if (!sendExtError("42601", e.what(), brk)) break;
+        if (brk) break;
+      }
+      continue;
+    }
+    if (type == 'B') {  // Bind: portal\0 stmt\0 ... i16 nParams ...
+      bool brk = false;
+      try {
+        BindMsg bm = parseBindMsg(msg);
+        if (bm.numParams != 0) {
+          if (!sendExtError("0A000",
+                            "extended mit Parametern nicht unterstuetzt",
+                            brk)) {
+            break;
+          }
+          if (brk) break;
+          continue;
+        }
+        auto it = prepStmts.find(bm.stmt);
+        if (it == prepStmts.end()) {
+          if (!sendExtError("42601", "unknown prepared statement", brk))
+            break;
+          if (brk) break;
+          continue;
+        }
+        if (containsDollarParam(it->second)) {
+          if (!sendExtError("0A000",
+                            "extended mit Parametern nicht unterstuetzt",
+                            brk)) {
+            break;
+          }
+          if (brk) break;
+          continue;
+        }
+        portals[bm.portal] = it->second;
+        if (!sendAll(fd, encodeBindComplete())) break;
+        extNeedSync = true;
+        extErrZ = false;
+      } catch (const std::exception& e) {
+        if (!sendExtError("42601", e.what(), brk)) break;
+        if (brk) break;
+      }
+      continue;
+    }
+    if (type == 'D') {  // Describe: 'S'/'P' + name\0 -> T/n ohne Execute
+      bool brk = false;
+      try {
+        DescribeMsg dm = parseDescribeMsg(msg);
+        std::string q;
+        if (dm.kind == 'S') {
+          auto it = prepStmts.find(dm.name);
+          if (it == prepStmts.end()) {
+            if (!sendExtError("42601", "unknown prepared statement", brk))
+              break;
+            if (brk) break;
+            continue;
+          }
+          q = it->second;
+        } else if (dm.kind == 'P') {
+          auto it = portals.find(dm.name);
+          if (it == portals.end()) {
+            if (!sendExtError("42601", "unknown portal", brk)) break;
+            if (brk) break;
+            continue;
+          }
+          q = it->second;
+        } else {
+          if (!sendExtError("0A000", "Describe: Typ muss S/P sein", brk))
+            break;
+          if (brk) break;
+          continue;
+        }
+        if (containsDollarParam(q)) {
+          if (!sendExtError("0A000",
+                            "extended mit Parametern nicht unterstuetzt",
+                            brk)) {
+            break;
+          }
+          if (brk) break;
+          continue;
+        }
+        std::vector<std::string> cols;
+        std::vector<int32_t> oids;
+        bool hasCols = false;
+        try {
+          std::lock_guard<std::mutex> lk(execMu_);
+          hasCols = describeProjection(q, executor_, cols, oids);
+        } catch (const dbengine::sql::SqlError& e) {
+          if (!sendExtError("42601", e.what(), brk)) break;
+          if (brk) break;
+          continue;
+        } catch (const std::exception& e) {
+          if (!sendExtError("0A000", e.what(), brk)) break;
+          if (brk) break;
+          continue;
+        }
+        if (!hasCols) {
+          if (!sendAll(fd, encodeNoData())) break;
+        } else {
+          auto t = encodeRowDescriptionTyped(cols, oids);
+          if (!sendAll(fd, t)) break;
+        }
+        extNeedSync = true;
+        extErrZ = false;
+      } catch (const std::exception& e) {
+        if (!sendExtError("42601", e.what(), brk)) break;
+        if (brk) break;
+      }
+      continue;
+    }
+    if (type == 'E') {  // Execute: portal\0 i32 maxRows -> T/D/C wie Q-Pfad
+      bool brk = false;
+      try {
+        ExecuteMsg em = parseExecuteMsg(msg);
+        auto it = portals.find(em.portal);
+        if (it == portals.end()) {
+          if (!sendExtError("42601", "unknown portal", brk)) break;
+          if (brk) break;
+          continue;
+        }
+        std::string q = it->second;
+        if (containsDollarParam(q)) {
+          if (!sendExtError("0A000",
+                            "extended mit Parametern nicht unterstuetzt",
+                            brk)) {
+            break;
+          }
+          if (brk) break;
+          continue;
+        }
+        if (isSelectOne(q)) {
+          auto t = dbengine::pgwire::encodeRowDescription({"?column?"});
+          auto d = dbengine::pgwire::encodeDataRow({"1"});
+          auto c = dbengine::pgwire::encodeCommandComplete("SELECT 1");
+          if (!sendAll(fd, t)) break;
+          if (!sendAll(fd, d)) break;
+          if (!sendAll(fd, c)) break;
+          extNeedSync = true;
+          extErrZ = false;
+          continue;
+        }
+        dbengine::sql::Result res;
+        std::vector<int32_t> oids;
+        std::string tag;
+        try {
+          std::lock_guard<std::mutex> lk(execMu_);
+          res = executor_.execute(q);
+          oids = resolveOids(res, q, executor_);
+          tag = res.message;
+        } catch (const dbengine::sql::SqlError& e) {
+          if (!sendExtError("42601", e.what(), brk)) break;
+          if (brk) break;
+          continue;
+        } catch (const std::exception& e) {
+          if (!sendExtError("0A000", e.what(), brk)) break;
+          if (brk) break;
+          continue;
+        }
+        if (!res.columns.empty()) {
+          auto t = encodeRowDescriptionTyped(res.columns, oids);
+          if (!sendAll(fd, t)) break;
+          bool ok = true;
+          for (const auto& row : res.rows) {
+            auto d = encodeDataRowValues(row);
+            if (!sendAll(fd, d)) {
+              ok = false;
+              break;
+            }
+          }
+          if (!ok) break;
+          if (tag.empty()) tag = "SELECT " + std::to_string(res.rows.size());
+          auto c = dbengine::pgwire::encodeCommandComplete(tag);
+          if (!sendAll(fd, c)) break;
+        } else {
+          if (tag.empty()) tag = "SELECT 0";
+          auto c = dbengine::pgwire::encodeCommandComplete(tag);
+          if (!sendAll(fd, c)) break;
+        }
+        extNeedSync = true;
+        extErrZ = false;
+      } catch (const std::exception& e) {
+        if (!sendExtError("42601", e.what(), brk)) break;
+        if (brk) break;
+      }
+      continue;
+    }
+    if (type == 'S') {  // Sync -> Z (nach Fehler evtl. schon gesendet)
+      if (msg.size() != 5) {
+        bool brk = false;
+        if (!sendExtError("42601", "Sync: Laenge passt nicht", brk)) break;
+        if (brk) break;
+        continue;
+      }
+      if (extErrZ && !extNeedSync) {
+        extErrZ = false;
+        continue;  // Z des Fehlers bereits gesendet, kein Doppel-Z
+      }
+      if (!sendAll(fd, dbengine::pgwire::encodeReadyForQuery('I'))) break;
+      extNeedSync = false;
+      extErrZ = false;
+      continue;
+    }
+    if (type == 'C') {  // Close: 'S'/'P' + name\0 -> '3'
+      bool brk = false;
+      try {
+        CloseMsg cm = parseCloseMsg(msg);
+        if (cm.kind == 'S') {
+          prepStmts.erase(cm.name);
+        } else if (cm.kind == 'P') {
+          portals.erase(cm.name);
+        } else {
+          if (!sendExtError("0A000", "Close: Typ muss S/P sein", brk))
+            break;
+          if (brk) break;
+          continue;
+        }
+        if (!sendAll(fd, encodeCloseComplete())) break;
+        extNeedSync = true;
+        extErrZ = false;
+      } catch (const std::exception& e) {
+        if (!sendExtError("42601", e.what(), brk)) break;
+        if (brk) break;
+      }
+      continue;
+    }
+    // Unbekannter Typ: Error + ReadyForQuery, Connection bleibt offen.
     auto err = dbengine::pgwire::encodeError(
         "ERROR", "0A000", std::string("nur Q/X in V1 (got '") + type + "')");
     if (!sendAll(fd, err)) break;

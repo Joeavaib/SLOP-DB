@@ -215,8 +215,15 @@ class Parser {
     if (matchKeyword("CREATE")) return parseCreate();
     if (matchKeyword("INSERT")) return parseInsert();
     if (matchKeyword("SELECT")) return parseSelect();
+    if (matchKeyword("UPDATE")) return parseUpdate();
+    if (matchKeyword("DELETE")) return parseDelete();
+    if (matchKeyword("DROP")) return parseDropTable();
+    if (peekKeyword("TRUNCATE"))
+      throw SqlError(
+          "TRUNCATE wird nicht unterstuetzt (DELETE FROM ... verwenden)");
     throw SqlError(
-        "Nur CREATE TABLE / INSERT / SELECT werden in V1 unterstuetzt");
+        "Nur CREATE TABLE / INSERT / SELECT / UPDATE / DELETE / DROP TABLE "
+        "werden unterstuetzt");
   }
 
  private:
@@ -367,6 +374,71 @@ class Parser {
     }
     if (s.rows.empty()) throw SqlError("INSERT ohne VALUES-Zeilen");
     return s;
+  }
+
+  UpdateStmt parseUpdate() {
+    UpdateStmt s;
+    s.table = parseIdent();
+    expectKeyword("SET");
+    while (true) {
+      std::string col = parseIdent();
+      expectSymbol("=");
+      Value v = parseLiteral();
+      s.sets.emplace_back(std::move(col), std::move(v));
+      if (matchSymbol(",")) continue;
+      break;
+    }
+    if (matchKeyword("WHERE")) parseWhereClause(s.where, s.where_groups);
+    return s;
+  }
+
+  DeleteStmt parseDelete() {
+    expectKeyword("FROM");
+    DeleteStmt s;
+    s.table = parseIdent();
+    if (matchKeyword("WHERE")) parseWhereClause(s.where, s.where_groups);
+    return s;
+  }
+
+  DropTableStmt parseDropTable() {
+    expectKeyword("TABLE");
+    DropTableStmt s;
+    if (peekKeyword("IF")) {
+      ++pos_;
+      expectKeyword("EXISTS");
+      s.if_exists = true;
+    }
+    s.table = parseIdent();
+    if (peekKeyword("CASCADE"))
+      throw SqlError(
+          "CASCADE wird nicht unterstuetzt (nur DROP TABLE ohne CASCADE)");
+    (void)matchKeyword("RESTRICT");  // Default-Semantik, toleriert
+    const Token& t = peek();
+    if (t.kind == TokKind::Symbol && t.text == ",")
+      throw SqlError("Nur eine Tabelle pro DROP TABLE wird unterstuetzt");
+    return s;
+  }
+
+  // WHERE als DNF (AND bindet staerker als OR): eine Konjunktion -> `where`,
+  // mehrere OR-Gruppen -> `groups`. Von SELECT/UPDATE/DELETE gemeinsam
+  // genutzt (Semantik identisch).
+  void parseWhereClause(std::vector<Condition>& where,
+                        std::vector<std::vector<Condition>>& groups) {
+    std::vector<std::vector<Condition>> tmp;
+    while (true) {
+      std::vector<Condition> conj;
+      conj.push_back(parseCondition());
+      while (matchKeyword("AND")) conj.push_back(parseCondition());
+      tmp.push_back(std::move(conj));
+      if (matchKeyword("OR")) continue;
+      break;
+    }
+    if (tmp.size() == 1) {
+      where = std::move(tmp[0]);
+    } else {
+      where.clear();
+      groups = std::move(tmp);
+    }
   }
 
   Value parseLiteral() {
@@ -761,22 +833,7 @@ class Parser {
         throw SqlError("Nur ein JOIN pro SELECT wird unterstuetzt");
     }
     if (matchKeyword("WHERE")) {
-      // DNF: Disjunktion von Konjunktionen (AND bindet staerker als OR).
-      std::vector<std::vector<Condition>> groups;
-      while (true) {
-        std::vector<Condition> conj;
-        conj.push_back(parseCondition());
-        while (matchKeyword("AND")) conj.push_back(parseCondition());
-        groups.push_back(std::move(conj));
-        if (matchKeyword("OR")) continue;
-        break;
-      }
-      if (groups.size() == 1) {
-        s.where = std::move(groups[0]);
-      } else {
-        s.where.clear();
-        s.where_groups = std::move(groups);
-      }
+      parseWhereClause(s.where, s.where_groups);
     }
     if (matchKeyword("GROUP")) {
       expectKeyword("BY");
@@ -2505,6 +2562,9 @@ Statement parseStatement(const std::string& sql) {
 std::string statementKind(const Statement& s) {
   if (std::holds_alternative<CreateTableStmt>(s)) return "CREATE";
   if (std::holds_alternative<InsertStmt>(s)) return "INSERT";
+  if (std::holds_alternative<UpdateStmt>(s)) return "UPDATE";
+  if (std::holds_alternative<DeleteStmt>(s)) return "DELETE";
+  if (std::holds_alternative<DropTableStmt>(s)) return "DROP";
   return "SELECT";
 }
 
@@ -2561,6 +2621,61 @@ Result Database::execInsert(const InsertStmt& s) {
     ++n;
   }
   return { {}, {}, "INSERT 0 " + std::to_string(n), n };
+}
+
+Result Database::execUpdate(const UpdateStmt& s) {
+  auto it = tables_.find(foldIdent(s.table));
+  if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  Table& t = it->second;
+  // SET-Spalten aufloesen (unbekannt -> SqlError, vor jeder Mutation).
+  std::vector<int> setIdx;
+  setIdx.reserve(s.sets.size());
+  for (const auto& [col, val] : s.sets) {
+    (void)val;
+    int idx = t.colIndex(col);
+    if (idx < 0) throw SqlError("Unbekannte Spalte: " + col);
+    setIdx.push_back(idx);
+  }
+  SelectStmt f;
+  f.where = s.where;
+  f.where_groups = s.where_groups;
+  std::size_t n = 0;
+  for (auto& row : t.rows) {
+    if (!evalWhere(t, row, f)) continue;
+    for (std::size_t i = 0; i < s.sets.size(); ++i) {
+      const std::size_t ti = static_cast<std::size_t>(setIdx[i]);
+      row[ti] = coerceTo(s.sets[i].second, t.columns[ti].type,
+                         t.columns[ti].name);
+    }
+    ++n;
+  }
+  return { {}, {}, "UPDATE " + std::to_string(n), n };
+}
+
+Result Database::execDelete(const DeleteStmt& s) {
+  auto it = tables_.find(foldIdent(s.table));
+  if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  Table& t = it->second;
+  SelectStmt f;
+  f.where = s.where;
+  f.where_groups = s.where_groups;
+  std::vector<std::vector<Value>> kept;
+  kept.reserve(t.rows.size());
+  for (auto& row : t.rows)
+    if (!evalWhere(t, row, f)) kept.push_back(row);
+  std::size_t n = t.rows.size() - kept.size();
+  t.rows = std::move(kept);
+  return { {}, {}, "DELETE " + std::to_string(n), n };
+}
+
+Result Database::execDrop(const DropTableStmt& s) {
+  auto it = tables_.find(foldIdent(s.table));
+  if (it == tables_.end()) {
+    if (s.if_exists) return { {}, {}, "DROP TABLE", 0 };
+    throw SqlError("Tabelle unbekannt: " + s.table);
+  }
+  tables_.erase(it);
+  return { {}, {}, "DROP TABLE", 0 };
 }
 
 Result Database::execSelect(const SelectStmt& s) {
@@ -2653,7 +2768,36 @@ Result Database::execute(const std::string& sql) {
     return execCreate(std::get<CreateTableStmt>(st));
   if (std::holds_alternative<InsertStmt>(st))
     return execInsert(std::get<InsertStmt>(st));
+  if (std::holds_alternative<UpdateStmt>(st))
+    return execUpdate(std::get<UpdateStmt>(st));
+  if (std::holds_alternative<DeleteStmt>(st))
+    return execDelete(std::get<DeleteStmt>(st));
+  if (std::holds_alternative<DropTableStmt>(st))
+    return execDrop(std::get<DropTableStmt>(st));
   return execSelect(std::get<SelectStmt>(st));
+}
+
+// Single-Table WHERE-Match fuer UPDATE/DELETE (exportiert, auch vom
+// KV/MVCC-Executor nutzbar). Semantik exakt wie SELECT: Ein-Zeilen-Filter
+// ueber einer Shadow-Tabelle, daher keine eigene Condition-Duplikation.
+bool rowMatchesWhere(const Table& t, const std::vector<Value>& row,
+                     const std::vector<Condition>& where,
+                     const std::vector<std::vector<Condition>>& where_groups) {
+  Database tmp;
+  CreateTableStmt c;
+  c.table = "rowmatcheswhere_shadow";
+  c.columns = t.columns;
+  tmp.execCreate(c);
+  InsertStmt ins;
+  ins.table = c.table;
+  ins.rows.push_back(row);
+  tmp.execInsert(ins);
+  SelectStmt f;
+  f.table = c.table;
+  f.select_all = true;
+  f.where = where;
+  f.where_groups = where_groups;
+  return !tmp.execSelect(f).rows.empty();
 }
 
 }  // namespace dbengine::sql
