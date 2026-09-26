@@ -10,6 +10,13 @@
 //   SELECT [* | col [AS alias], ... | COUNT(*)] FROM t
 //     [WHERE disj [OR disj ...]] [GROUP BY <cols>] [ORDER BY o [ASC|DESC]
 //     [NULLS FIRST|LAST], ...] [LIMIT n|ALL] [OFFSET n]
+//   SELECT ... FROM a [AS x] [INNER] JOIN b [AS y]
+//     ON a.c = b.d [AND a.e = b.f ...] (genau ein INNER JOIN; Equi-ON per
+//     Hash-Join ueber die kleinere Seite, sonst Nested-Loop; WHERE/GROUP BY/
+//     ORDER BY/LIMIT/OFFSET danach auf den Combined-Rows wie bisher).
+//   Qualifizierte Refs `t.c` (Tabelle oder Alias als Prefix) in SELECT, WHERE,
+//     ON, GROUP BY, ORDER BY und Aggregat-Argumenten; unqualifiziert + in
+//     beiden Tabellen vorhanden -> SqlError (ambiguous).
 //     disj  := cond [AND cond ...]              (AND bindet staerker als OR)
 //     cond  := col (=|<>|!=|<|<=|>|>=) literal | col LIKE 'pat' | col ILIKE 'pat'
 //            | col NOT LIKE 'pat' | col NOT ILIKE 'pat'
@@ -27,8 +34,8 @@
 // Aggregat-Ausdruck oder 1-basiertes Positions-Ordinal (PG). Sortierung +
 // LIMIT/OFFSET werden nach Filter/Gruppierung/Aggregation angewendet.
 // NULL-Platzierung PG-konform (Default ASC->NULLS LAST, DESC->NULLS FIRST).
-// V2-Luecken (bewusst): Joins, UPDATE/DELETE, Indexe, Typcheck streng,
-// Prepared Statements / Extended Protocol.
+// V2-Luecken (bewusst): LEFT/RIGHT/FULL/OUTER/CROSS JOIN, UPDATE/DELETE,
+// Indexe, Typcheck streng, Prepared Statements / Extended Protocol.
 
 #include <cstdint>
 #include <map>
@@ -76,7 +83,7 @@ struct InsertStmt {
 };
 
 struct Condition {
-  std::string column;
+  std::string column;  // "c" oder qualifiziert "t.c" (JOIN)
   std::string op;  // "=", "<>", "<", "<=", ">", ">=", "LIKE", "ILIKE",
                    // "NOT LIKE", "NOT ILIKE", "IS NULL", "IS NOT NULL",
                    // "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"
@@ -91,7 +98,8 @@ struct Condition {
 struct AggExpr {
   enum class Kind { Column, Literal, Binary };
   Kind kind = Kind::Column;
-  std::string column;                    // Kind::Column (lower-gefoldet)
+  std::string column;                    // Kind::Column (lower-gefoldet,
+                                         // ggf. "t.c" bei JOIN)
   Value literal = Value{std::monostate{}};  // Kind::Literal
   char op = 0;                           // Kind::Binary: '+','-','*','/'
   std::shared_ptr<AggExpr> left;
@@ -122,7 +130,7 @@ struct SelectItem {
 struct OrderByItem {
   bool is_agg = false;
   Aggregate agg;      // gueltig wenn is_agg
-  std::string column;  // gueltig wenn !is_agg && !is_ordinal
+  std::string column;  // gueltig wenn !is_agg && !is_ordinal ("c"/"t.c")
   bool is_ordinal = false;
   int64_t ordinal = 0;  // 1-basiert, wenn is_ordinal
   bool desc = false;
@@ -130,9 +138,30 @@ struct OrderByItem {
   bool nulls_first = false;  // effektiv (Default: desc)
 };
 
+// JOIN ... ON-Bedingung (AND-Kette): Spalte-zu-Spalte (Equi "=" oder
+// Vergleich "<,<=,>,>=,<>") oder Spalte-zu-Literal. Referenzen wie ueberall
+// optional qualifiziert ("t.c", sonst "c"). Reine Equi-Kette ueber beide
+// Seiten -> Hash-Join, sonst Nested-Loop.
+struct JoinCond {
+  std::string left;
+  std::string op;  // "=", "<>", "<", "<=", ">", ">="
+  bool right_is_col = true;
+  std::string right;                // wenn right_is_col
+  Value literal = Value{std::monostate{}};  // sonst
+};
+
 struct SelectStmt {
   std::string table;
+  std::string table_alias;  // "" = kein Alias (Qualifizierer faellt auf table zurueck)
+  // Optionaler INNER JOIN (genau einer): FROM t [AS x] [INNER] JOIN u [AS y]
+  // ON <cond> [AND <cond> ...]. has_join=false = Single-Table wie bisher.
+  // Self-Join (t == u) braucht zwei verschiedene Aliase.
+  bool has_join = false;
+  std::string join_table;
+  std::string join_alias;  // "" = join_table
+  std::vector<JoinCond> join_on;  // AND-Kette (>= 1 wenn has_join)
   std::vector<std::string> columns;  // leer + select_all = "*"
+                                         // Eintraege "c" oder "t.c" (JOIN)
   std::vector<std::string> column_aliases;  // parallel zu columns, "" = kein Alias
   bool select_all = true;
   bool count_star = false;  // legacy: alleiniges COUNT(*) (Verhalten fixiert)
@@ -141,7 +170,8 @@ struct SelectStmt {
   // DNF bei OR: Disjunktion von Konjunktionen. Leer = kein OR (where gilt).
   // Nicht-leer = where ist leer und diese Gruppen gelten (OR dazwischen).
   std::vector<std::vector<Condition>> where_groups;
-  std::vector<std::string> group_by;  // leer = keine Gruppierung (1..n Spalten)
+  std::vector<std::string> group_by;  // leer = keine Gruppierung (1..n Spalten,
+                                        // "c"/"t.c")
   std::vector<SelectItem> items;  // Projektionsreihenfolge (leer = legacy-Pfad)
   std::vector<OrderByItem> order_by;  // leer = unsortiert (Einfuege-/First-Seen-Reihenfolge)
   bool has_limit = false;

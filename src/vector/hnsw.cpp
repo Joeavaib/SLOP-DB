@@ -19,9 +19,10 @@ namespace dbengine::vector {
 
 namespace {
 
-float vec_norm(const Vector& v) {
+float row_norm(const float* p, int n) {
   double acc = 0.0;
-  for (float x : v) acc += static_cast<double>(x) * x;
+  for (int i = 0; i < n; ++i)
+    acc += static_cast<double>(p[i]) * p[i];
   return static_cast<float>(std::sqrt(acc));
 }
 
@@ -276,9 +277,10 @@ int HnswIndex::random_level() {
 int HnswIndex::add(const Vector& v) {
   if (static_cast<int>(v.size()) != dim_)
     throw std::invalid_argument("HnswIndex::add: dim mismatch");
-  const int id = static_cast<int>(data_.size());
-  data_.push_back(v);
-  norms_.push_back(vec_norm(v));
+  // SoA: Zeile ans flache Row-Major-Buffer anhaengen (id*dim_+d).
+  const int id = static_cast<int>(norms_.size());
+  data_flat_.insert(data_flat_.end(), v.begin(), v.end());
+  norms_.push_back(row_norm(v.data(), dim_));
   const int lv = random_level();
   levels_.push_back(lv);
   links_.emplace_back(static_cast<size_t>(lv) + 1);
@@ -298,7 +300,7 @@ int HnswIndex::add(const Vector& v) {
 }
 
 void HnswIndex::clear() {
-  data_.clear();
+  data_flat_.clear();
   norms_.clear();
   levels_.clear();
   links_.clear();
@@ -309,6 +311,12 @@ void HnswIndex::clear() {
 
 std::vector<int> HnswIndex::select_neighbors(
     const Vector& /*q*/, std::vector<SearchHit>& cand, int mm) const {
+  // q ungenutzt (wie bisher); Kern arbeitet auf gespeicherten Zeilen.
+  return select_neighbors_ptr(nullptr, cand, mm);
+}
+
+std::vector<int> HnswIndex::select_neighbors_ptr(
+    const float* /*q*/, std::vector<SearchHit>& cand, int mm) const {
   // HNSW select-neighbors-heuristic (Paper Alg. 3, Diversitaet):
   // cand = (dist zum Insert, id). Nach (dist, id) sortiert wird ein Kandidat
   // nur aufgenommen, wenn er naeher am Insert liegt als an allen bereits
@@ -348,10 +356,10 @@ std::vector<int> HnswIndex::select_neighbors(
        ++i) {
     bool keep = true;
     for (const auto& p : picked) {
-      // Squared-Basis (L2): dispatch_distance2 ohne sqrt; Ordnung ==
-      // sqrt-Basis (monoton), (dist,id)-Ties deterministisch. Cosine: identisch.
-      const float d_es =
-          dispatch_distance2(data_[sorted[i].id], data_[p.id], metric_);
+      // Squared-Basis (L2): dist2 ohne sqrt; Ordnung == sqrt-Basis (monoton),
+      // (dist,id)-Ties deterministisch. Cosine: identisch. Zeilen-Recompute
+      // via Kerne (gleiche Numerik wie zuvor dispatch_distance2).
+      const float d_es = dist2_between_stored(sorted[i].id, p.id);
       if (d_es < sorted[i].dist) {
         keep = false;
         break;
@@ -364,7 +372,7 @@ std::vector<int> HnswIndex::select_neighbors(
   }
   // Auffuellen mit naechstem Rest (Grad erhalten, Recall-neutral).
   for (size_t i = 0; i < sorted.size() && static_cast<int>(picked.size()) < mm;
-       ++i) {
+        ++i) {
     if (!is_picked[i]) {
       picked.push_back(sorted[i]);
       is_picked[i] = 1;
@@ -395,7 +403,7 @@ void HnswIndex::shrink_layer(int id, int lc, int max_m) {
   // nb danach in Heuristik-Reihenfolge (erste = naechste).
   std::vector<SearchHit> scored;
   scored.reserve(nb.size());
-  for (int v : nb) scored.push_back({v, dist2_to_stored(data_[id], v)});
+  for (int v : nb) scored.push_back({v, dist2_to_stored_ptr(row_ptr(id), v)});
   std::sort(scored.begin(), scored.end(), [](const SearchHit& a,
                                              const SearchHit& b) {
     if (a.dist != b.dist) return a.dist < b.dist;
@@ -405,11 +413,10 @@ void HnswIndex::shrink_layer(int id, int lc, int max_m) {
   picked.reserve(static_cast<size_t>(max_m));
   std::vector<char> is_picked(scored.size(), 0);
   for (size_t i = 0; i < scored.size() && static_cast<int>(picked.size()) < max_m;
-       ++i) {
+        ++i) {
     bool keep = true;
     for (const auto& p : picked) {
-      const float d_es =
-          dispatch_distance2(data_[scored[i].id], data_[p.id], metric_);
+      const float d_es = dist2_between_stored(scored[i].id, p.id);
       if (d_es < scored[i].dist) {
         keep = false;
         break;
@@ -450,7 +457,7 @@ void HnswIndex::shrink_layer_after_add(int id, int lc, int max_m, int fresh_id,
     if (v == fresh_id)
       scored.push_back({v, fresh_dist});
     else
-      scored.push_back({v, dist2_to_stored(data_[id], v)});
+      scored.push_back({v, dist2_to_stored_ptr(row_ptr(id), v)});
   }
   std::sort(scored.begin(), scored.end(), [](const SearchHit& a,
                                              const SearchHit& b) {
@@ -464,8 +471,7 @@ void HnswIndex::shrink_layer_after_add(int id, int lc, int max_m, int fresh_id,
        ++i) {
     bool keep = true;
     for (const auto& p : picked) {
-      const float d_es =
-          dispatch_distance2(data_[scored[i].id], data_[p.id], metric_);
+      const float d_es = dist2_between_stored(scored[i].id, p.id);
       if (d_es < scored[i].dist) {
         keep = false;
         break;
@@ -477,7 +483,7 @@ void HnswIndex::shrink_layer_after_add(int id, int lc, int max_m, int fresh_id,
     }
   }
   for (size_t i = 0; i < scored.size() && static_cast<int>(picked.size()) < max_m;
-       ++i) {
+        ++i) {
     if (!is_picked[i]) {
       picked.push_back(scored[i]);
       is_picked[i] = 1;
@@ -490,6 +496,13 @@ void HnswIndex::shrink_layer_after_add(int id, int lc, int max_m, int fresh_id,
 
 std::vector<SearchHit> HnswIndex::search_layer(const Vector& q, int entry_id,
                                               int ef, int lc) const {
+  if (static_cast<int>(q.size()) != dim_)
+    throw std::invalid_argument("l2: dim mismatch");
+  return search_layer_ptr(q.data(), entry_id, ef, lc);
+}
+
+std::vector<SearchHit> HnswIndex::search_layer_ptr(const float* q, int entry_id,
+                                              int ef, int lc) const {
   // Beam-Search auf genau einem Layer lc (ungefiltert, fuer Build + Descent).
   // Gleiche Traversierung wie zuvor, aber ohne Per-Call-Overhead:
   // Epochen-Visited (kein vector<char>(n)-Alloc/Zero) + Heap-Vektoren mit
@@ -501,14 +514,14 @@ std::vector<SearchHit> HnswIndex::search_layer(const Vector& q, int entry_id,
   // Rueckgabe fuer L2 daher quadriert (nur Build-intern, kein Output-Ranking);
   // Aufrufer (insert/select/shrink) vergleichen konsistent quadriert.
   using Cand = std::pair<float, int>;
-  const int n = static_cast<int>(data_.size());
+  const int n = static_cast<int>(norms_.size());
   if (n == 0 || entry_id < 0 || entry_id >= n) return {};
   auto [seen, mark] = acquire_visited(n);
   std::vector<Cand> frontier;
   frontier.reserve(static_cast<size_t>(2 * ef + 8));
   std::vector<Cand> top;
   top.reserve(static_cast<size_t>(ef + 1));
-  const float d0 = dist2_to_stored(q, entry_id);
+  const float d0 = dist2_to_stored_ptr(q, entry_id);
   frontier.emplace_back(d0, entry_id);
   seen[entry_id] = mark;
   top.emplace_back(d0, entry_id);
@@ -528,7 +541,7 @@ std::vector<SearchHit> HnswIndex::search_layer(const Vector& q, int entry_id,
       if (v < 0 || v >= n) continue;
       if (seen[v] == mark) continue;
       seen[v] = mark;
-      const float d_v = dist2_to_stored(q, v);
+      const float d_v = dist2_to_stored_ptr(q, v);
       frontier.emplace_back(d_v, v);
       std::push_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
       if (static_cast<int>(top.size()) < ef) {
@@ -552,17 +565,24 @@ std::vector<SearchHit> HnswIndex::search_layer(const Vector& q, int entry_id,
 }
 
 int HnswIndex::greedy_closest(const Vector& q, int entry_id, int lc) const {
+  if (static_cast<int>(q.size()) != dim_)
+    throw std::invalid_argument("l2: dim mismatch");
+  return greedy_closest_ptr(q.data(), entry_id, lc);
+}
+
+int HnswIndex::greedy_closest_ptr(const float* q, int entry_id,
+                                  int lc) const {
   // Squared-Vergleiche (L2 ohne sqrt, monoton-ordnungsaequivalent);
   // Cosine unveraendert.
   int cur = entry_id;
-  float cur_d = dist2_to_stored(q, cur);
+  float cur_d = dist2_to_stored_ptr(q, cur);
   bool improved = true;
   while (improved) {
     improved = false;
     if (cur < 0 || cur >= static_cast<int>(links_.size())) break;
     if (lc >= static_cast<int>(links_[cur].size())) break;
     for (int v : links_[cur][lc]) {
-      const float d = dist2_to_stored(q, v);
+      const float d = dist2_to_stored_ptr(q, v);
       if (d < cur_d || (d == cur_d && v < cur)) {
         cur_d = d;
         cur = v;
@@ -575,19 +595,24 @@ int HnswIndex::greedy_closest(const Vector& q, int entry_id, int lc) const {
 
 void HnswIndex::insert_node(int id) {
   const int lv = levels_[id];
-  if (data_.size() == 1) {
+  if (norms_.size() == 1) {
     entry_ = id;
     max_level_ = lv;
     built_ = true;
     return;
   }
+  // SoA: Query ist die gespeicherte Zeile selbst (Pointer, kein Vector-Umweg).
+  // Flacher Buffer waechst waehrend insert_node nicht (nur links_/levels_),
+  // daher ist qrow ueber den gesamten Insert stabil (Single-Thread-Build).
+  const float* qrow = row_ptr(id);
   int cur = entry_;
   // 1) Greedy-Descent von Top bis lv+1.
-  for (int lc = max_level_; lc > lv; --lc) cur = greedy_closest(data_[id], cur, lc);
+  for (int lc = max_level_; lc > lv; --lc)
+    cur = greedy_closest_ptr(qrow, cur, lc);
   // 2) Pro Layer <= lv: Kandidaten via Beam, bidirektional verlinken.
   const int top_lc = std::min(lv, max_level_);
   for (int lc = top_lc; lc >= 0; --lc) {
-    auto cand = search_layer(data_[id], cur, ef_construction_, lc);
+    auto cand = search_layer_ptr(qrow, cur, ef_construction_, lc);
     // Eigenen Knoten aus Kandidaten entfernen (defensiv; neuer Knoten hat
     // noch keine eingehenden Kanten und ist daher i.d.R. nicht enthalten).
     cand.erase(std::remove_if(cand.begin(), cand.end(),
@@ -635,7 +660,8 @@ void HnswIndex::insert_node(int id) {
       if (nprobe > 0) {
         std::pair<float, int> scored[kSpreadK];
         for (int t = 0; t < nprobe; ++t)
-          scored[t] = {dist2_to_stored(data_[id], probe_ids[t]), probe_ids[t]};
+          scored[t] = {dist2_to_stored_ptr(qrow, probe_ids[t]),
+                       probe_ids[t]};
         std::sort(scored, scored + nprobe, [](const auto& a, const auto& b) {
           if (a.first != b.first) return a.first < b.first;
           return a.second < b.second;
@@ -651,7 +677,7 @@ void HnswIndex::insert_node(int id) {
     // (dist, id) behaelt).
     const int best_cand = cand.empty() ? -1 : cand.front().id;
     // Danach gilt: cand[k] == (sel[k], dist(neu, sel[k])), (dist, id)-sortiert.
-    auto sel = select_neighbors(data_[id], cand, max_m);
+    auto sel = select_neighbors_ptr(qrow, cand, max_m);
     // Mindestens 1 Nachbar garantieren (Graph nie isoliert): naechsten per
     // Scan, falls Beam leer (z.B. ef klein / Einfuege-Reihenfolge).
     if (sel.empty() && best_cand >= 0) sel.push_back(best_cand);
@@ -661,7 +687,7 @@ void HnswIndex::insert_node(int id) {
       int best = -1;
       float best_d = 0.0f;
       for (int j = 0; j < id; ++j) {
-        const float d = dist2_to_stored(data_[id], j);
+        const float d = dist2_to_stored_ptr(qrow, j);
         if (best < 0 || d < best_d) {
           best = j;
           best_d = d;
@@ -692,7 +718,7 @@ void HnswIndex::insert_node(int id) {
 }
 
 void HnswIndex::build() {
-  const int n = static_cast<int>(data_.size());
+  const int n = static_cast<int>(norms_.size());
   if (n == 0) {
     links_.clear();
     max_level_ = -1;
@@ -734,13 +760,22 @@ void HnswIndex::build() {
 }
 
 bool HnswIndex::built() const { return built_; }
-size_t HnswIndex::size() const { return data_.size(); }
+size_t HnswIndex::size() const { return norms_.size(); }
 int HnswIndex::dim() const { return dim_; }
 
+const float* HnswIndex::row_ptr(int id) const noexcept {
+  return data_flat_.data() + static_cast<size_t>(id) * static_cast<size_t>(dim_);
+}
+
 const Vector& HnswIndex::get(int id) const {
-  if (id < 0 || id >= static_cast<int>(data_.size()))
+  if (id < 0 || id >= static_cast<int>(norms_.size()))
     throw std::out_of_range("HnswIndex::get: bad id");
-  return data_[id];
+  // SoA: keine gespeicherte Vector-Zeile — thread_lokale Kopie zurueckgeben.
+  // Gueltig bis zum naechsten get() auf demselben Thread (s. hnsw.h Doku).
+  thread_local Vector cache;
+  const float* r = row_ptr(id);
+  cache.assign(r, r + dim_);
+  return cache;
 }
 
 size_t HnswIndex::neighbor_count(int id) const {
@@ -755,18 +790,22 @@ float HnswIndex::dist(const Vector& a, const Vector& b) const {
 }
 
 float HnswIndex::dist_to_stored(const Vector& q, int id) const {
-  const Vector& b = data_[id];
-  const int n = static_cast<int>(b.size());
+  if (static_cast<int>(q.size()) != dim_)
+    throw std::invalid_argument("l2: dim mismatch");
+  return dist_to_stored_ptr(q.data(), id);
+}
+
+float HnswIndex::dist_to_stored_ptr(const float* q, int id) const {
+  // q: dim_ floats (externer Query oder gespeicherte Zeile). Direkt auf dem
+  // flachen Buffer, ohne Vector-Temporaer.
+  const float* b = row_ptr(id);
   if (metric_ == DistanceMetric::L2) {
-    if (q.size() != b.size())
-      throw std::invalid_argument("l2: dim mismatch");
-    const float d2 = detail::l2_squared_kernel(q.data(), b.data(), n);
+    const float d2 = detail::l2_squared_kernel(q, b, dim_);
     return static_cast<float>(std::sqrt(static_cast<double>(d2)));
   }
   // Cosine: dot + ||q||^2 aus einem Kernel-Durchgang, ||b||^2 aus dem
   // gecachten norms_-Eintrag (gleiche Formel wie zuvor: sqrt(nq*nb)).
-  const detail::DotNorms dn =
-      detail::dot_norms_kernel(q.data(), b.data(), n);
+  const detail::DotNorms dn = detail::dot_norms_kernel(q, b, dim_);
   const double nb = static_cast<double>(norms_[id]) * norms_[id];
   const double nq = static_cast<double>(dn.na);
   if (nq == 0.0 || nb == 0.0) return 1.0f;
@@ -777,14 +816,51 @@ float HnswIndex::dist_to_stored(const Vector& q, int id) const {
 // Squared-Hotpath (vgl. hnsw.h): L2 ohne sqrt, Cosine delegiert (sqrt in
 // Norm unvermeidbar). Wirft bei dim mismatch wie dist_to_stored.
 float HnswIndex::dist2_to_stored(const Vector& q, int id) const {
-  const Vector& b = data_[id];
+  if (static_cast<int>(q.size()) != dim_)
+    throw std::invalid_argument("l2: dim mismatch");
+  return dist2_to_stored_ptr(q.data(), id);
+}
+
+float HnswIndex::dist2_to_stored_ptr(const float* q, int id) const {
   if (metric_ == DistanceMetric::L2) {
-    if (q.size() != b.size())
-      throw std::invalid_argument("l2: dim mismatch");
-    return detail::l2_squared_kernel(q.data(), b.data(),
-                                     static_cast<int>(b.size()));
+    return detail::l2_squared_kernel(q, row_ptr(id), dim_);
   }
-  return dist_to_stored(q, id);
+  return dist_to_stored_ptr(q, id);
+}
+
+float HnswIndex::dist2_between_stored(int a, int b) const {
+  // Voller Recompute via Kerne (gleiche Numerik wie zuvor
+  // dispatch_distance2(data_[a], data_[b])): L2 quadriert, Cosine final.
+  const float* pa = row_ptr(a);
+  const float* pb = row_ptr(b);
+  if (metric_ == DistanceMetric::L2) {
+    return detail::l2_squared_kernel(pa, pb, dim_);
+  }
+  const detail::DotNorms dn = detail::dot_norms_kernel(pa, pb, dim_);
+  if (dn.na == 0.0f || dn.nb == 0.0f) return 1.0f;
+  const double cos_sim = static_cast<double>(dn.dot) /
+                         (std::sqrt(static_cast<double>(dn.na)) *
+                          std::sqrt(static_cast<double>(dn.nb)));
+  const double clamped = std::clamp(cos_sim, -1.0, 1.0);
+  return static_cast<float>(1.0 - clamped);
+}
+
+float HnswIndex::dist_exact_ptr(const float* q, int id) const {
+  // Exakte Distanz ohne Norm-Cache (gleiche Numerik wie dist() — fuer die
+  // brute_force-Baseline, damit deren Outputs bit-identisch zum alten
+  // dist(query, data_[i])-Pfad bleiben).
+  const float* b = row_ptr(id);
+  if (metric_ == DistanceMetric::L2) {
+    const float d2 = detail::l2_squared_kernel(q, b, dim_);
+    return static_cast<float>(std::sqrt(static_cast<double>(d2)));
+  }
+  const detail::DotNorms dn = detail::dot_norms_kernel(q, b, dim_);
+  if (dn.na == 0.0f || dn.nb == 0.0f) return 1.0f;
+  const double cos_sim = static_cast<double>(dn.dot) /
+                         (std::sqrt(static_cast<double>(dn.na)) *
+                          std::sqrt(static_cast<double>(dn.nb)));
+  const double clamped = std::clamp(cos_sim, -1.0, 1.0);
+  return static_cast<float>(1.0 - clamped);
 }
 
 std::vector<SearchHit> HnswIndex::brute_force(const Vector& query, int k,
@@ -793,10 +869,13 @@ std::vector<SearchHit> HnswIndex::brute_force(const Vector& query, int k,
     throw std::invalid_argument("brute_force: dim mismatch");
   if (k <= 0) return {};
   std::vector<SearchHit> all;
-  all.reserve(data_.size());
-  for (int i = 0; i < static_cast<int>(data_.size()); ++i) {
+  all.reserve(norms_.size());
+  const float* q = query.data();
+  for (int i = 0; i < static_cast<int>(norms_.size()); ++i) {
     if (filter && !filter(i)) continue;
-    all.push_back({i, dist(query, data_[i])});
+    // Direkt auf dem flachen Buffer (exakter Pfad ohne Norm-Cache,
+    // gleiche Numerik wie zuvor dist(query, data_[i])).
+    all.push_back({i, dist_exact_ptr(q, i)});
   }
   if (static_cast<int>(all.size()) > k) {
     std::nth_element(all.begin(), all.begin() + k, all.end(),
@@ -818,9 +897,12 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
   if (static_cast<int>(query.size()) != dim_)
     throw std::invalid_argument("search: dim mismatch");
   if (k <= 0) return {};
-  const int n = static_cast<int>(data_.size());
+  const int n = static_cast<int>(norms_.size());
   if (n == 0) return {};
   if (!built_) return brute_force(query, k, filter);
+  // SoA: Query einmal als Rohzeiger (dim_ floats), alle Scores direkt
+  // auf dem flachen Buffer (kein Vector-Umweg).
+  const float* qptr = query.data();
 
   int ef_search = (ef <= 0) ? ef_default_ : ef;
   if (ef_search < k) ef_search = k;
@@ -856,7 +938,7 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
       if (dup) continue;
       int c = raw[i];
       for (int lc = max_level_; lc >= 1; --lc)
-        c = greedy_closest(query, c, lc);
+        c = greedy_closest_ptr(qptr, c, lc);
       descended[i] = c;
     }
   }
@@ -873,7 +955,7 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
       }
     }
     if (dup) continue;
-    ranked[nranked++] = {dist2_to_stored(query, descended[i]), descended[i]};
+    ranked[nranked++] = {dist2_to_stored_ptr(qptr, descended[i]), descended[i]};
   }
   std::sort(ranked, ranked + nranked, [](const auto& a, const auto& b) {
     if (a.first != b.first) return a.first < b.first;
@@ -900,7 +982,7 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
     }
     if (!known) {
       seeds[nseeds] = fb;
-      seed_d[nseeds] = dist2_to_stored(query, fb);
+      seed_d[nseeds] = dist2_to_stored_ptr(qptr, fb);
       ++nseeds;
     }
   }
@@ -946,7 +1028,7 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
       uniq[nuniq++] = pid;
     }
     for (int t = 0; t < nuniq; ++t)
-      scored[t] = {dist2_to_stored(query, uniq[t]), uniq[t]};
+      scored[t] = {dist2_to_stored_ptr(qptr, uniq[t]), uniq[t]};
     std::sort(scored, scored + nuniq, [](const auto& a, const auto& b) {
       if (a.first != b.first) return a.first < b.first;
       return a.second < b.second;
@@ -1042,7 +1124,7 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
     for (int v : links_[u][0]) {
       if (v < 0 || v >= n || seen[v] == mark) continue;
       seen[v] = mark;
-      const float d_v = dist2_to_stored(query, v);
+      const float d_v = dist2_to_stored_ptr(qptr, v);
       frontier.emplace_back(d_v, v);
       std::push_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
       consider(v, d_v);
@@ -1054,7 +1136,7 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
       if (seen[i] == mark) continue;
       seen[i] = mark;
       if (use_filter && !filter(i)) continue;
-      top.emplace_back(dist2_to_stored(query, i), i);
+      top.emplace_back(dist2_to_stored_ptr(qptr, i), i);
       std::push_heap(top.begin(), top.end(), std::less<Cand>());
     }
   }

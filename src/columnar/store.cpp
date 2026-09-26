@@ -4,6 +4,7 @@
 #include "dbengine/columnar/store.h"
 
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -72,12 +73,79 @@ void FsyncDirPath(const std::string& dir) {
   std::string d = dir.empty() ? "." : dir;
   int dfd = ::open(d.c_str(), O_RDONLY
 #ifdef O_DIRECTORY
-                                   | O_DIRECTORY
+                                    | O_DIRECTORY
 #endif
   );
   if (dfd < 0) return;  // best effort
   (void)::fsync(dfd);
   ::close(dfd);
+}
+
+// ---- COL2: Delta+FOR+Bitpacking (STL-only, kein ZSTD) ----------------------
+// Pro Part: Basis = min (int64, Zonemap). Delta_i = (uint64_t)value_i -
+// (uint64_t)base (mod 2^64; exakt, da value_i >= base mathematisch in
+// [0, 2^64-1] liegt). bitwidth = bit_width(max_delta), 0 bei allen gleich.
+// Packung LSB-first: Bitposition p = i*bitwidth, Wort p/64, Offset p%64.
+// nwords = ceil(rows*bitwidth/64). bitwidth==64 nur mit Offset 0 (p = i*64).
+uint32_t ForBitWidth(uint64_t max_delta) {
+  if (max_delta == 0) return 0;
+  return static_cast<uint32_t>(std::bit_width(max_delta));
+}
+
+uint64_t ForMask(uint32_t bw) {
+  if (bw == 0) return 0;
+  if (bw >= 64) return ~uint64_t{0};
+  return (uint64_t{1} << bw) - uint64_t{1};
+}
+
+std::vector<uint64_t> PackForDeltas(const std::vector<uint64_t>& deltas,
+                                    uint32_t bw) {
+  if (bw == 0 || deltas.empty()) return {};
+  const uint64_t rows = static_cast<uint64_t>(deltas.size());
+  const uint64_t nwords = (rows * bw + 63u) / 64u;
+  std::vector<uint64_t> words(static_cast<size_t>(nwords), 0);
+  for (uint64_t i = 0; i < rows; ++i) {
+    const uint64_t d = deltas[i];
+    const uint64_t p = i * static_cast<uint64_t>(bw);
+    const size_t wi = static_cast<size_t>(p / 64u);
+    const unsigned off = static_cast<unsigned>(p % 64u);
+    words[wi] |= (d << off);
+    if (static_cast<uint64_t>(off) + bw > 64u) {
+      words[wi + 1] |= (d >> (64u - off));
+    }
+  }
+  return words;
+}
+
+std::vector<int64_t> UnpackFor(int64_t base, uint32_t bw, uint64_t rows,
+                               const std::vector<uint64_t>& words) {
+  std::vector<int64_t> out;
+  out.reserve(static_cast<size_t>(rows));
+  if (rows == 0) return out;
+  if (bw == 0) {
+    out.assign(static_cast<size_t>(rows), base);
+    return out;
+  }
+  const uint64_t mask = ForMask(bw);
+  const uint64_t base_u = std::bit_cast<uint64_t>(base);
+  for (uint64_t i = 0; i < rows; ++i) {
+    const uint64_t p = i * static_cast<uint64_t>(bw);
+    const size_t wi = static_cast<size_t>(p / 64u);
+    const unsigned off = static_cast<unsigned>(p % 64u);
+    uint64_t d = 0;
+    if (static_cast<uint64_t>(off) + bw <= 64u) {
+      d = (words[wi] >> off) & mask;
+    } else {
+      const unsigned low_bits = 64u - off;
+      const uint64_t low = words[wi] >> off;
+      const uint64_t high_mask = ForMask(bw - low_bits);
+      const uint64_t high = words[wi + 1] & high_mask;
+      d = low | (high << low_bits);
+    }
+    const uint64_t uv = base_u + d;
+    out.push_back(std::bit_cast<int64_t>(uv));
+  }
+  return out;
 }
 }  // namespace
 
@@ -286,32 +354,46 @@ bool Part::DecodeBinary(const std::string& path,
   return true;
 }
 
-// ---- s24: COL1 Part-File (Header + RLE + Dict) -----------------------------
+// ---- s24: COL2 Part-File (Header + FOR/Bitpacking + Dict) ------------------
 // Layout (LE, host == x86-64 LE):
-// magic[4]="COL1" | u64 id | u64 name_len | name | u64 rows |
-// i64 min | i64 max | u64 nruns | runs(value i64, count u64) |
+// magic[4]="COL2" | u64 id | u64 name_len | name | u64 rows |
+// i64 min | i64 max | u32 bitwidth | u64 nwords | nwords x u64 Worte |
 // u64 dict_size | per entry u32 len + bytes | u64 ncodes | codes u32
+// Int-Codec: Basis = min, Deltas bitgepackt (s. PackForDeltas). bitwidth==0
+// => keine Worte, alle Werte == min. RLE/Dict/Scan/Export-Semantik unberuehrt.
 bool Part::Save(const std::string& path) const {
   // Crash-safe: tmp-File schreiben + fsync + rename + dir-fsync (WAL-Vorbild).
-  // Serialisierung unveraendert (COL1-Layout, s. Kommentar unten).
+  // Serialisierung als COL2-Layout (s. Kommentar oben).
   const std::string tmp_path = path + ".tmp";
   {
     std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
-    out.write("COL1", 4);
+    out.write("COL2", 4);
     WriteU64(out, id_);
     WriteU64(out, static_cast<uint64_t>(name_.size()));
     if (!name_.empty()) out.write(name_.data(), (std::streamsize)name_.size());
     const uint64_t rows = static_cast<uint64_t>(size());
     WriteU64(out, rows);
+    const int64_t base = empty() ? 0 : Min();
     WriteI64(out, empty() ? 0 : Min());
     WriteI64(out, empty() ? 0 : Max());
-    auto runs = EncodeRle(ints_.data());
-    WriteU64(out, static_cast<uint64_t>(runs.size()));
-    for (const auto& r : runs) {
-      WriteI64(out, r.value);
-      WriteU64(out, r.count);
+    // FOR-Kodierung der Int-Spalte.
+    const auto& vals = ints_.data();
+    const uint64_t base_u = std::bit_cast<uint64_t>(base);
+    std::vector<uint64_t> deltas;
+    deltas.reserve(static_cast<size_t>(rows));
+    uint64_t max_delta = 0;
+    for (int64_t v : vals) {
+      const uint64_t d =
+          std::bit_cast<uint64_t>(v) - base_u;  // mod 2^64 == exakt
+      deltas.push_back(d);
+      if (d > max_delta) max_delta = d;
     }
+    const uint32_t bw = rows == 0 ? 0 : ForBitWidth(max_delta);
+    const std::vector<uint64_t> words = PackForDeltas(deltas, bw);
+    WriteU32(out, bw);
+    WriteU64(out, static_cast<uint64_t>(words.size()));
+    for (uint64_t w : words) WriteU64(out, w);
     const auto& dict = strs_.dict_values();
     const auto& codes = strs_.codes();
     WriteU64(out, static_cast<uint64_t>(dict.size()));
@@ -342,7 +424,11 @@ Part Part::Load(const std::string& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error("Part::Load: cannot open " + path);
   char magic[4];
-  if (!in.read(magic, 4) || std::memcmp(magic, "COL1", 4) != 0)
+  if (!in.read(magic, 4))
+    throw std::runtime_error("Part::Load: bad magic " + path);
+  const bool is_col1 = (std::memcmp(magic, "COL1", 4) == 0);
+  const bool is_col2 = (std::memcmp(magic, "COL2", 4) == 0);
+  if (!is_col1 && !is_col2)
     throw std::runtime_error("Part::Load: bad magic " + path);
   uint64_t id = 0, name_len = 0, rows = 0;
   if (!ReadU64(in, id) || !ReadU64(in, name_len))
@@ -359,21 +445,55 @@ Part Part::Load(const std::string& path) {
   int64_t mn = 0, mx = 0;
   if (!ReadI64(in, mn) || !ReadI64(in, mx))
     throw std::runtime_error("Part::Load: truncated stats");
-  uint64_t nruns = 0;
-  if (!ReadU64(in, nruns) || nruns > rows + 1)
-    throw std::runtime_error("Part::Load: bad nruns");
-  std::vector<RleRun> runs;
-  runs.reserve((size_t)std::min<uint64_t>(nruns, 1 << 20));
-  for (uint64_t i = 0; i < nruns; ++i) {
-    int64_t v = 0;
-    uint64_t c = 0;
-    if (!ReadI64(in, v) || !ReadU64(in, c))
-      throw std::runtime_error("Part::Load: truncated runs");
-    runs.push_back({v, c});
+  std::vector<int64_t> ints;
+  ints.reserve(static_cast<size_t>(rows));
+  if (is_col1) {
+    // Fallback-Pfad: altes RLE-Layout (unveraendert).
+    uint64_t nruns = 0;
+    if (!ReadU64(in, nruns) || nruns > rows + 1)
+      throw std::runtime_error("Part::Load: bad nruns");
+    std::vector<RleRun> runs;
+    runs.reserve((size_t)std::min<uint64_t>(nruns, 1 << 20));
+    for (uint64_t i = 0; i < nruns; ++i) {
+      int64_t v = 0;
+      uint64_t c = 0;
+      if (!ReadI64(in, v) || !ReadU64(in, c))
+        throw std::runtime_error("Part::Load: truncated runs");
+      runs.push_back({v, c});
+    }
+    ints = DecodeRle(runs);
+    if (ints.size() != rows)
+      throw std::runtime_error("Part::Load: rows mismatch (RLE)");
+  } else {
+    // COL2: FOR/Bitpacking (Basis = mn aus Header).
+    uint32_t bw = 0;
+    uint64_t nwords = 0;
+    if (!ReadU32(in, bw) || bw > 64)
+      throw std::runtime_error("Part::Load: bad bitwidth");
+    if (!ReadU64(in, nwords))
+      throw std::runtime_error("Part::Load: truncated for header");
+    const uint64_t expect =
+        (rows == 0 || bw == 0)
+            ? 0
+            : (rows * static_cast<uint64_t>(bw) + 63u) / 64u;
+    if (nwords != expect)
+      throw std::runtime_error("Part::Load: bad nwords");
+    if (rows == 0 && (bw != 0 || nwords != 0))
+      throw std::runtime_error("Part::Load: bad empty for");
+    if (bw == 0 && rows > 0 && mn != mx)
+      throw std::runtime_error("Part::Load: bad for stats");
+    std::vector<uint64_t> words;
+    words.reserve((size_t)std::min<uint64_t>(nwords, 1 << 20));
+    for (uint64_t i = 0; i < nwords; ++i) {
+      uint64_t w = 0;
+      if (!ReadU64(in, w))
+        throw std::runtime_error("Part::Load: truncated for words");
+      words.push_back(w);
+    }
+    ints = UnpackFor(mn, bw, rows, words);
+    if (ints.size() != rows)
+      throw std::runtime_error("Part::Load: rows mismatch (FOR)");
   }
-  std::vector<int64_t> ints = DecodeRle(runs);
-  if (ints.size() != rows)
-    throw std::runtime_error("Part::Load: rows mismatch (RLE)");
   uint64_t dict_size = 0;
   if (!ReadU64(in, dict_size) || dict_size > (1u << 24))
     throw std::runtime_error("Part::Load: bad dict");

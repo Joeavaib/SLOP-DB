@@ -6,6 +6,8 @@
 >
 > V1 (s01–s20): Row-Kern + Stubs. V2 (s21–s26): echte Implementierungen —
 > siehe Kapitel 8 (HNSW-multi, PQ-N/IVF, WAL-Group-Commit, COL1-File, Raft-TCP).
+> Welle 8–10 (s38–s52): SQL-Aggregate/Session/Filter, Metrics/Backup/Kill-9,
+> Pager-Atomaritaet, HNSW/IVF-Skala, Auth/TLS — siehe Kapitel 9.
 
 ## 1. Schichtenmodell
 
@@ -15,22 +17,22 @@ Reads nutzen Snapshot-Pfade (Pfeile aufwärts):
 ```text
 SQL (parser, pgwire, executor, jsonb)
   |
-Txn (mvcc, clock: TSO/HLC Stub)
+Txn (mvcc, clock: TSO/HLC + Commit-Wait, echt)
   |
 KV (kv: Get/Put/Delete/Scan/Iterator, WriteBatch, Snapshot)
   |
-Raft (shard: Range/Tablet + RaftGroup 3er-Sim, kein Netzwerk in V1)
+Raft (shard: Range/Tablet + RaftGroup 3er-Sim + TCP-Wire/Persistenz s25)
   |
 Storage (pager 16KiB + wal REDO + columnar Parts + index + vector/search)
 ```
 
 | Schicht | Code | Verantwortung |
 |---|---|---|
-| SQL | `src/sql/parser.cpp`, `src/sql/executor.cpp`, `src/sql/jsonb.cpp`, `src/server/pgwire.cpp`, `src/server/pgserver.cpp` | Mini-SQL `CREATE/INSERT/SELECT` + Filter, `TableRegistry`, JSONB-Operatoren `->/->>/@>`, PGWire-Stub + TCPServer (127.0.0.1 ephemeral) |
-| Txn | `src/txn/mvcc.cpp`, `src/txn/clock.cpp` | Snapshot-Isolation, Undo-Ketten, Single-Writer pro Shard, TSO/HLC + Commit-Wait |
+| SQL | `src/sql/parser.cpp`, `src/sql/executor.cpp`, `src/sql/jsonb.cpp`, `src/server/pgwire.cpp`, `src/server/pgserver.cpp` | Mini-SQL `CREATE/INSERT/SELECT` + Filter/Sort/Aggregate (s39/s43/s48: `SUM/AVG/MIN/MAX/COUNT`, `GROUP BY`, `BETWEEN/IN/OR`, `ORDER BY/LIMIT/OFFSET`), `TableRegistry`, JSONB-Operatoren `->/->>/@>`, PGWire-Session + TCPServer (127.0.0.1 ephemeral, echte T/D/C mit OIDs/NULLs, Auth-Hook opt-in) |
+| Txn | `src/txn/mvcc.cpp`, `src/txn/clock.cpp` | Snapshot-Isolation, Undo-Ketten, Single-Writer pro Shard, TSO/HLC + Commit-Wait + monotone Snapshots (echt, `txn/clock.h`: `HybridLogicalClock`/`TimestampOracle`/`SnapshotIssuer`, kein Stub) |
 | KV | `src/kv/kv.cpp` | Native API `Get/Put/Delete/Scan/Iterator`, atomarer `WriteBatch`, `Snapshot`-Handle |
-| Raft | `src/raft/shard.cpp` | `Shard{id, [start,end)}` + `RaftGroup` (3 Nodes in-process), Election/Replikation/Failover-Sim |
-| Storage | `src/storage/pager.cpp`, `src/storage/wal.cpp`, `src/columnar/store.cpp`, `src/index/btree.cpp`, `src/vector/hnsw.cpp`, `src/search/hybrid.cpp` | 16KiB-Pages + mmap, REDO-WAL, immutable Columnar-Parts, Secondary-B-Tree, HNSW-lite + BM25-Hybrid |
+| Raft | `src/raft/shard.cpp` | `Shard{id, [start,end)}` + `RaftGroup` (3 Nodes in-process-Sim + TCP-Wire-Codec/`SaveLog`/`SaveSnapshot`/Follower-Reads, s25) |
+| Storage | `src/storage/pager.cpp`, `src/storage/wal.cpp`, `src/columnar/store.cpp`, `src/index/btree.cpp`, `src/vector/hnsw.cpp`, `src/search/hybrid.cpp` | 16KiB-Pages + mmap, REDO-WAL, immutable Columnar-Parts (COL1-File+Merge, s24), Secondary-B-Tree, mehrschichtiger filterbarer HNSW + BM25-Hybrid |
 
 Regeln:
 
@@ -133,8 +135,10 @@ Vektor first-class, **nur STL/POSIX, kein FAISS** (siehe `SBOM.md`):
   Post-Filter-Recall-Verlust).
 - Baseline: `brute_force(q,k,filter)` Full-Scan mit gleichem Filter/Distanz
   für Recall-Messung (`Recall@10`, Ziel >0.9–0.95).
-- Quantisierung: `SQ8Quantizer`-Stub (min/max pro Dim → uint8, ADC + Re-Rank
-  geplant). V1 rechnet float32 exakt; `fit()` wirft aktuell `logic_error`.
+- Quantisierung: `SQ8` echt (`vector/quant.h: Sq8Quantizer`: min/max pro Dim →
+  uint8, `encode/decode`, ADC `adc_l2_squared` + Re-Rank `quantized_search_rerank`;
+  alter `hnsw.h:SQ8Quantizer`-Stub nur noch historisch, aktive Suche nutzt
+  `quant.h`). PQ siehe 8.2/9.8 (PQ-N + residuales IVF).
 - Thread-Safety: `search/brute_force` const & nebenläufig sicher nach `build()`;
   `add/build` nicht nebenläufig sicher.
 
@@ -153,14 +157,18 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
 ## 6. Weitere Module (Kurzreferenz)
 
 - **Pager** (`storage/pager.h`): 16KiB-Pages, Single-File, LRU, `mmap`
-  Zero-Copy Reads (`read_zero_copy`) mit `pread`-Fallback, `allocate/write/read_page`.
+  Zero-Copy Reads (`read_zero_copy`) mit `pread`-Fallback, `allocate/write/read_page`;
+  clustered B+Tree-Hülle (`insert/find/erase`, key-sortiert) + atomares
+  `store_image` (`tmp+rename+fsync`, `load_image` strikt: Torn→Fehler, s50).
 - **KV** (`kv.h`): `Get/Put/Delete/Scan/Iterator`, `WriteBatch` atomar.
-- **Index** (`index/btree.h`): Secondary B-Tree via `multimap` + TTL + ART/GIN-Stubs.
-- **Columnar** (`columnar/store.h`): immutable Parts + Pruning, kein OLTP-Retrofit.
+- **Index** (`index/btree.h`): Secondary B-Tree via `multimap` + TTL + ART/GIN-Stubs (unverändert Stub).
+- **Columnar** (`columnar/store.h`): immutable Parts + Pruning + COL1-File/Merge/Compact via `Save/Load` (s24, kein OLTP-Retrofit).
 - **JSONB** (`sql/jsonb.h`): Binär-JSON, GIN-Inverted-Index, `->/->>/@>`.
-- **Clock** (`txn/clock.h`): TSO/HLC + Commit-Wait + monotone Snapshots.
+- **Clock** (`txn/clock.h`): TSO/HLC + Commit-Wait + monotone Snapshots (echt: `HybridLogicalClock`, `TimestampOracle`, `SnapshotIssuer`, s14).
 - **PGServer** (`server/pgserver.h`): POSIX-TCP, Startup/Q-Flow über Socket,
-  `SELECT 1`-Smoke psql-kompatibel.
+  echte Session (`Executor::execute`, T mit OIDs / D mit `NULL=-1` / C / Z,
+  `SELECT 1`-Sonderpfad erhalten) + opt-in Auth-Hook (`setAuth/setAuthRequired`,
+  Fail `28P01`, Default Trust-All, s41/s49).
 
 ## 7. Nicht-Ziele V1/V2 / Grenzen (Stand s26)
 
@@ -168,9 +176,10 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
   mehrschichtig; PQ-2-Stub → s22 PQ-N+IVF; WAL ohne Wait/CDC → s23;
   Columnar ohne File/Merge → s24; Raft ohne Netz/Persistenz → s25.
 - Weiter offen: verteiltes 2PC/SSI, Auto-Split mit Daten-Move (nur Range-Ops,
-  s25), DiskANN (nur HNSW+PQ+Spill), Graph (V2-Empfehlung Kuzu-embedded),
-  RESP/Arrow-Flight/REST (F6.2), SDKs/WASM (F6.3). Siehe Roadmap
-  `.rfg/roadmap.yaml`.
+  s25), Graph (V2-Empfehlung Kuzu-embedded),
+  RESP/Arrow-Flight/REST (F6.2), SDKs/WASM (F6.3). DiskANN-These überholt:
+  Spill via `vector/quant.h: DiskSpill` (mmap-File, echt) + HNSW+PQ+IVF vorhanden.
+  Siehe Roadmap `.rfg/roadmap.yaml`.
 
 ## 8. V2-Vertiefungen (s21–s25, alle STL/POSIX-only, Apache-2.0)
 
@@ -225,3 +234,104 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
 - `follower_get` + `is_caught_up` (read_index light),
   `Shard::split(mid)` (binärer ID-Baum, Range-validiert) + `can_merge_with`
   (Adjazenz); Daten-Move als Follow-up dokumentiert.
+
+## 9. Welle 8–10 (s38–s52, alle STL/POSIX-only)
+
+### 9.1 NVMe-Bench (`tools/bench.cpp`, s38)
+
+- `dbbench --data-dir DIR`: `Wal::append_many` + `flush` in Batches auf
+  `DIR/dbbench.wal`; CSV `op,throughput,lat_p95` + Zeilen `wal_durable_puts`,
+  `wal_flush_p95` (alte Modi unverändert).
+- Messwerte (WAL durable puts): NVMe ~40k ops/s, p95 ~1.2ms; tmpfs ~682k ops/s
+  (fsync vs. Page-Cache; Vergleichsanker, kein SLO).
+
+### 9.2 SQL-Aggregate + GROUP BY (`sql/parser.h`, `src/sql/parser.cpp`, `src/sql/executor.cpp`, s39/s43)
+
+- Skalar-Aggregate ohne `GROUP BY`: `SUM/AVG/MIN/MAX/COUNT(col|*)`, Arg = Spalte
+  oder binärer `*/+-`-Ausdruck (`AggExpr`, DOUBLE, NULL propagiert);
+  Q6-Kern `SUM(price*(1-disc))` grün; leere Eingabe ohne `GROUP BY` = 1 Zeile.
+- `GROUP BY` (1..n Spalten, Hash-Aggregation, Q1-Kern ohne `ORDER BY`):
+  gemischte Projektion Gruppen-Spalten + Aggregate; leere Eingabe = 0 Gruppen.
+- Alias-Fix: `AS`-Alias + Blank-Alias für Spalten und Aggregate
+  (`SELECT SUM(x) AS s`, `SELECT rf g`), Klausel-Keywords schlucken keinen Alias
+  (`parser.cpp` Klausel-Guard); `ORDER BY` löst Alias/Aggregat/Ordinal auf.
+
+### 9.3 SQL-Filter + Sort (`sql/parser.h`, `src/sql/parser.cpp`, s48)
+
+- `WHERE`: `BETWEEN/NOT BETWEEN`, `IN/NOT IN (v, ...)`, `IS [NOT] NULL`,
+  `LIKE/ILIKE`, Vergleichs-Ops; DNF via `where_groups` (`OR` von `AND`-Ketten).
+- `ORDER BY` multi, je Item `ASC/DESC` + `NULLS FIRST/LAST` (Default PG-konform:
+  `ASC→NULLS LAST`, `DESC→NULLS FIRST`), Referenzen: Alias/Aggregat/Ordinal/
+  Tabellenspalte; danach `LIMIT n|ALL` + `OFFSET n`.
+
+### 9.4 PGWire-Session + Auth (`server/pgserver.h`, `src/server/pgserver.cpp`, s41/s49)
+
+- Session echt: `Q` → server-eigene `Executor`-Instanz (`execMu_`-serialisiert);
+  `SELECT` → `T` (Spalten + OIDs) / `D*` (Text, `NULL=-1`) / `C(SELECT n)` / `Z`;
+  `INSERT/CREATE` → `C(tag)/Z`; Fehler → `E(42601/0A000)/Z`; `SELECT 1`-Sonderpfad
+  byte-identisch; `X` beendet sauber, Extended/COPY → `E(0A000)/Z`.
+- Auth-Hook opt-in: `setAuth(map)` + `setAuthRequired(bool)` (Default Trust-All =
+  altes `R(0)+Z`); required: `R(3 Cleartext)` → `PasswordMessage('p')` → Match
+  `R(0)`, sonst `E FATAL 28P01` + close; Cleartext nur hinter Sidecar-TLS
+  (Kommentar-Warnung in `pgserver.h`).
+
+### 9.5 Metrics (`server/metrics.h`, `src/server/metrics.cpp`, `dbmetrics`, s42)
+
+- `MetricsServer` (127.0.0.1, ephemeral, `GET /metrics`): rendert `Snapshot` als
+  Prometheus-Text (`dbengine_*`); hält keine globalen Stores (Aufrufer füllt).
+- Liste: `wal_durable_lsn/next_lsn/appends/flushes`, `raft_commit_index/log_size/
+  alive_count/leader_id/term`, `columnar_total_rows/sealed_parts`,
+  `hnsw_size/dim/max_level`, `kv_keys/sequence`.
+- `dbmetrics --selfcheck` (ephemeral, assertet Keywords), Demo-Fütterung via WAL.
+
+### 9.6 Backup (`server/backup.h`, `src/server/backup.cpp`, `dbbackup`, s44)
+
+- Offline, single-shard: `flush` → `ColumnarStore::Save` → `Raft SaveLog+
+  SaveSnapshot` → WAL-Copy (`wal.log`) → `MANIFEST` **zuletzt**, atomar
+  (`tmp+rename+fsync` File + Dir, Muster `wal.cpp`).
+- `MANIFEST` (`DBBACKUP1`, `key=value`): `wal_lsn/rows/term/commit`; Layout:
+  `wal.log`, `raft.log` (`RAFT1`), `raft.snap` (`RSNP1`), `columnar/` + `MANIFEST`.
+- Restore: `MANIFEST` validieren → WAL kopieren + `replay_file`-Check
+  (`max-LSN == wal_lsn`) → `LoadLog` + `LoadSnapshot` (Commit-Match) →
+  `ColumnarStore::Load` (Rows-Match) → Tail-Count ab `wal_lsn+1` (offline: 0,
+  `Executor::recover()` anwendbar); kein PITR/Incremental/Multi-Shard.
+
+### 9.7 Crash-Garantien (`storage/wal.h`, `tests/test_wal.cpp` s46, `tests/test_chaos.cpp`)
+
+- Regel bleibt: Kill-9-sicher **nur nach `flush()`**; ungeflushte `append`s gehen
+  verloren (Design); Torn-Tail → Prefix gewinnt (Magic+Len+CRC, open kappt).
+- s46-Harness echt: `fork+kill -9` vor/nach `flush` + mitten in `checkpoint`;
+  Reopen-Replay = Prefix-Modell, Verlust 0 nach `flush`.
+- Chaos (10k Ops, Seed 42): put/del/scan + flush/256 + Checkpoint/CDC/Wait +
+  Torn-Inject nach Op 5000; Replay == Modell, `map_replayed == expected == Scan`.
+
+### 9.8 Vektor-Skala (`vector/hnsw.h`, `src/vector/hnsw.cpp`, `vector/quant.h`, `src/vector/quant.cpp`, s40/s47/s51)
+
+- Symmetrische Shrink-Heuristik (s40, `shrink_layer[_after_add]`): reziproke
+  Kantenstützung mit Diversitäts-Heuristik (Paper Alg. 3) statt nächste-only;
+  Fernkanten bleiben → clustered-Recall 1.0, uniform ≥ Stand.
+- Query-Probes (s47): `P=min(256,N/64)` adaptive Multi-Start-Coarse-Probes
+  (flach, deterministisch, `kQueryProbeMax=256`) + squared-Hotpath
+  (`dispatch_distance2`, L2 ohne sqrt pro Kandidat); kleine N deutlich schneller.
+- Residuales IVF + Autotune (s51, Format-Wechsel): PQ trainiert auf Residuen
+  (`v − coarse[assign(v)]`), Codes inkompatibel zu alt (neu `train+build` nötig);
+  Sample-Regel `min(N,max(2048,N/10))`; Defaults `nlist≈4·sqrt(N)` ([1,4096], ≤N),
+  `nprobe≈nlist/8` (`default_nlist/nprobe/autotune(n)`); `ef`-Autotune
+  (`autotune_ef(k,sel)`, `autotune_ef_for_filter`) + Coarse-P256-Pfad
+  (AVX2 `_mm256`-Kerne, `hsum_m256`, Sample-Caps→Prozent-Regel).
+
+### 9.9 Pager-Atomarität (`storage/pager.h`, `src/storage/pager.cpp`, s50)
+
+- `store_image`: serialisieren → `path.tmp` → fsync → `rename` → Dir-fsync
+  (alt oder neu vollständig, nie torn-mix); `load_image` strikt
+  (Magic/Version/Record-Stream/Trailing-Zero; torn → open-Fehler statt Teilverlust).
+- Header `DBENPG01`, clustered KV-Image (key-sortiert), `mmap`-Read + `pread`-
+  Fallback (`uses_mmap()`), Torn-Image-Test vorhanden.
+
+### 9.10 TLS-Sidecar (`docs/RUNBOOK.md` Kap. 7, `k8s/statefulset.yaml`, s52)
+
+- Kein eigenes TLS im Server (Klartext, Trust/Proxy-Vertrauen); Terminierung im
+  Sidecar (`stunnel`: `accept 5433 → connect 5432`, `envoy`-analog); Test
+  `psql "sslmode=require" port 5433`; K8s nur auskommentierte Skizze
+  (`tls-cert`-Secret-Volume, `stunnel`-Sidecar, `pgwire-tls`-Port 5433, nicht
+  deployed); Warnung: Auth-Hook ohne Sidecar = Klartext über Netz.

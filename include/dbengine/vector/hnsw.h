@@ -24,7 +24,22 @@
 //     + Disk-Tiering (s10-columnar).
 //
 // Thread-Safety: Lese-Operationen (search/brute_force) sind const & neben-
-// laeufig sicher nach build(). add()/build() sind nicht nebenlaeufig sicher.
+// laeufig sicher nach build(). add()/build()/clear() sind nicht nebenlaeufig
+// sicher (Single-Thread, wie bisher).
+//
+// SoA-Layout (s-perf): Vektordaten liegen in EINEM flachen float-Buffer
+// (Groesse N*dim, Row-Major, Zugriff id*dim+d). norms_ bleibt parallel
+// (N Eintraege, L2-Normen fuer Cosine). Distanzkerne arbeiten direkt auf
+// Buffer-Pointern (kein Vector-Umweg).
+// get() gibt aus API-Gruenden weiter const Vector& zurueck, backed durch
+// einen thread_local Kopie-Puffer: Referenz ist nur bis zum naechsten get()
+// auf DEMSELBEN Thread gueltig; zwei Referenzen gleichzeitig halten ist
+// UNSICHER (zweite get()-Kopie ueberschreibt die erste) — bei Bedarf
+// kopieren (Vector v = idx.get(id);). Nebenlaeufige get() auf VERSCHIEDENEN
+// Threads sind sicher (eigener Slot je Thread). add()/clear()/build() machen
+// zuvor zurueckgegebene Kopien inhaltlich stale (Mapping id->Zeile aendert
+// sich); das entspricht sinngemaess der bisherigen Realloc-Semantik
+// (Referenzen in vector<Vector> waren ueber Wachstum ebenfalls instabil).
 
 #include <cstddef>
 #include <functional>
@@ -149,6 +164,9 @@ class HnswIndex {
   // --- Lesepfad ---
   [[nodiscard]] size_t size() const;
   [[nodiscard]] int dim() const;
+  // SoA-Semantik (s. Thread-Safety/SoA-Block oben): thread_local Kopie,
+  // gueltig bis zum naechsten get() auf demselben Thread. Nicht zwei
+  // Referenzen gleichzeitig halten — kopieren bei Bedarf.
   [[nodiscard]] const Vector& get(int id) const;
   [[nodiscard]] size_t neighbor_count(int id) const;
 
@@ -164,19 +182,37 @@ class HnswIndex {
       const Vector& query, int k, FilterFn filter = nullptr) const;
 
  private:
+  // Zeiger auf Zeile id im flachen Buffer (id*dim_+d, Row-Major). Aufrufer
+  // prueft id-Gueltigkeit; Pointer ist gueltig, bis data_flat_ erneut
+  // waechst (add/clear/build, Single-Thread-Schreibpfad).
+  [[nodiscard]] const float* row_ptr(int id) const noexcept;
   [[nodiscard]] float dist(const Vector& a, const Vector& b) const;
   [[nodiscard]] float dist_to_stored(const Vector& q, int id) const;
+  [[nodiscard]] float dist_to_stored_ptr(const float* q, int id) const;
   // Quadrierter Hotpath: L2 -> l2_squared_kernel ohne sqrt (Beam-Heaps,
   // select/shrink-Scores, greedy); Cosine -> identisch zu dist_to_stored
   // (sqrt in Norm noetig, kein Einsparpotenzial). Finale search()-Outputs
   // werden einmalig nach sqrt konvertiert (dist-Einheiten).
   [[nodiscard]] float dist2_to_stored(const Vector& q, int id) const;
+  [[nodiscard]] float dist2_to_stored_ptr(const float* q, int id) const;
+  // Distanz zwischen zwei GESPEICHERTEN Zeilen (voller Recompute via Kerne,
+  // gleiche Numerik wie bisheriges dispatch_distance2(data_[a], data_[b])).
+  [[nodiscard]] float dist2_between_stored(int a, int b) const;
+  // Exakte Distanz Query-Rohzeiger vs. gespeicherte Zeile OHNE Norm-Cache
+  // (gleiche Numerik wie dist(), fuer brute_force-Baseline).
+  [[nodiscard]] float dist_exact_ptr(const float* q, int id) const;
   // --- s21 Mehrschicht-Interna ---
   int random_level();
   [[nodiscard]] std::vector<SearchHit> search_layer(const Vector& q,
                                                    int entry_id, int ef,
                                                    int lc) const;
+  // Pointer-Kern (kein Vector-Umweg): q zeigt auf dim_ floats (externer Query
+  // oder gespeicherte Zeile). Vector-Variante delegiert via q.data().
+  [[nodiscard]] std::vector<SearchHit> search_layer_ptr(const float* q,
+                                                       int entry_id, int ef,
+                                                       int lc) const;
   int greedy_closest(const Vector& q, int entry_id, int lc) const;
+  int greedy_closest_ptr(const float* q, int entry_id, int lc) const;
   void insert_node(int id);
   // select_neighbors arbeitet in-place auf dem uebergebenen (owned)
   // Kandidatenvektor (keine Kopie-Flut): HNSW-Diversitaets-Heuristik
@@ -186,6 +222,9 @@ class HnswIndex {
   // sel-Reihenfolge gebracht (Score-Wiederverwendung im Insert).
   [[nodiscard]] std::vector<int> select_neighbors(
       const Vector& q, std::vector<SearchHit>& cand, int mm) const;
+  // Pointer-Kern fuer Insert (q = gespeicherte Zeile, kein Vector-Umweg).
+  [[nodiscard]] std::vector<int> select_neighbors_ptr(
+      const float* q, std::vector<SearchHit>& cand, int mm) const;
   void shrink_layer(int id, int lc, int max_m);
   // Wie shrink_layer, nutzt aber den aus der Kandidatensuche bekannten Score
   // der frischen Kante (fresh_id, fresh_dist) statt ihn neu zu berechnen.
@@ -199,8 +238,10 @@ class HnswIndex {
   DistanceMetric metric_;
   double ml_ = 0.36;  // 1/ln(M), bei set_m neu berechnet
 
-  std::vector<Vector> data_;
-  std::vector<float> norms_;  // L2-Normen (fuer Cosine, parallel zu data_)
+  // SoA-Primaer-Speicher: N*dim floats, Row-Major, Zeile id ab id*dim_.
+  // Groesseninvariante: data_flat_.size() == size()*dim_ (size() == norms_.size()).
+  std::vector<float> data_flat_;
+  std::vector<float> norms_;  // L2-Normen (fuer Cosine, parallel zu data_flat_)
   std::vector<int> levels_;   // Level pro Knoten
   // links_[id][lc] = Nachbarn auf Layer lc (lc <= levels_[id])
   std::vector<std::vector<std::vector<int>>> links_;

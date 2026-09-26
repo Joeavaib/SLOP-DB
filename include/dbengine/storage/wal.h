@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -32,6 +33,35 @@ struct WalRecord {
   uint64_t lsn = 0;
   std::string data;
 };
+
+// Audit-Konvention auf WAL-Basis (kein Format-Bruch: normale Records).
+//
+// Compliance-Vorstufe, KEIN Tamper-Schutz: Audit-Events sind normale
+// WAL-Payloads ohne HMAC/Signatur/Kette. Jeder mit Dateizugriff kann sie
+// faelschen, umschreiben oder per checkpoint() verwerfen. Keine
+// Vollstaendigkeits- oder Unveraenderbarkeitsgarantie — nur Konvention
+// zur Filterung per Prefix.
+//
+// Encoding (Payload, UTF-8/opak, '\0'-tolerant):
+//   "AUD1\n" + esc(actor) + "\n" + esc(action) + "\n" + esc(detail)
+// Escaping pro Feld (dokumentiert, reversibel):
+//   '\\' -> "\\\\"  (Backslash zuerst escapen)
+//   '\n' -> "\\n"   (echter Zeilenumbruch -> Backslash + 'n')
+// Alle anderen Bytes (inkl. '\r', '\0', UTF-8) passieren unveraendert.
+// Trennzeichen sind NUR unescapte '\n'; strikter Prefix-Match "AUD1\n"
+// (5 Bytes), sonst gilt der Record als Nicht-Audit und wird geskippt.
+struct AuditEvent {
+  uint64_t lsn = 0;
+  std::string actor;
+  std::string action;
+  std::string detail;
+};
+
+/// Parst einen WAL-Record als Audit-Event. Gibt nullopt zurueck, wenn der
+/// Payload nicht mit "AUD1\n" beginnt (strikter Prefix-Match) oder das
+/// Restformat ungueltig ist (falsche Feldzahl, ungueltige Escape-Sequenz,
+/// einsamer Backslash am Ende). Reine Funktion, kein Lock/Dateizugriff.
+std::optional<AuditEvent> parse_audit(const WalRecord& rec);
 
 class Wal {
  public:
@@ -61,6 +91,17 @@ class Wal {
   /// CDC: alle Records mit lsn >= from_lsn (aufsteigend). max_records==0: alle.
   std::vector<WalRecord> read_from(uint64_t from_lsn,
                                    size_t max_records = 0);
+  /// Audit-Append (normale Record-Payload nach AUD1-Konvention, s. oben).
+  /// Gibt die LSN zurueck. Wirft bei Ueberschreitung von kMaxPayload
+  /// (nach Escaping). Beeinflusst bestehende Tests nicht (neue API only).
+  uint64_t append_audit(std::string_view actor, std::string_view action,
+                        std::string_view detail);
+  /// Audit-Read: read_from(from_lsn) + parse_audit + nur AUD1-Eintraege
+  /// (strikter Prefix-Match, sonst skip, LSN-Ordnung bleibt). max_records==0:
+  /// alle Audit-Events; sonst max. so viele Audit-Events (Limit zaehlt
+  /// gefilterte Events, nicht gescannte Records).
+  std::vector<AuditEvent> read_audit(uint64_t from_lsn,
+                                     size_t max_records = 0);
   /// Liest alle gueltigen Records ab Dateianfang (torn tail -> Prefix).
   std::vector<WalRecord> replay();
   /// Statische Variante ohne offene Instanz (fuer Recovery beim Start).

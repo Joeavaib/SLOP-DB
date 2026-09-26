@@ -267,6 +267,19 @@ class Parser {
     throw SqlError("Erwartet Identifier");
   }
 
+  // Spaltenreferenz mit optionalem Tabellen-Prefix: col | t.col (JOIN).
+  // Beide Teile via parseIdent (unquoted -> lowercase-Folding).
+  std::string parseColRef() {
+    std::string first = parseIdent();
+    if (matchSymbol(".")) {
+      std::string second = parseIdent();
+      if (peek().kind == TokKind::Symbol && peek().text == ".")
+        throw SqlError("Nur ein Tabellen-Prefix (t.c) wird unterstuetzt");
+      return first + "." + second;
+    }
+    return first;
+  }
+
   CreateTableStmt parseCreate() {
     expectKeyword("TABLE");
     CreateTableStmt s;
@@ -578,7 +591,7 @@ class Parser {
           return n;
         }
       }
-      std::string col = parseIdent();  // foldet unquoted nach lowercase
+      std::string col = parseColRef();  // foldet unquoted nach lowercase
       auto n = std::make_shared<AggExpr>();
       n->kind = AggExpr::Kind::Column;
       n->column = col;
@@ -598,10 +611,66 @@ class Parser {
                                 "HAVING", "BY",   "ASC",  "DESC",
                                 "NULLS",  "FIRST", "LAST", "NOT",
                                 "BETWEEN", "IN",  "IS",   "LIKE",
-                                "ILIKE",  "NULL"};
+                                "ILIKE",  "NULL", "JOIN", "INNER",
+                                "LEFT", "RIGHT", "FULL", "OUTER",
+                                "CROSS", "ON"};
     for (auto k : kws)
       if (peekKeyword(k)) return true;
     return false;
+  }
+
+  // Optionaler Tabellen-Alias: [AS] name ("" = keiner). Klausel-Keywords
+  // (u.a. JOIN/ON/WHERE/...) werden nie als Blank-Alias geschluckt.
+  std::string parseOptAlias() {
+    if (matchKeyword("AS")) return parseIdent();
+    if (peek().kind == TokKind::Ident && !peekClauseKeyword())
+      return parseIdent();
+    return "";
+  }
+
+  // Eine ON-Bedingung: colref (cmp) colref | colref (cmp) literal.
+  JoinCond parseJoinCond() {
+    JoinCond j;
+    j.left = parseColRef();
+    const Token& t = next();
+    if (t.kind != TokKind::Symbol)
+      throw SqlError("Erwartet Vergleichsoperator in JOIN ... ON");
+    static const char* kOps[] = {"=", "<", "<=", ">", ">=", "<>", "!="};
+    bool ok = false;
+    for (auto o : kOps)
+      if (t.text == o) ok = true;
+    if (!ok) throw SqlError("Unbekannter Operator in JOIN ... ON: " + t.text);
+    j.op = t.text;
+    if (j.op == "!=") j.op = "<>";
+    // Rechte Seite: Literal oder Spaltenreferenz.
+    const Token& u = peek();
+    bool isLit = (u.kind == TokKind::Integer || u.kind == TokKind::Float ||
+                  u.kind == TokKind::String);
+    if (!isLit && u.kind == TokKind::Symbol &&
+        (u.text == "-" || u.text == "+"))
+      isLit = true;
+    if (!isLit && u.kind == TokKind::Ident) {
+      std::string kw = toUpper(u.text);
+      if (kw == "NULL" || kw == "TRUE" || kw == "FALSE" || kw == "DEFAULT")
+        isLit = true;
+    }
+    if (isLit) {
+      j.right_is_col = false;
+      j.literal = parseLiteral();
+    } else {
+      j.right_is_col = true;
+      j.right = parseColRef();
+    }
+    return j;
+  }
+
+  // JOIN-Auftakt? INNER / JOIN starten einen (unterstuetzten) Inner-Join,
+  // LEFT/RIGHT/FULL/OUTER/CROSS werden mit explizitem Fehler abgelehnt.
+  bool peekJoinStart() const {
+    return peekKeyword("INNER") || peekKeyword("JOIN") ||
+           peekKeyword("LEFT") || peekKeyword("RIGHT") ||
+           peekKeyword("FULL") || peekKeyword("OUTER") ||
+           peekKeyword("CROSS");
   }
 
   SelectStmt parseSelect() {
@@ -624,7 +693,7 @@ class Parser {
           s.items.push_back(SelectItem{true, s.aggregates.size()});
           s.aggregates.push_back(std::move(a));
         } else {
-          std::string col = parseIdent();
+          std::string col = parseColRef();
           std::string alias;
           // Optionaler Alias auch fuer Plain-Spalten: "rf AS g" / "rf g".
           if (matchKeyword("AS")) {
@@ -652,6 +721,45 @@ class Parser {
     }
     expectKeyword("FROM");
     s.table = parseIdent();
+    s.table_alias = parseOptAlias();
+    // Genau ein optionaler INNER JOIN: [INNER] JOIN u [AS y] ON ... [AND ...].
+    if (peekJoinStart()) {
+      if (peekKeyword("INNER")) {
+        ++pos_;
+        expectKeyword("JOIN");
+      } else if (peekKeyword("JOIN")) {
+        ++pos_;
+      } else {
+        throw SqlError(
+            "Nur INNER JOIN wird unterstuetzt (kein LEFT/RIGHT/FULL/OUTER/"
+            "CROSS JOIN)");
+      }
+      s.has_join = true;
+      s.join_table = parseIdent();
+      s.join_alias = parseOptAlias();
+      expectKeyword("ON");
+      while (true) {
+        s.join_on.push_back(parseJoinCond());
+        if (matchKeyword("AND")) continue;
+        break;
+      }
+      if (s.join_on.empty())
+        throw SqlError("JOIN braucht mindestens eine ON-Bedingung");
+      if (foldIdent(s.table) == foldIdent(s.join_table)) {
+        if (s.table_alias.empty() || s.join_alias.empty() ||
+            foldIdent(s.table_alias) == foldIdent(s.join_alias))
+          throw SqlError(
+              "Self-Join braucht zwei verschiedene Aliase "
+              "(FROM t AS x JOIN t AS y ON ...)");
+      }
+      std::string lEff = s.table_alias.empty() ? s.table : s.table_alias;
+      std::string rEff = s.join_alias.empty() ? s.join_table : s.join_alias;
+      if (foldIdent(lEff) == foldIdent(rEff) &&
+          foldIdent(s.table) != foldIdent(s.join_table))
+        throw SqlError("Doppelter Tabellen-Alias im JOIN: " + rEff);
+      if (peekJoinStart())
+        throw SqlError("Nur ein JOIN pro SELECT wird unterstuetzt");
+    }
     if (matchKeyword("WHERE")) {
       // DNF: Disjunktion von Konjunktionen (AND bindet staerker als OR).
       std::vector<std::vector<Condition>> groups;
@@ -675,7 +783,7 @@ class Parser {
       if (s.select_all)
         throw SqlError("SELECT * mit GROUP BY wird nicht unterstuetzt");
       while (true) {
-        s.group_by.push_back(parseIdent());
+        s.group_by.push_back(parseColRef());
         if (matchSymbol(",")) continue;
         break;
       }
@@ -715,9 +823,21 @@ class Parser {
     }
     if (peekKeyword("LIMIT") || peekKeyword("OFFSET"))
       throw SqlError("Doppeltes LIMIT / OFFSET");
-    // HAVING/JOIN -> klare V2-Fehlermeldung statt Silent-Ignore.
-    if (peekKeyword("HAVING") || peekKeyword("JOIN"))
-      throw SqlError("HAVING / JOIN erst ab V2");
+    // HAVING -> klare V2-Fehlermeldung statt Silent-Ignore; verirrtes
+    // JOIN/ON (zweite JOIN-Kette, ON ohne JOIN, OUTER-Varianten) ebenfalls.
+    if (peekKeyword("HAVING"))
+      throw SqlError("HAVING erst ab V2");
+    if (peekKeyword("LEFT") || peekKeyword("RIGHT") || peekKeyword("FULL") ||
+        peekKeyword("OUTER") || peekKeyword("CROSS"))
+      throw SqlError(
+          "Nur INNER JOIN wird unterstuetzt (kein LEFT/RIGHT/FULL/OUTER/"
+          "CROSS JOIN)");
+    if (peekKeyword("JOIN") || peekKeyword("INNER"))
+      throw SqlError(
+          "JOIN nur direkt nach FROM (nur ein JOIN pro SELECT wird "
+          "unterstuetzt)");
+    if (peekKeyword("ON"))
+      throw SqlError("ON ohne JOIN wird nicht unterstuetzt");
     return s;
   }
 
@@ -738,7 +858,7 @@ class Parser {
       o.is_agg = true;
       o.agg = parseAggregate();
     } else {
-      o.column = parseIdent();
+      o.column = parseColRef();
     }
     if (matchKeyword("ASC")) {
       o.desc = false;
@@ -800,7 +920,7 @@ class Parser {
 
   Condition parseCondition() {
     Condition c;
-    c.column = parseIdent();
+    c.column = parseColRef();
     // Optionales NOT-Praefix: NOT BETWEEN / NOT IN / NOT LIKE / NOT ILIKE.
     bool neg = false;
     if (peekKeyword("NOT")) {
@@ -1567,6 +1687,753 @@ Result execGroupedAggregates(const Table& t,
   return r;
 }
 
+// ---------- INNER JOIN ----------
+// (JoinCtx, resolveJoinCol, evalJoin*, execJoinRows, sortJoin*,
+// execJoinScalarAggregates, execJoinGroupedAggregates, execJoinSelect;
+// Details siehe Fortsetzung unten.)
+
+// Kombinierter Auswertungskontext: Combined-Rows sind konkateniert
+// [links..., rechts...]; WHERE/GROUP/ORDER/Aggregate arbeiten darauf wie
+// bisher auf Single-Table-Rows (WHERE/GROUP/ORDER-Semantik unveraendert).
+struct JoinCtx {
+  const Table* left = nullptr;
+  const Table* right = nullptr;
+  std::string lTable;  // Originalnamen (Fehlermeldungen)
+  std::string rTable;
+  std::string lEff;  // effektiver Qualifizierer (Alias oder Tabelle)
+  std::string rEff;
+  std::size_t nL = 0;  // Spaltenzahl links
+};
+
+void splitColRef(const std::string& ref, std::string& prefix,
+                 std::string& col) {
+  std::string::size_type p = ref.find('.');
+  if (p == std::string::npos) {
+    prefix.clear();
+    col = ref;
+  } else {
+    prefix = ref.substr(0, p);
+    col = ref.substr(p + 1);
+  }
+}
+
+// Spaltenreferenz -> Combined-Index. Qualifizierer darf Tabellenname oder
+// Alias je Seite sein; unqualifiziert + beidseitig vorhanden -> ambiguous.
+int resolveJoinCol(const JoinCtx& j, const std::string& ref) {
+  std::string pre, col;
+  splitColRef(ref, pre, col);
+  if (!pre.empty()) {
+    bool lm = (foldIdent(pre) == foldIdent(j.lEff)) ||
+              (foldIdent(pre) == foldIdent(j.lTable));
+    bool rm = (foldIdent(pre) == foldIdent(j.rEff)) ||
+              (foldIdent(pre) == foldIdent(j.rTable));
+    if (lm && rm)
+      throw SqlError("Mehrdeutiger Tabellen-Prefix: " + pre +
+                     " (ambiguous, Alias verwenden)");
+    if (lm) {
+      int idx = j.left->colIndex(col);
+      if (idx < 0) throw SqlError("Unbekannte Spalte: " + ref);
+      return idx;
+    }
+    if (rm) {
+      int idx = j.right->colIndex(col);
+      if (idx < 0) throw SqlError("Unbekannte Spalte: " + ref);
+      return static_cast<int>(j.nL + static_cast<std::size_t>(idx));
+    }
+    throw SqlError("Unbekannter Tabellen-Prefix: " + pre);
+  }
+  int li = j.left->colIndex(col);
+  int ri = j.right->colIndex(col);
+  if (li >= 0 && ri >= 0)
+    throw SqlError("Mehrdeutige Spalte: " + col +
+                   " (ambiguous, Tabellen-Prefix t.c angeben)");
+  if (li >= 0) return li;
+  if (ri >= 0)
+    return static_cast<int>(j.nL + static_cast<std::size_t>(ri));
+  throw SqlError("Unbekannte Spalte: " + ref);
+}
+
+// Original-Spaltenname am Combined-Index (Ausgabe ohne Qualifizierer, PG).
+const std::string& joinColName(const JoinCtx& j, int idx) {
+  std::size_t i = static_cast<std::size_t>(idx);
+  if (i < j.nL) return j.left->columns[i].name;
+  return j.right->columns[i - j.nL].name;
+}
+
+// ON-Bedingung auf einer Combined-Row (AND-Kette ausserhalb). NULL auf
+// einer Seite -> UNKNOWN -> false (Inner-Join droppt, wie WHERE).
+bool evalJoinOnCond(const JoinCtx& j, const std::vector<Value>& crow,
+                    const JoinCond& c) {
+  int li = resolveJoinCol(j, c.left);
+  const Value& lv = crow[static_cast<std::size_t>(li)];
+  Value rv;
+  if (c.right_is_col) {
+    int ri = resolveJoinCol(j, c.right);
+    rv = crow[static_cast<std::size_t>(ri)];
+  } else {
+    rv = c.literal;
+  }
+  if (valueIsNull(lv) || valueIsNull(rv)) return false;
+  int cmp = compareValues(lv, rv);
+  if (cmp == -2) return false;
+  if (c.op == "=") return cmp == 0;
+  if (c.op == "<>") return cmp != 0;
+  if (c.op == "<") return cmp < 0;
+  if (c.op == "<=") return cmp <= 0;
+  if (c.op == ">") return cmp > 0;
+  if (c.op == ">=") return cmp >= 0;
+  throw SqlError("Unbekannter Operator in JOIN ... ON: " + c.op);
+}
+
+// WHERE-Condition auf Combined-Row (Koerper wie evalCondition, nur
+// Aufloesung join-bewusst).
+bool evalJoinCondition(const JoinCtx& j, const std::vector<Value>& crow,
+                       const Condition& c) {
+  int idx = resolveJoinCol(j, c.column);
+  const Value& v = crow[static_cast<std::size_t>(idx)];
+  if (c.op == "IS NULL") return valueIsNull(v);
+  if (c.op == "IS NOT NULL") return !valueIsNull(v);
+  if (c.op == "IN" || c.op == "NOT IN") {
+    if (valueIsNull(v)) return false;
+    bool has_null = false;
+    for (auto& e : c.list) {
+      if (valueIsNull(e)) {
+        has_null = true;
+        continue;
+      }
+      if (compareValues(v, e) == 0) return (c.op == "IN");
+    }
+    if (c.op == "IN") return false;
+    return !has_null;
+  }
+  if (valueIsNull(v) || valueIsNull(c.value)) return false;  // NULL -> false
+  if (c.op == "BETWEEN" || c.op == "NOT BETWEEN") {
+    if (valueIsNull(c.second)) return false;
+    int lo = compareValues(v, c.value);
+    int hi = compareValues(v, c.second);
+    if (lo == -2 || hi == -2) return false;
+    bool in = (lo >= 0 && hi <= 0);
+    return (c.op == "BETWEEN") ? in : !in;
+  }
+  if (c.op == "LIKE" || c.op == "ILIKE" || c.op == "NOT LIKE" ||
+      c.op == "NOT ILIKE") {
+    auto* vs = std::get_if<std::string>(&v);
+    auto* ps = std::get_if<std::string>(&c.value);
+    if (!vs || !ps)
+      throw SqlError(c.op + " braucht TEXT-Operanden");
+    bool m = likeMatch(*vs, *ps, c.op == "ILIKE" || c.op == "NOT ILIKE");
+    return (c.op == "LIKE" || c.op == "ILIKE") ? m : !m;
+  }
+  int cmp = compareValues(v, c.value);
+  if (cmp == -2) return false;
+  if (c.op == "=") return cmp == 0;
+  if (c.op == "<>") return cmp != 0;
+  if (c.op == "<") return cmp < 0;
+  if (c.op == "<=") return cmp <= 0;
+  if (c.op == ">") return cmp > 0;
+  if (c.op == ">=") return cmp >= 0;
+  throw SqlError("Unbekannter Operator: " + c.op);
+}
+
+bool evalJoinWhere(const JoinCtx& j, const std::vector<Value>& crow,
+                   const SelectStmt& s) {
+  if (!s.where_groups.empty()) {
+    for (auto& conj : s.where_groups) {
+      bool ok = true;
+      for (auto& c : conj) {
+        if (!evalJoinCondition(j, crow, c)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
+  for (auto& c : s.where)
+    if (!evalJoinCondition(j, crow, c)) return false;
+  return true;
+}
+
+// Aggregat-Argument auf Combined-Row (Koerper wie evalAggExprNode).
+Value evalJoinAggNode(const JoinCtx& j, const std::vector<Value>& crow,
+                      const AggExpr& e) {
+  switch (e.kind) {
+    case AggExpr::Kind::Column: {
+      int idx = resolveJoinCol(j, e.column);
+      return crow[static_cast<std::size_t>(idx)];
+    }
+    case AggExpr::Kind::Literal:
+      return e.literal;
+    case AggExpr::Kind::Binary: {
+      Value lv = evalJoinAggNode(j, crow, *e.left);
+      Value rv = evalJoinAggNode(j, crow, *e.right);
+      if (valueIsNull(lv) || valueIsNull(rv))
+        return Value{std::monostate{}};
+      if (std::holds_alternative<std::string>(lv) ||
+          std::holds_alternative<std::string>(rv) ||
+          std::holds_alternative<bool>(lv) ||
+          std::holds_alternative<bool>(rv))
+        throw SqlError("Aggregat-Ausdruck braucht numerische Operanden");
+      double a = aggToDouble(lv);
+      double b = aggToDouble(rv);
+      switch (e.op) {
+        case '+':
+          return Value{a + b};
+        case '-':
+          return Value{a - b};
+        case '*':
+          return Value{a * b};
+        case '/':
+          if (b == 0.0) return Value{std::monostate{}};
+          return Value{a / b};
+        default:
+          break;
+      }
+      throw SqlError("Unbekannter Operator in Aggregat");
+    }
+  }
+  throw SqlError("Ungueltiger Aggregat-Ausdruck");
+}
+
+// Ein Aggregat ueber Combined-Rows (Semantik wie computeAggregate).
+Value computeJoinAggregate(
+    const JoinCtx& j, const std::vector<const std::vector<Value>*>& rows,
+    const Aggregate& a) {
+  if (a.star) {  // COUNT(*)
+    return Value{static_cast<int64_t>(rows.size())};
+  }
+  if (!a.arg) throw SqlError("Aggregat ohne Argument: " + a.func);
+  if (a.func == "COUNT") {
+    int64_t c = 0;
+    for (auto rp : rows) {
+      Value v = evalJoinAggNode(j, *rp, *a.arg);
+      if (!valueIsNull(v)) ++c;
+    }
+    return Value{c};
+  }
+  if (a.func == "SUM") {
+    bool any = false;
+    double sum = 0.0;
+    for (auto rp : rows) {
+      Value v = evalJoinAggNode(j, *rp, *a.arg);
+      if (valueIsNull(v)) continue;
+      requireNumericForSumAvg(v, "SUM");
+      sum += aggToDouble(v);
+      any = true;
+    }
+    return any ? Value{sum} : Value{std::monostate{}};
+  }
+  if (a.func == "AVG") {
+    double sum = 0.0;
+    int64_t n = 0;
+    for (auto rp : rows) {
+      Value v = evalJoinAggNode(j, *rp, *a.arg);
+      if (valueIsNull(v)) continue;
+      requireNumericForSumAvg(v, "AVG");
+      sum += aggToDouble(v);
+      ++n;
+    }
+    return n > 0 ? Value{sum / static_cast<double>(n)}
+                 : Value{std::monostate{}};
+  }
+  if (a.func == "MIN" || a.func == "MAX") {
+    bool any = false;
+    Value best{std::monostate{}};
+    for (auto rp : rows) {
+      Value v = evalJoinAggNode(j, *rp, *a.arg);
+      if (valueIsNull(v)) continue;
+      if (!any) {
+        best = v;
+        any = true;
+      } else {
+        int cmp = compareValues(v, best);
+        if (a.func == "MIN" ? (cmp < 0) : (cmp > 0)) best = v;
+      }
+    }
+    return any ? best : Value{std::monostate{}};
+  }
+  throw SqlError("Unbekannte Aggregatfunktion: " + a.func);
+}
+
+// Hashbar? Nur reine Equi-Kette ("=" Spalte-zu-Spalte, je eine Seite).
+// Loest dabei alle Refs auf (unbekannt/ambig -> SqlError) und liefert die
+// seiten-lokalen Key-Indizes.
+bool joinIsHashable(const JoinCtx& j, const SelectStmt& s,
+                    std::vector<int>& lKeys, std::vector<int>& rKeys) {
+  lKeys.clear();
+  rKeys.clear();
+  if (s.join_on.empty()) return false;
+  for (auto& c : s.join_on) {
+    if (c.op != "=" || !c.right_is_col) return false;
+    int li = resolveJoinCol(j, c.left);
+    int ri = resolveJoinCol(j, c.right);
+    bool lInL = static_cast<std::size_t>(li) < j.nL;
+    bool rInL = static_cast<std::size_t>(ri) < j.nL;
+    if (lInL == rInL) return false;  // gleiche Seite -> kein Join-Key
+    int lLocal = lInL ? li : ri;
+    int rLocal = (lInL ? ri : li) - static_cast<int>(j.nL);
+    lKeys.push_back(lLocal);
+    rKeys.push_back(rLocal);
+  }
+  return true;
+}
+
+// Combined-Rows ([links..., rechts...]) in Nested-Loop-Ordnung (links-major):
+// Hash-Join bei reiner Equi-ON-Kette (kleinere Seite builden, NULL-Keys
+// matchen nie), sonst Nested-Loop mit voller AND-Auswertung.
+std::vector<std::vector<Value>> execJoinRows(const JoinCtx& j,
+                                             const SelectStmt& s) {
+  const auto& L = j.left->rows;
+  const auto& R = j.right->rows;
+  const std::size_t nR = j.right->columns.size();
+  std::vector<std::vector<Value>> out;
+  std::vector<int> lKeys, rKeys;
+  if (joinIsHashable(j, s, lKeys, rKeys)) {
+    auto keyOf = [&](const std::vector<Value>& row, std::size_t off,
+                     const std::vector<int>& keys, std::string& k) -> bool {
+      k.clear();
+      for (int ki : keys) {
+        const Value& v = row[off + static_cast<std::size_t>(ki)];
+        if (valueIsNull(v)) return false;  // NULL-Key matcht nie
+        k += groupKeyField(v);
+      }
+      return true;
+    };
+    struct Pair {
+      std::size_t li = 0;
+      std::size_t ri = 0;
+    };
+    std::vector<Pair> pairs;
+    if (L.size() <= R.size()) {
+      std::unordered_map<std::string, std::vector<std::size_t>> ht;
+      for (std::size_t i = 0; i < L.size(); ++i) {
+        std::string k;
+        if (!keyOf(L[i], 0, lKeys, k)) continue;
+        ht[k].push_back(i);
+      }
+      for (std::size_t ri = 0; ri < R.size(); ++ri) {
+        std::string k;
+        if (!keyOf(R[ri], 0, rKeys, k)) continue;
+        auto it = ht.find(k);
+        if (it == ht.end()) continue;
+        for (auto li : it->second) pairs.push_back(Pair{li, ri});
+      }
+      // Build-Seite war links (Probe rechts-major) -> links-major
+      // wiederherstellen.
+      std::stable_sort(pairs.begin(), pairs.end(),
+                       [](const Pair& a, const Pair& b) {
+                         if (a.li != b.li) return a.li < b.li;
+                         return a.ri < b.ri;
+                       });
+    } else {
+      std::unordered_map<std::string, std::vector<std::size_t>> ht;
+      for (std::size_t i = 0; i < R.size(); ++i) {
+        std::string k;
+        if (!keyOf(R[i], 0, rKeys, k)) continue;
+        ht[k].push_back(i);
+      }
+      for (std::size_t li = 0; li < L.size(); ++li) {
+        std::string k;
+        if (!keyOf(L[li], 0, lKeys, k)) continue;
+        auto it = ht.find(k);
+        if (it == ht.end()) continue;
+        for (auto ri : it->second) pairs.push_back(Pair{li, ri});
+      }
+      // Probe war links -> bereits links-major.
+    }
+    out.reserve(pairs.size());
+    for (auto& p : pairs) {
+      std::vector<Value> c;
+      c.reserve(j.nL + nR);
+      c.insert(c.end(), L[p.li].begin(), L[p.li].end());
+      c.insert(c.end(), R[p.ri].begin(), R[p.ri].end());
+      out.push_back(std::move(c));
+    }
+    return out;
+  }
+  for (std::size_t li = 0; li < L.size(); ++li) {
+    for (std::size_t ri = 0; ri < R.size(); ++ri) {
+      std::vector<Value> c;
+      c.reserve(j.nL + nR);
+      c.insert(c.end(), L[li].begin(), L[li].end());
+      c.insert(c.end(), R[ri].begin(), R[ri].end());
+      bool ok = true;
+      for (auto& cd : s.join_on)
+        if (!evalJoinOnCond(j, c, cd)) {
+          ok = false;
+          break;
+        }
+      if (ok) out.push_back(std::move(c));
+    }
+  }
+  return out;
+}
+
+// ORDER BY auf ungefiltert-projizierten Plain-Combined-Rows (vor Projektion):
+// Aufloesung je Item wie sortPlainRows (Ausgabe-Alias/Spalte zuerst, dann
+// Combined-Spalte; Dubletten unqualifiziert -> ambiguous). Stabil.
+void sortJoinPlainRows(const JoinCtx& j,
+                       std::vector<std::vector<Value>>& kept,
+                       const SelectStmt& s, const std::vector<int>& projIdx,
+                       const std::vector<std::string>& outNames) {
+  struct Key {
+    int col = -1;
+    bool desc = false;
+    bool nulls_first = false;
+  };
+  auto resolveName = [&](const std::string& name) -> int {
+    int found = -1;
+    bool amb = false;
+    for (std::size_t i = 0; i < outNames.size(); ++i) {
+      if (foldIdent(outNames[i]) == foldIdent(name)) {
+        int ci = projIdx[i];
+        if (found < 0)
+          found = ci;
+        else if (found != ci) {
+          amb = true;
+          break;
+        }
+      }
+    }
+    if (amb)
+      throw SqlError("Mehrdeutige Spalte in ORDER BY: " + name +
+                     " (ambiguous)");
+    if (found >= 0) return found;
+    return resolveJoinCol(j, name);
+  };
+  auto resolveOrdinal = [&](int64_t ord) -> int {
+    if (ord < 1 || static_cast<std::size_t>(ord) > projIdx.size())
+      throw SqlError("ORDER BY-Position ausserhalb der Projektion");
+    return projIdx[static_cast<std::size_t>(ord - 1)];
+  };
+  std::vector<Key> keys;
+  keys.reserve(s.order_by.size());
+  for (auto& o : s.order_by) {
+    Key k;
+    k.desc = o.desc;
+    k.nulls_first = o.has_nulls ? o.nulls_first : o.desc;
+    if (o.is_agg)
+      throw SqlError(
+          "ORDER BY mit Aggregat nur mit GROUP BY oder Aggregat-Projektion");
+    else if (o.is_ordinal)
+      k.col = resolveOrdinal(o.ordinal);
+    else
+      k.col = resolveName(o.column);
+    keys.push_back(k);
+  }
+  std::stable_sort(kept.begin(), kept.end(),
+                   [&](const std::vector<Value>& a,
+                       const std::vector<Value>& b) {
+                     for (auto& k : keys) {
+                       int c = compareOrdered(
+                           a[static_cast<std::size_t>(k.col)],
+                           b[static_cast<std::size_t>(k.col)], k.desc,
+                           k.nulls_first);
+                       if (c != 0) return c < 0;
+                     }
+                     return false;
+                   });
+}
+
+// ORDER BY auf gruppierten Join-Results (nach Aggregation): Aufloesung wie
+// sortGroupedRows (Ausgabe, GROUP BY-Key per Combined-Index, berechnetes
+// Aggregat). Unsortiert bleibt First-Seen-Reihenfolge. Stabil.
+void sortJoinGroupedRows(const JoinCtx& j, const std::vector<Group>& groups,
+                         const std::vector<int>& gidx, const SelectStmt& s,
+                         Result& r) {
+  std::vector<GroupOrderKey> keys;
+  keys.reserve(s.order_by.size());
+  for (auto& o : s.order_by) {
+    GroupOrderKey k;
+    k.desc = o.desc;
+    k.nulls_first = o.has_nulls ? o.nulls_first : o.desc;
+    if (o.is_ordinal) {
+      if (o.ordinal < 1 ||
+          static_cast<std::size_t>(o.ordinal) > r.columns.size())
+        throw SqlError("ORDER BY-Position ausserhalb der Projektion");
+      k.kind = GroupOrderKey::Kind::Result;
+      k.pos = static_cast<std::size_t>(o.ordinal - 1);
+    } else if (o.is_agg) {
+      int rpos = -1;
+      for (std::size_t i = 0; i < r.columns.size(); ++i)
+        if (foldIdent(r.columns[i]) == foldIdent(o.agg.display)) {
+          rpos = static_cast<int>(i);
+          break;
+        }
+      if (rpos >= 0) {
+        k.kind = GroupOrderKey::Kind::Result;
+        k.pos = static_cast<std::size_t>(rpos);
+      } else {
+        k.kind = GroupOrderKey::Kind::Computed;
+        k.agg = o.agg;
+      }
+    } else {
+      int rpos = -1;
+      for (std::size_t i = 0; i < r.columns.size(); ++i)
+        if (foldIdent(r.columns[i]) == foldIdent(o.column)) {
+          rpos = static_cast<int>(i);
+          break;
+        }
+      if (rpos >= 0) {
+        k.kind = GroupOrderKey::Kind::Result;
+        k.pos = static_cast<std::size_t>(rpos);
+      } else {
+        int ci = resolveJoinCol(j, o.column);
+        int gpos = -1;
+        for (std::size_t i = 0; i < gidx.size(); ++i)
+          if (gidx[i] == ci) {
+            gpos = static_cast<int>(i);
+            break;
+          }
+        if (gpos < 0)
+          throw SqlError("Unbekannte Spalte in ORDER BY: " + o.column);
+        k.kind = GroupOrderKey::Kind::GroupKey;
+        k.pos = static_cast<std::size_t>(gpos);
+      }
+    }
+    keys.push_back(std::move(k));
+  }
+  std::size_t n = r.rows.size();
+  std::vector<std::vector<Value>> kvals(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    kvals[i].reserve(keys.size());
+    for (auto& k : keys) {
+      if (k.kind == GroupOrderKey::Kind::Result)
+        kvals[i].push_back(r.rows[i][k.pos]);
+      else if (k.kind == GroupOrderKey::Kind::GroupKey)
+        kvals[i].push_back(groups[i].key[k.pos]);
+      else
+        kvals[i].push_back(computeJoinAggregate(j, groups[i].rows, k.agg));
+    }
+  }
+  std::vector<std::size_t> idx(n);
+  for (std::size_t i = 0; i < n; ++i) idx[i] = i;
+  std::stable_sort(idx.begin(), idx.end(),
+                   [&](std::size_t a, std::size_t b) {
+                     for (std::size_t m = 0; m < keys.size(); ++m) {
+                       int c = compareOrdered(kvals[a][m], kvals[b][m],
+                                              keys[m].desc,
+                                              keys[m].nulls_first);
+                       if (c != 0) return c < 0;
+                     }
+                     return false;
+                   });
+  std::vector<std::vector<Value>> sorted;
+  sorted.reserve(n);
+  for (auto i : idx) sorted.push_back(std::move(r.rows[i]));
+  r.rows = std::move(sorted);
+}
+
+// ORDER BY-Validierung auf 1-zeiligen Join-Aggregat-Results (No-Op wie
+// validateOrderScalar, join-bewusst).
+void validateOrderJoinScalar(
+    const JoinCtx& j, const std::vector<std::vector<Value>>& kept,
+    const SelectStmt& s, const Result& r) {
+  for (auto& o : s.order_by) {
+    if (o.is_ordinal) {
+      if (o.ordinal < 1 ||
+          static_cast<std::size_t>(o.ordinal) > r.columns.size())
+        throw SqlError("ORDER BY-Position ausserhalb der Projektion");
+    } else if (o.is_agg) {
+      bool known = false;
+      for (auto& a : s.aggregates)
+        if (a.display == o.agg.display && a.func == o.agg.func) {
+          known = true;
+          break;
+        }
+      if (!known) {
+        std::vector<const std::vector<Value>*> refs;
+        refs.reserve(kept.size());
+        for (auto& row : kept) refs.push_back(&row);
+        (void)computeJoinAggregate(j, refs, o.agg);
+      }
+    } else {
+      bool ok = false;
+      for (auto& c : r.columns)
+        if (foldIdent(c) == foldIdent(o.column)) {
+          ok = true;
+          break;
+        }
+      if (!ok) throw SqlError("Unbekannte Spalte in ORDER BY: " + o.column);
+    }
+  }
+}
+
+// Ein-Zeilen-Result ueber Join (Semantik wie execScalarAggregates).
+Result execJoinScalarAggregates(
+    const JoinCtx& j, const std::vector<std::vector<Value>>& kept,
+    const SelectStmt& s) {
+  Result r;
+  r.columns.reserve(s.aggregates.size());
+  for (auto& a : s.aggregates)
+    r.columns.push_back(a.alias.empty() ? a.display : a.alias);
+  std::vector<const std::vector<Value>*> refs;
+  refs.reserve(kept.size());
+  for (auto& row : kept) refs.push_back(&row);
+  std::vector<Value> out;
+  out.reserve(s.aggregates.size());
+  for (auto& a : s.aggregates)
+    out.push_back(computeJoinAggregate(j, refs, a));
+  r.rows.push_back(std::move(out));
+  validateOrderJoinScalar(j, kept, s, r);
+  applyLimitOffset(r, s);
+  return r;
+}
+
+// Hash-Aggregation ueber Join (Semantik wie execGroupedAggregates:
+// First-Seen, leere Eingabe -> 0 Zeilen, Plain-Spalten muessen gruppiert
+// sein; Vergleich per Combined-Index, daher ist "id" GROUP BY "a.id"
+// dieselbe Spalte).
+Result execJoinGroupedAggregates(
+    const JoinCtx& j, const std::vector<std::vector<Value>>& kept,
+    const SelectStmt& s) {
+  if (s.select_all || s.count_star)
+    throw SqlError("SELECT * / COUNT(*) mit GROUP BY wird nicht unterstuetzt");
+  std::vector<int> gidx;
+  gidx.reserve(s.group_by.size());
+  for (auto& g : s.group_by) gidx.push_back(resolveJoinCol(j, g));
+  for (auto& c : s.columns) {
+    int ci = resolveJoinCol(j, c);
+    bool ok = false;
+    for (int gi : gidx)
+      if (gi == ci) {
+        ok = true;
+        break;
+      }
+    if (!ok)
+      throw SqlError("Spalte '" + c + "' muss in GROUP BY erscheinen");
+  }
+  std::vector<Group> groups;
+  std::unordered_map<std::string, std::size_t> pos;
+  for (auto& row : kept) {
+    std::string k;
+    std::vector<Value> kv;
+    kv.reserve(gidx.size());
+    for (int gi : gidx) {
+      const Value& v = row[static_cast<std::size_t>(gi)];
+      kv.push_back(v);
+      k += groupKeyField(v);
+    }
+    auto it = pos.find(k);
+    if (it == pos.end()) {
+      std::size_t id = groups.size();
+      pos.emplace(k, id);
+      Group g;
+      g.key = std::move(kv);
+      g.rows.push_back(&row);
+      groups.push_back(std::move(g));
+    } else {
+      groups[it->second].rows.push_back(&row);
+    }
+  }
+  std::vector<std::size_t> colPos;
+  colPos.reserve(s.columns.size());
+  for (auto& c : s.columns) {
+    int ci = resolveJoinCol(j, c);
+    std::size_t p = 0;
+    for (; p < gidx.size(); ++p)
+      if (gidx[p] == ci) break;
+    colPos.push_back(p);
+  }
+  std::vector<SelectItem> items = s.items;
+  if (items.empty()) {
+    for (std::size_t i = 0; i < s.columns.size(); ++i)
+      items.push_back(SelectItem{false, i});
+    for (std::size_t i = 0; i < s.aggregates.size(); ++i)
+      items.push_back(SelectItem{true, i});
+  }
+  Result r;
+  r.columns.reserve(items.size());
+  for (auto& it : items) {
+    if (it.is_agg) {
+      if (it.index >= s.aggregates.size())
+        throw SqlError("Ungueltige Projektion (Aggregat-Index)");
+      const Aggregate& a = s.aggregates[it.index];
+      r.columns.push_back(a.alias.empty() ? a.display : a.alias);
+    } else {
+      if (it.index >= s.columns.size())
+        throw SqlError("Ungueltige Projektion (Spalten-Index)");
+      int idx = resolveJoinCol(j, s.columns[it.index]);
+      std::string alias;
+      if (it.index < s.column_aliases.size()) alias = s.column_aliases[it.index];
+      r.columns.push_back(alias.empty() ? joinColName(j, idx) : alias);
+    }
+  }
+  for (auto& g : groups) {
+    std::vector<Value> out;
+    out.reserve(items.size());
+    for (auto& it : items) {
+      if (it.is_agg) {
+        out.push_back(computeJoinAggregate(j, g.rows, s.aggregates[it.index]));
+      } else {
+        out.push_back(g.key[colPos[it.index]]);
+      }
+    }
+    r.rows.push_back(std::move(out));
+  }
+  if (!s.order_by.empty()) sortJoinGroupedRows(j, groups, gidx, s, r);
+  applyLimitOffset(r, s);
+  return r;
+}
+
+// Join-Treiber: Join -> WHERE -> Gruppe/Aggregat/Plain -> ORDER/LIMIT.
+Result execJoinSelect(const JoinCtx& j, const SelectStmt& s) {
+  std::vector<std::vector<Value>> joined = execJoinRows(j, s);
+  std::vector<std::vector<Value>> kept;
+  kept.reserve(joined.size());
+  for (auto& row : joined)
+    if (evalJoinWhere(j, row, s)) kept.push_back(row);
+  if (!s.group_by.empty()) {
+    return execJoinGroupedAggregates(j, kept, s);
+  }
+  if (s.count_star) {
+    Result r{{"count"}, {{Value{static_cast<int64_t>(kept.size())}}},
+             "SELECT 1", std::size_t{1}};
+    validateOrderJoinScalar(j, kept, s, r);
+    applyLimitOffset(r, s);
+    return r;
+  }
+  if (!s.aggregates.empty()) {
+    if (!s.columns.empty() || s.select_all)
+      throw SqlError(
+          "Ohne GROUP BY: Aggregate (SUM/AVG/MIN/MAX/COUNT) und Spalten nicht "
+          "mischbar");
+    return execJoinScalarAggregates(j, kept, s);
+  }
+  std::vector<int> idxs;
+  std::vector<std::string> cols;
+  if (s.select_all) {
+    for (std::size_t i = 0; i < j.nL + j.right->columns.size(); ++i) {
+      idxs.push_back(static_cast<int>(i));
+      if (i < j.nL)
+        cols.push_back(j.left->columns[i].name);
+      else
+        cols.push_back(j.right->columns[i - j.nL].name);
+    }
+  } else {
+    for (std::size_t i = 0; i < s.columns.size(); ++i) {
+      auto& c = s.columns[i];
+      int idx = resolveJoinCol(j, c);
+      idxs.push_back(idx);
+      std::string alias;
+      if (i < s.column_aliases.size()) alias = s.column_aliases[i];
+      cols.push_back(alias.empty() ? joinColName(j, idx) : alias);
+    }
+  }
+  Result r;
+  r.columns = cols;
+  if (!s.order_by.empty()) sortJoinPlainRows(j, kept, s, idxs, cols);
+  for (auto& row : kept) {
+    std::vector<Value> o;
+    o.reserve(idxs.size());
+    for (int i : idxs) o.push_back(row[static_cast<std::size_t>(i)]);
+    r.rows.push_back(std::move(o));
+  }
+  applyLimitOffset(r, s);
+  return r;
+}
+
 }  // namespace
 
 // ---------- Oeffentliche API ----------
@@ -1697,6 +2564,29 @@ Result Database::execInsert(const InsertStmt& s) {
 }
 
 Result Database::execSelect(const SelectStmt& s) {
+  if (s.has_join) {
+    auto lit = tables_.find(foldIdent(s.table));
+    if (lit == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+    auto rit = tables_.find(foldIdent(s.join_table));
+    if (rit == tables_.end())
+      throw SqlError("Tabelle unbekannt: " + s.join_table);
+    JoinCtx j;
+    j.left = &lit->second;
+    j.right = &rit->second;
+    j.lTable = s.table;
+    j.rTable = s.join_table;
+    j.lEff = s.table_alias.empty() ? s.table : s.table_alias;
+    j.rEff = s.join_alias.empty() ? s.join_table : s.join_alias;
+    j.nL = j.left->columns.size();
+    // Defensive Huerde fuer handgebaute Statements (Parser prueft schaerfer).
+    if (foldIdent(j.lEff) == foldIdent(j.rEff))
+      throw SqlError(
+          "JOIN braucht disjunkte Tabellen-Aliase (Self-Join: FROM t AS x "
+          "JOIN t AS y ...)");
+    if (s.join_on.empty())
+      throw SqlError("JOIN ohne ON wird nicht unterstuetzt");
+    return execJoinSelect(j, s);
+  }
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
   const Table& t = it->second;

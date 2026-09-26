@@ -123,7 +123,12 @@ class Part {
                            std::vector<int64_t>* out_ints,
                            std::vector<std::string>* out_strs);
 
-  // s24: persistentes Part-File COL1 (Header + RLE-Ints + Dict-Strings).
+  // s24: persistentes Part-File COL1 (Header + RLE-Ints + Dict-Strings)
+  // + COL2 (Header + FOR/Bitpacking-Ints + Dict-Strings, STL-only).
+  // Save schreibt COL2; Load liest COL1 (Fallback) UND COL2.
+  // COL2-Int-Layout: u32 bitwidth | u64 nwords | nwords x u64 LE-Worte;
+  // Deltas = value - min (mod 2^64), LSB-first bitgepackt, bitwidth =
+  // bit_width(max_delta) (0 => alle == min, keine Worte). Roundtrip exakt.
   // Save/Load sind roundtrip-treu (id/name/Rows/Zonemaps). Load gibt
   // versiegelten Part zurueck.
   bool Save(const std::string& path) const;

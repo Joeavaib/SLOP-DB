@@ -123,6 +123,51 @@ inline void write_record(int fd, const char hdr[20], const char* payload,
   writev_all(fd, iov, cnt);
 }
 
+// Audit-Konvention (s. wal.h): Escaping pro Feld.
+std::string audit_escape(std::string_view s) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    if (c == '\\') {
+      out.push_back('\\');
+      out.push_back('\\');
+    } else if (c == '\n') {
+      out.push_back('\\');
+      out.push_back('n');
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+// Rueckgabe false bei ungueltiger Escape-Sequenz (inkl. einsamer '\\' am
+// Ende oder rohem '\n' im Feld — Felder duerfen nach Split kein rohes '\n'
+// mehr enthalten).
+bool audit_unescape(std::string_view in, std::string& out) {
+  out.clear();
+  out.reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    char c = in[i];
+    if (c == '\\') {
+      if (i + 1 >= in.size()) return false;
+      char n = in[i + 1];
+      if (n == '\\')
+        out.push_back('\\');
+      else if (n == 'n')
+        out.push_back('\n');
+      else
+        return false;  // unbekannte Escape-Sequenz -> strikt ablehnen
+      ++i;
+    } else if (c == '\n') {
+      return false;  // rohes '\n' gehoert nicht in ein Feld
+    } else {
+      out.push_back(c);
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 Wal::Wal(std::string path) : path_(std::move(path)) {}
@@ -415,6 +460,72 @@ std::vector<WalRecord> Wal::read_from(uint64_t from_lsn, size_t max_records) {
   for (auto& r : all) {
     if (r.lsn < from_lsn) continue;
     out.push_back(std::move(r));
+    if (max_records && out.size() >= max_records) break;
+  }
+  return out;
+}
+
+uint64_t Wal::append_audit(std::string_view actor, std::string_view action,
+                           std::string_view detail) {
+  // Ausserhalb des Locks encodieren; append() lockt + prueft kMaxPayload.
+  std::string payload;
+  payload.reserve(5 + actor.size() + action.size() + detail.size() + 2);
+  payload += "AUD1\n";
+  payload += audit_escape(actor);
+  payload.push_back('\n');
+  payload += audit_escape(action);
+  payload.push_back('\n');
+  payload += audit_escape(detail);
+  return append(payload);
+}
+
+std::optional<AuditEvent> parse_audit(const WalRecord& rec) {
+  constexpr std::string_view kPrefix = "AUD1\n";
+  std::string_view data(rec.data);
+  if (data.size() < kPrefix.size() || data.substr(0, kPrefix.size()) != kPrefix)
+    return std::nullopt;  // strikter Prefix-Match, sonst skip
+  std::string_view rest = data.substr(kPrefix.size());
+  // Trennzeichen: unescapte '\n' (auf '\\' folgt immer genau ein Zeichen).
+  size_t sep1 = std::string_view::npos;
+  size_t sep2 = std::string_view::npos;
+  for (size_t i = 0; i < rest.size(); ++i) {
+    char c = rest[i];
+    if (c == '\\') {
+      if (i + 1 >= rest.size()) return std::nullopt;  // einsamer '\\'
+      ++i;  // escaptes Zeichen ueberspringen (Gueltigkeit prueft unescape)
+      continue;
+    }
+    if (c == '\n') {
+      if (sep1 == std::string_view::npos)
+        sep1 = i;
+      else if (sep2 == std::string_view::npos)
+        sep2 = i;
+      else
+        return std::nullopt;  // mehr als 2 Trennzeichen -> kein AUD1-Format
+    }
+  }
+  if (sep1 == std::string_view::npos || sep2 == std::string_view::npos)
+    return std::nullopt;  // zu wenige Felder
+  std::string_view f_actor = rest.substr(0, sep1);
+  std::string_view f_action = rest.substr(sep1 + 1, sep2 - sep1 - 1);
+  std::string_view f_detail = rest.substr(sep2 + 1);
+  AuditEvent ev;
+  ev.lsn = rec.lsn;
+  if (!audit_unescape(f_actor, ev.actor)) return std::nullopt;
+  if (!audit_unescape(f_action, ev.action)) return std::nullopt;
+  if (!audit_unescape(f_detail, ev.detail)) return std::nullopt;
+  return ev;
+}
+
+std::vector<AuditEvent> Wal::read_audit(uint64_t from_lsn, size_t max_records) {
+  // read_from()/replay() locken intern; hier nicht halten.
+  std::vector<WalRecord> all = read_from(from_lsn, 0);
+  std::vector<AuditEvent> out;
+  out.reserve(all.size());
+  for (const auto& r : all) {
+    auto ev = parse_audit(r);
+    if (!ev) continue;  // Nicht-AUD1 (strikter Prefix-Match) -> skip
+    out.push_back(std::move(*ev));
     if (max_records && out.size() >= max_records) break;
   }
   return out;

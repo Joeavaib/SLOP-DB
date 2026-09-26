@@ -475,29 +475,51 @@ Result Executor::execSelect(const SelectStmt& s) {
   auto it = tables_.find(norm);
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
   const TableSchema& sch = it->second;
-
-  // Snapshot-Read: Key-Menge aus KV-Snapshot, Werte aus MVCC-Snapshot.
-  auto snap = kv_.GetSnapshot();
-  auto kvs = snap->Scan(tablePrefix(norm));
-
-  txn::Transaction rtxn = mvcc_.BeginRead();
-  std::vector<std::vector<Value>> allRows;
-  allRows.reserve(kvs.size());
-  for (auto& [k, v] : kvs) {
-    (void)v;  // Key-Menge aus KV, Wert NUR aus MVCC (kein KV-Fallback).
-    // Dirty-Read-Fix: KV-only Keys ohne committed MVCC-Version sind unsichtbar.
-    auto mv = mvcc_.Read(rtxn, k);
-    if (!mv.has_value()) continue;
-    const std::string& enc = *mv;
-    try {
-      allRows.push_back(decodeRow(enc, sch.columns.size()));
-    } catch (...) {
-      continue;  // korrupte Zeile ueberspringen (sollte nicht passieren)
-    }
+  // Rechte Join-Seite ggf. vorab aufloesen (Fehler vor dem Snapshot-Read).
+  const TableSchema* rsch = nullptr;
+  std::string rnorm;
+  const bool needRight =
+      s.has_join && normalizeTable(s.join_table) != norm;
+  if (s.has_join && !needRight) {
+    // Self-Join (gleiche Tabelle): rechte Seite = linke (ein Scan genuegt).
+    rsch = &sch;
+    rnorm = norm;
+  } else if (s.has_join) {
+    rnorm = normalizeTable(s.join_table);
+    auto jt = tables_.find(rnorm);
+    if (jt == tables_.end())
+      throw SqlError("Tabelle unbekannt: " + s.join_table);
+    rsch = &jt->second;
   }
+
+  // Snapshot-Read: Key-Mengen aus EINEM KV-Snapshot, Werte aus EINEM
+  // MVCC-Snapshot (beide Seiten konsistent). Sichtbar NUR bei committed
+  // MVCC-Version (kein KV-Fallback-Dirty-Read).
+  auto snap = kv_.GetSnapshot();
+  txn::Transaction rtxn = mvcc_.BeginRead();
+  auto loadRows = [&](const std::string& tnorm, const TableSchema& sc) {
+    std::vector<std::vector<Value>> rows;
+    auto kvs = snap->Scan(tablePrefix(tnorm));
+    rows.reserve(kvs.size());
+    for (auto& [k, v] : kvs) {
+      (void)v;  // Key-Menge aus KV, Wert NUR aus MVCC.
+      auto mv = mvcc_.Read(rtxn, k);
+      if (!mv.has_value()) continue;
+      const std::string& enc = *mv;
+      try {
+        rows.push_back(decodeRow(enc, sc.columns.size()));
+      } catch (...) {
+        continue;  // korrupte Zeile ueberspringen (sollte nicht passieren)
+      }
+    }
+    return rows;
+  };
+  std::vector<std::vector<Value>> allRows = loadRows(norm, sch);
+  std::vector<std::vector<Value>> allRRows;
+  if (needRight) allRRows = loadRows(rnorm, *rsch);
   mvcc_.Commit(rtxn);
 
-  // Filter/Projektion/COUNT(*) an In-Memory-Database delegieren
+  // Filter/Projektion/JOIN an In-Memory-Database delegieren
   // (parser-kompatible Semantik: =, <>, LIKE/ILIKE, AND, IS NULL ...).
   Database tmp;
   tmp.execCreate(CreateTableStmt{s.table, sch.columns, false});
@@ -506,6 +528,15 @@ Result Executor::execSelect(const SelectStmt& s) {
     ins.table = s.table;
     ins.rows = allRows;
     tmp.execInsert(ins);
+  }
+  if (needRight) {
+    tmp.execCreate(CreateTableStmt{s.join_table, rsch->columns, false});
+    if (!allRRows.empty()) {
+      InsertStmt ins;
+      ins.table = s.join_table;
+      ins.rows = allRRows;
+      tmp.execInsert(ins);
+    }
   }
   return tmp.execSelect(s);
 }
