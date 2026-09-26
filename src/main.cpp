@@ -48,6 +48,11 @@ void printHelp(const char* prog) {
       << "    oder anderer Pfad) startet die DB leer; WAL-Verlust =\n"
       << "    Datenverlust. Ein abgerissener WAL-Tail wird toleriert\n"
       << "    (gueltiges Prefix gewinnt).\n"
+      << "  - Mirror-Checkpoint: <db-datei>.btree (BTreeKV-Sidecar, Latest-\n"
+      << "    State je Key + Spiegel-LSN) wird pro WAL-Flush inkrementell\n"
+      << "    nachgezogen; beim Start wird daraus geladen und nur der\n"
+      << "    WAL-Tail (lsn > Spiegel-LSN) replayt. Fehlt/korrupt -> Voll-\n"
+      << "    Replay + Warnung (WAL bleibt Wahrheit, kein Datenverlust).\n"
       << "\nREPL:\n"
       << "  .quit / .exit beendet, leere Zeilen werden ignoriert, SQL-Fehler\n"
       << "  werden gedruckt und der REPL laeuft weiter, EOF (Ctrl-D) beendet.\n"
@@ -343,6 +348,26 @@ int main(int argc, char** argv) {
     return 1;
   }
   dbengine::sql::Executor ex(kv, mvcc, &wal);
+  // Mirror-Checkpoint-Sidecar (<db>.btree) tolerant aktivieren: Fehler
+  // (fehlend/korrupt) -> Voll-Replay + Warnung, nie Datenverlust.
+  const std::string mirror_path = db_path + ".btree";
+  try {
+    std::string mirror_warn;
+    const bool mirror_ok = ex.enableMirror(mirror_path, &mirror_warn);
+    if (!mirror_ok) {
+      std::cerr << prog << ": Warnung: Spiegel '" << mirror_path
+                << "' nicht aktiv"
+                << (mirror_warn.empty() ? "" : (": " + mirror_warn))
+                << "; Voll-Replay aus WAL\n";
+    } else if (!mirror_warn.empty()) {
+      std::cerr << prog << ": Warnung: Spiegel '" << mirror_path
+                << "': " << mirror_warn
+                << " (Voll-Replay, Spiegel wird geheilt)\n";
+    }
+  } catch (const std::exception& e) {
+    std::cerr << prog << ": Warnung: Spiegel '" << mirror_path << "' Fehler ("
+              << e.what() << "); Voll-Replay aus WAL\n";
+  }
   try {
     const std::size_t skipped = ex.recover();
     if (skipped != 0) {

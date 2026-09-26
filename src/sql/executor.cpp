@@ -2,12 +2,15 @@
 
 #include "dbengine/sql/executor.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <iomanip>
 #include <limits>
 #include <map>
 #include <set>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -585,6 +588,275 @@ std::vector<Value> decodeRowSelected(const std::string& s, std::size_t ncols,
 Executor::Executor(kv::KVStore& kv, txn::MvccStore& mvcc, storage::Wal* wal)
     : kv_(kv), mvcc_(mvcc), wal_(wal) {}
 
+Executor::~Executor() { disableMirror(); }
+
+// ---- Mirror-Checkpoint: Format + Protokoll ----------------------------------
+// Spiegel-Format (BTreeKV-Sidecar, geordnetes Latest-State-Abbild):
+//   - Row-/Schema-Keys 1:1 wie im KVStore: "sql/<tabelle>/<pk>" -> Row-Codec,
+//     "sql/__schema/<tabelle>" -> Schema-Codec (kein Format-Bruch, dieselben
+//     Codec-Helper wie live).
+//   - Meta-Key "\0mirror/lsn" (fuehrendes NUL: kann mit keinem "sql/..."-Key
+//     kollidieren, faellt aus keinem Prefix-Scan) -> dezimale durable-LSN, bis
+//     zu der der Spiegel den WAL 1:1 abbildet (mirror_lsn).
+// Inkrementell-Protokoll: Statements spiegeln ihren gerade geschriebenen
+// Batch via syncMirrorBatch (O(Batch), kein WAL-Re-Read); recover() nutzt
+// syncMirrorFromWal (Vollscan, selten) als Catch-up.
+// Reihenfolge auf den Spiegel an (Put/Delete 1:1, DROP = Prefix-Delete +
+// Schema-Delete); danach mirror_lsn = durable in EINEM BTreeKV-Flush
+// (Shadow-Paging -> atomar: Crash davor = alter Spiegel + alte LSN =
+// konsistent, Tail-Replay holt den Rest).
+// Sichtbarkeits-Regel beim Laden: Rows werden als frische Single-Version-
+// Ketten unter je einem Chunk-Commit installiert (committed, trx_end = INF);
+// im frischen Prozess ohne aktive Txns ist jede committed Version fuer jeden
+// zukuenftigen Snapshot sichtbar (trx_begin <= snapshot). Tombstones/DROP-
+// States existieren im Spiegel nicht als Historie, sondern als Abwesenheit
+// (Latest-State) -> identische Sichtbarkeit wie Voll-Replay ohne aktive Txns.
+namespace {
+constexpr std::string_view kMirrorLsnKey{"\0mirror/lsn", 11};
+constexpr std::string_view kMirrorMetaPrefix{"\0mirror/", 8};
+constexpr std::string_view kMirrorSchemaPrefix{"sql/__schema/", 13};
+constexpr std::string_view kMirrorSqlPrefix{"sql/", 4};
+constexpr std::size_t kMirrorLoadChunk = 4096;
+}  // namespace
+
+bool Executor::enableMirror(const std::string& path, std::string* warn) {
+  auto note = [&](const std::string& m) {
+    if (warn != nullptr) {
+      if (!warn->empty()) *warn += "; ";
+      *warn += m;
+    }
+  };
+  try {
+    auto bt = std::make_unique<kv::BTreeKV>();
+    if (!bt->Open(path)) {
+      note("Spiegel '" + path + "' nicht oeffbar");
+      return false;
+    }
+    std::uint64_t lsn = 0;
+    bool degraded = false;
+    if (auto v = bt->Get(std::string(kMirrorLsnKey))) {
+      try {
+        lsn = std::stoull(*v);
+      } catch (...) {
+        degraded = true;
+        note("Spiegel-LSN korrupt");
+        lsn = 0;
+      }
+    }
+    try {
+      const auto all = bt->Scan("");
+      // Pass 1: Schemas zuerst (Rows brauchen bekannte Tabellen, wie recover).
+      std::vector<std::pair<std::string, std::string>> rows;
+      rows.reserve(all.size());
+      for (const auto& [k, v] : all) {
+        const std::string_view kvw(k);
+        if (kvw.starts_with(kMirrorMetaPrefix)) continue;
+        if (kvw.starts_with(kMirrorSchemaPrefix)) {
+          try {
+            applyCreateRecord(
+                std::string(kvw.substr(kMirrorSchemaPrefix.size())), v);
+          } catch (...) {
+            degraded = true;
+            note("korrupter Schema-Eintrag im Spiegel");
+          }
+        } else if (kvw.starts_with(kMirrorSqlPrefix)) {
+          rows.emplace_back(k, v);
+        } else {
+          degraded = true;  // fremder Key: sicherheitshalber Voll-Replay
+          note("fremder Key im Spiegel");
+        }
+      }
+      // Pass 2: nur Rows bekannter Tabellen laden (recover skipt INSERTs ohne
+      // Schema; Phantom-Rows duerfen bei spaeterem CREATE nicht erscheinen).
+      std::vector<std::string> prefixes;
+      prefixes.reserve(tables_.size());
+      for (const auto& [t, sch] : tables_) {
+        (void)sch;
+        prefixes.push_back(tablePrefix(t));
+      }
+      std::vector<std::pair<std::string, std::string>> owned;
+      owned.reserve(rows.size());
+      for (auto& [k, v] : rows) {
+        bool known = false;
+        for (const auto& p : prefixes) {
+          if (k.rfind(p, 0) == 0) {
+            known = true;
+            break;
+          }
+        }
+        if (known) owned.emplace_back(std::move(k), std::move(v));
+      }
+      for (std::size_t b = 0; b < owned.size() && !degraded;
+           b += kMirrorLoadChunk) {
+        const std::size_t e = std::min(b + kMirrorLoadChunk, owned.size());
+        kv::WriteBatch batch;
+        for (std::size_t i = b; i < e; ++i)
+          batch.Put(owned[i].first, owned[i].second);
+        if (!kv_.Write(batch)) {
+          degraded = true;
+          note("Spiegel-Rows nicht in KV ladbar");
+          break;
+        }
+        txn::Transaction w = mvcc_.BeginWriteBlocking();
+        bool ok = true;
+        for (std::size_t i = b; i < e; ++i) {
+          if (!mvcc_.Write(w, owned[i].first, owned[i].second)) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) ok = mvcc_.Commit(w);
+        if (!ok) {
+          mvcc_.Abort(w);
+          degraded = true;
+          note("Spiegel-Rows nicht in MVCC ladbar");
+          break;
+        }
+      }
+      for (const auto& [t, sch] : tables_) {
+        (void)sch;
+        rebuildReplicaForTable(t);
+      }
+    } catch (...) {
+      degraded = true;
+      note("Spiegel-Scan fehlgeschlagen");
+    }
+    // Degradiert: mirror_lsn = 0 -> Voll-Replay; WAL-Truth (last-wins)
+    // ueberschreibt jeden geladenen Spiegel-Stand -> nie Datenverlust.
+    if (degraded) lsn = 0;
+    mirror_ = std::move(bt);
+    mirror_path_ = path;
+    mirror_lsn_ = lsn;
+    mirror_on_ = true;
+    return true;
+  } catch (...) {
+    note("Spiegel-Aktivierung fehlgeschlagen");
+    return false;
+  }
+}
+
+void Executor::disableMirror() {
+  try {
+    if (mirror_) mirror_->Close();  // best effort Flush (BTreeKV::Close)
+  } catch (...) {
+  }
+  mirror_.reset();
+  mirror_path_.clear();
+  mirror_lsn_ = 0;
+  mirror_on_ = false;
+}
+
+bool Executor::applyMirrorRecord(const std::string& data) {
+  auto parts = splitWal(data);
+  if (parts.empty()) return true;  // recover skipt -> kein State -> Advance ok
+  const std::string schemaPfx(kMirrorSchemaPrefix);
+  if (parts[0] == "C" && parts.size() == 3) {
+    try {
+      (void)schemaDecode(parts[2]);  // validieren wie recover
+    } catch (...) {
+      return true;
+    }
+    return mirror_->Put(schemaPfx + normalizeTable(parts[1]), parts[2]);
+  }
+  if ((parts[0] == "I" || parts[0] == "U") && parts.size() == 4) {
+    const std::string norm = normalizeTable(parts[1]);
+    if (!mirror_->Get(schemaPfx + norm).has_value()) return true;  // Skip wie recover
+    std::string key;
+    try {
+      key = walUnescape(parts[2]);
+    } catch (...) {
+      return true;
+    }
+    return mirror_->Put(key, parts[3]);
+  }
+  if (parts[0] == "D" && parts.size() == 3) {
+    const std::string norm = normalizeTable(parts[1]);
+    if (!mirror_->Get(schemaPfx + norm).has_value()) return true;  // Skip wie recover
+    std::string key;
+    try {
+      key = walUnescape(parts[2]);
+    } catch (...) {
+      return true;
+    }
+    (void)mirror_->Delete(key);  // missing = idempotenter No-Op
+    return true;
+  }
+  if (parts[0] == "T" && parts.size() == 2) {
+    const std::string norm = normalizeTable(parts[1]);
+    const std::string pfx = tablePrefix(norm);
+    for (const auto& [k, v] : mirror_->Scan(pfx)) {
+      (void)v;
+      (void)mirror_->Delete(k);
+    }
+    (void)mirror_->Delete(schemaPfx + norm);  // DROP: Spiegel-Eintraege weg
+    return true;
+  }
+  return true;  // unbekannter Opcode: recover skipt -> kein State -> Advance ok
+}
+
+void Executor::syncMirrorFromWal() { syncMirrorBatch(nullptr); }
+
+void Executor::syncMirrorBatch(const std::vector<std::string>* batch) {
+  if (!mirror_on_ || !mirror_ || wal_ == nullptr) return;
+  try {
+    if (!mirror_->IsOpen()) return;
+    std::uint64_t durable = 0;
+    try {
+      durable = wal_->durable_lsn();
+    } catch (...) {
+      return;
+    }
+    if (durable <= mirror_lsn_) return;
+    bool from_wal = (batch == nullptr);
+    std::vector<storage::WalRecord> recs;
+    if (from_wal) {
+      try {
+        recs = wal_->read_from(mirror_lsn_ + 1);  // NUR neue Records
+      } catch (...) {
+        return;
+      }
+    }
+    bool all_ok = true;
+    if (from_wal) {
+      for (auto& r : recs) {
+        try {
+          if (!applyMirrorRecord(r.data)) all_ok = false;
+        } catch (...) {
+          all_ok = false;
+        }
+      }
+    } else {
+      for (auto& p : *batch) {
+        try {
+          if (!applyMirrorRecord(p)) all_ok = false;
+        } catch (...) {
+          all_ok = false;
+        }
+      }
+    }
+    if (all_ok) {
+      bool ok = false;
+      try {
+        ok = mirror_->Put(std::string(kMirrorLsnKey),
+                          std::to_string(durable));
+        if (ok) ok = mirror_->Flush();
+      } catch (...) {
+        ok = false;
+      }
+      if (ok) mirror_lsn_ = durable;  // mirror_lsn = durable (atomar geflusht)
+    } else {
+      // Teilsync crashfest machen; Watermark bleibt alt -> Restart replayt
+      // den Tail erneut (last-wins, idempotent).
+      try {
+        (void)mirror_->Flush();
+      } catch (...) {
+      }
+    }
+  } catch (...) {
+    // Spiegel darf Writes niemals scheitern lassen.
+  }
+}
+
 std::string Executor::normalizeTable(const std::string& table) {
   return toLower(table);
 }
@@ -814,6 +1086,8 @@ Result Executor::execute(const std::string& sql) {
     }
     if (hits.empty()) return {{}, {}, "UPDATE 0", 0};
     if (wal_ != nullptr) {
+      std::vector<std::string> mirror_batch;
+      mirror_batch.reserve(hits.size());
       for (const auto& [k, enc] : hits) {
         std::string payload;
         payload += 'U';
@@ -824,8 +1098,10 @@ Result Executor::execute(const std::string& sql) {
         payload += kWalSep;
         payload += enc;
         wal_->append(payload);
+        mirror_batch.push_back(std::move(payload));
       }
       wal_->flush();
+      syncMirrorBatch(&mirror_batch);
     }
     {
       kv::WriteBatch batch;
@@ -952,6 +1228,8 @@ Result Executor::execute(const std::string& sql) {
     }
     if (keys.empty()) return {{}, {}, "DELETE 0", 0};
     if (wal_ != nullptr) {
+      std::vector<std::string> mirror_batch;
+      mirror_batch.reserve(keys.size());
       for (const auto& k : keys) {
         std::string payload;
         payload += 'D';
@@ -960,8 +1238,10 @@ Result Executor::execute(const std::string& sql) {
         payload += kWalSep;
         payload += walEscape(k);
         wal_->append(payload);
+        mirror_batch.push_back(std::move(payload));
       }
       wal_->flush();
+      syncMirrorBatch(&mirror_batch);
     }
     {
       kv::WriteBatch batch;
@@ -1017,6 +1297,8 @@ Result Executor::execute(const std::string& sql) {
       payload += norm;
       wal_->append(payload);
       wal_->flush();
+      const std::vector<std::string> mirror_batch{payload};
+      syncMirrorBatch(&mirror_batch);
     }
     {
       kv::WriteBatch batch;
@@ -1076,6 +1358,8 @@ Result Executor::execCreate(const CreateTableStmt& s) {
     payload += enc;
     wal_->append(payload);
     wal_->flush();
+    const std::vector<std::string> mirror_batch{payload};
+    syncMirrorBatch(&mirror_batch);
   }
   return {{}, {}, "CREATE TABLE", 0};
 }
@@ -1144,6 +1428,8 @@ Result Executor::execInsert(const InsertStmt& s) {
 
   // 1) WAL-append (1 Record/Zeile), dann Group-Commit via flush.
   if (wal_ != nullptr) {
+    std::vector<std::string> mirror_batch;
+    mirror_batch.reserve(keys.size());
     for (std::size_t i = 0; i < keys.size(); ++i) {
       std::string payload;
       payload += 'I';
@@ -1154,8 +1440,10 @@ Result Executor::execInsert(const InsertStmt& s) {
       payload += kWalSep;
       payload += encs[i];
       wal_->append(payload);
+      mirror_batch.push_back(std::move(payload));
     }
     wal_->flush();
+    syncMirrorBatch(&mirror_batch);
   }
 
   // 2) KV-WriteBatch atomar.
@@ -1398,7 +1686,21 @@ std::size_t Executor::recover() {
   recover_skipped_ = 0;
   recover_applied_ = 0;
   if (wal_ == nullptr) return 0;
-  auto recs = wal_->replay();
+  // Mit aktivem Spiegel nur den Tail seit mirror_lsn replayen (der Rest
+  // steckt als Latest-State im Spiegel, s. enableMirror). Ohne Spiegel oder
+  // bei degradiertem Spiegel (lsn 0) exakt Altverhalten: Voll-Replay.
+  std::vector<storage::WalRecord> recs;
+  const bool use_tail = mirror_on_ && mirror_ != nullptr &&
+                        mirror_->IsOpen() && mirror_lsn_ > 0;
+  if (use_tail) {
+    try {
+      recs = wal_->read_from(mirror_lsn_ + 1);
+    } catch (...) {
+      recs = wal_->replay();  // Fallback: WAL-Truth gewinnt immer
+    }
+  } else {
+    recs = wal_->replay();
+  }
   for (auto& r : recs) {
     auto parts = splitWal(r.data);
     if (parts.empty()) {
@@ -1539,6 +1841,9 @@ std::size_t Executor::recover() {
       }
     }
   }
+  // Checkpoint-Catch-up: gerade replayten Tail (oder leeren Tail) in den
+  // Spiegel spiegeln, damit der naechste Restart den Tail nicht erneut zahlt.
+  if (mirror_on_) syncMirrorFromWal();
   return recover_skipped_;
 }
 
