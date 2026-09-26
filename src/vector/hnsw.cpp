@@ -526,6 +526,58 @@ void HnswIndex::insert_node(int id) {
     cand.erase(std::remove_if(cand.begin(), cand.end(),
                               [&](const SearchHit& h) { return h.id == id; }),
                cand.end());
+    // Deterministische Spread-Probes gegen Cluster-Trapping (kein RNG):
+    // Der Build-Beam erreicht Cross-Cluster-Knoten nie (Henne-Ei: ohne
+    // existierende Fernkanten findet der Beam keine), also enthaelt der
+    // Graph sonst keine Flucht-Kanten. K=8 index-gestreute bereits
+    // existierende Knoten pid = id*(j+1)/(K+1) scoren, die besten
+    // (naechsten) bis zu 3 davon, die nicht schon im Beam-Pool sind und
+    // auf diesem Layer existieren, vor select_neighbors in den Pool
+    // aufnehmen. Die diversifizierte Heuristik behaelt echte Fernkanten
+    // (fern von bereits Gewaehlten => akzeptiert). Caps (max_m),
+    // Level-Sampling, Suchpfad unveraendert. Kosten: <=K Distanzen/Layer.
+    if (id > 0) {
+      constexpr int kSpreadK = 8;
+      constexpr int kSpreadTake = 3;
+      int probe_ids[kSpreadK];
+      int nprobe = 0;
+      for (int j = 0; j < kSpreadK; ++j) {
+        const int pid = static_cast<int>(
+            (static_cast<long long>(id) * (j + 1)) / (kSpreadK + 1));
+        if (pid < 0 || pid >= id) continue;
+        if (pid >= static_cast<int>(levels_.size())) continue;
+        if (levels_[pid] < lc) continue;  // nur auf diesem Layer existent
+        bool dup = false;
+        for (int t = 0; t < nprobe; ++t) {
+          if (probe_ids[t] == pid) {
+            dup = true;
+            break;
+          }
+        }
+        if (dup) continue;
+        bool in_cand = false;
+        for (const auto& h : cand) {
+          if (h.id == pid) {
+            in_cand = true;
+            break;
+          }
+        }
+        if (in_cand) continue;
+        probe_ids[nprobe++] = pid;
+      }
+      if (nprobe > 0) {
+        std::pair<float, int> scored[kSpreadK];
+        for (int t = 0; t < nprobe; ++t)
+          scored[t] = {dist_to_stored(data_[id], probe_ids[t]), probe_ids[t]};
+        std::sort(scored, scored + nprobe, [](const auto& a, const auto& b) {
+          if (a.first != b.first) return a.first < b.first;
+          return a.second < b.second;
+        });
+        const int take = nprobe < kSpreadTake ? nprobe : kSpreadTake;
+        for (int t = 0; t < take; ++t)
+          cand.push_back(SearchHit{scored[t].second, scored[t].first});
+      }
+    }
     const int max_m = (lc == 0) ? 2 * m_ : m_;
     // Besten merken VOR select (select arbeitet in-place auf cand; der
     // Front-Eintrag ueberlebt die Stutzung, da die Auswahl die kleinsten
@@ -772,6 +824,69 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
     }
   }
 
+  // 1b) Flache Coarse-Probes zur Query-Zeit (kein Descent, kein RNG).
+  // Diagnose: Entry-Descent + Fallbacks kollabieren auf oberen duennen Layern
+  // ins gleiche falsche Basin; der Layer0-Beam terminiert voll-aber-falsch
+  // (ef-Abbruch greift, Refill nur bei top<k). P=256 deterministische
+  // Spread-Knoten pid = (entry_ + j*n/P) % n (j=0..P-1, reine Index-Funktion)
+  // werden flach per dist_to_stored gescort; die besten B=3 distinkten (nach
+  // (dist, id), exkl. bestehender Seeds) kommen als zusaetzliche Layer0-Seeds
+  // in die Union (Dedup final via visited-Epoche beim Einsetzen). Kein
+  // greedy_closest fuer Probes: Upper-Layer sind zu duenn, um quer zu routen.
+  // P=256, weil Cluster id-interleaved sind: Trefferquote aufs Query-Cluster
+  // (156/10k) = 1-(1-0.0156)^256 ~= 98 %. Kosten: P SIMD-Distanzen/Query
+  // (~10us, p95-SLO hat weiter >100x Headroom).
+  // Bestehende Seeds/Descent/Filter/Refill/ef-Abbruch unveraendert.
+  int probe_seeds[3] = {-1, -1, -1};
+  float probe_d[3] = {0.0f, 0.0f, 0.0f};
+  int nprobes = 0;
+  {
+    constexpr int kQueryProbeP = 256;
+    constexpr int kQueryProbeB = 3;
+    std::pair<float, int> scored[kQueryProbeP];
+    int uniq[kQueryProbeP];
+    int nuniq = 0;
+    for (int j = 0; j < kQueryProbeP; ++j) {
+      const int pid = static_cast<int>(
+          (static_cast<long long>(entry_) +
+           (static_cast<long long>(j) * n) / kQueryProbeP) %
+          n);
+      if (pid < 0 || pid >= n) continue;
+      bool dup = false;
+      for (int t = 0; t < nuniq; ++t) {
+        if (uniq[t] == pid) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      uniq[nuniq++] = pid;
+    }
+    for (int t = 0; t < nuniq; ++t)
+      scored[t] = {dist_to_stored(query, uniq[t]), uniq[t]};
+    std::sort(scored, scored + nuniq, [](const auto& a, const auto& b) {
+      if (a.first != b.first) return a.first < b.first;
+      return a.second < b.second;
+    });
+    for (int t = 0; t < nuniq && nprobes < kQueryProbeB; ++t) {
+      const int pid = scored[t].second;
+      bool known = false;
+      for (int s = 0; s < nseeds; ++s) {
+        if (seeds[s] == pid) {
+          known = true;
+          break;
+        }
+      }
+      for (int s = 0; s < nprobes && !known; ++s) {
+        if (probe_seeds[s] == pid) known = true;
+      }
+      if (known) continue;
+      probe_seeds[nprobes] = pid;
+      probe_d[nprobes] = scored[t].first;
+      ++nprobes;
+    }
+  }
+
   // 2) Layer0-Beam mit gemeinsamer Filter-Evaluierung (s08-Semantik).
   // Wie search_layer: Epochen-Visited + Heap-Vektoren mit Reserve.
   // Filter-Praedikat einmalig auf bool materialisiert (kein
@@ -806,6 +921,18 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
     if (s < 0 || s >= n || seen[s] == mark) continue;
     seen[s] = mark;
     const float d = seed_d[si];
+    frontier.emplace_back(d, s);
+    std::push_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
+    consider(s, d);
+  }
+  // Union mit flachen Coarse-Probes (1b, max. 3): gleiche Einsetz-Semantik,
+  // Dedup via visited-Epoche (deckt auch Seeds-Ueberlappung ab). Filter-,
+  // Abbruch- und Refill-Logik unveraendert.
+  for (int pi = 0; pi < nprobes; ++pi) {
+    const int s = probe_seeds[pi];
+    if (s < 0 || s >= n || seen[s] == mark) continue;
+    seen[s] = mark;
+    const float d = probe_d[pi];
     frontier.emplace_back(d, s);
     std::push_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
     consider(s, d);
