@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace dbengine::raft {
@@ -48,6 +49,9 @@ class RaftGroup {
 
   RaftGroup(const RaftGroup&) = delete;
   RaftGroup& operator=(const RaftGroup&) = delete;
+  // Move (fuer Shard::split-Rueckgabe): sperrt other, verschiebt Zustand.
+  RaftGroup(RaftGroup&& other) noexcept;
+  RaftGroup& operator=(RaftGroup&& other) noexcept;
 
   // ---- Election (term/vote, Mehrheit) ----------------------------------
   // Waehlt den ersten lebenden Knoten als Leader (deterministisch).
@@ -83,9 +87,31 @@ class RaftGroup {
   [[nodiscard]] std::optional<std::string> get(const std::string& key) const;
   [[nodiscard]] int shardId() const noexcept { return shard_id_; }
 
+  // ---- s25: Follower-Reads (read_index light) ------------------------------
+  // follower_get liest die State-Machine eines Followers (kann stale sein).
+  // is_caught_up: follower.commit == leader.commit (linearisierbar-lesbar).
+  [[nodiscard]] std::optional<std::string> follower_get(
+      int node_id, const std::string& key) const;
+  [[nodiscard]] bool is_caught_up(int node_id) const;
+
+  // ---- s25: persistentes Log (Datei + Replay) -------------------------------
+  // Format "RAFT1": term u64, commit u64, n u64, je Entry term/index/cmd.
+  // Save: Leader-Log + term/commit. Load: stellt Log auf allen lebenden
+  // Knoten wieder her (commit/apply). Gibt false bei IO-/Formatfehler.
+  bool SaveLog(const std::string& path) const;
+  bool LoadLog(const std::string& path);
+
+  // ---- s25: Snapshots (State-Machine dump/load + Log-Compaction) ------------
+  // Format "RSNP1": last_index u64, n u64, je Paar klen/vlen + bytes.
+  // Load: setzt applied-Maps, kappt Log <= last_index, commit/last_applied
+  // auf max(commit, last_index).
+  bool SaveSnapshot(const std::string& path) const;
+  bool LoadSnapshot(const std::string& path);
+
  private:
   // Wendet alle committeten, noch nicht angewendeten Eintraege eines Knotens an.
-  static void apply(Node& node);
+  // last_applied/commit sind echte Indizes (Basis log_base_).
+  void apply(Node& node);
   static bool parseCommand(const std::string& cmd, std::string& op,
                            std::string& key, std::string& value);
   void electLocked(int candidate);  // Setzt Rollen/Votes, braucht Mehrheit
@@ -95,12 +121,19 @@ class RaftGroup {
   std::vector<Node> nodes_;
   int leader_id_ = -1;
   std::uint64_t term_ = 0;
+  // s25: Log-Basis (kompaktierte Prefix-Laenge via Snapshot). Eintrag an
+  // Position p hat Index log_base_ + p + 1. Ohne Snapshot 0 (V1-Semantik).
+  std::uint64_t log_base_ = 0;
 };
 
 // Shard/Tablet: id + Key-Range [range_start, range_end), traegt eine RaftGroup.
 class Shard {
  public:
   Shard(int id, std::string range_start, std::string range_end);
+  Shard(Shard&&) noexcept = default;
+  Shard& operator=(Shard&&) noexcept = default;
+  Shard(const Shard&) = delete;
+  Shard& operator=(const Shard&) = delete;
 
   [[nodiscard]] int id() const noexcept { return id_; }
   [[nodiscard]] const std::string& rangeStart() const noexcept { return start_; }
@@ -115,11 +148,29 @@ class Shard {
   RaftGroup& group() noexcept { return group_; }
   const RaftGroup& group() const noexcept { return group_; }
 
+  // s25: Split/Merge vorbereitet (reine Range-Ops, kein Daten-Move in V2).
+  // split(mid): [start,mid) + [mid,end). mid muss in (start,end) liegen
+  // (leeres end = offen, dann reicht mid > start).
+  [[nodiscard]] std::pair<Shard, Shard> split(const std::string& mid) const;
+  [[nodiscard]] bool can_merge_with(const Shard& other) const;
+
  private:
   int id_;
   std::string start_;
   std::string end_;
   RaftGroup group_;
 };
+
+// ---- s25: TCP-Wire-Codec (len-prefixed Entry-Replikation) -------------------
+// Payload = term u64 BE | index u64 BE | cmd_len u32 BE | cmd bytes.
+// Framing = msg_len u32 BE (Payload-Laenge) + Payload. SendWire/RecvWire
+// arbeiten auf beliebigem Stream-fd (TCP-Socket, socketpair, pipe).
+std::string EncodeEntryWire(const Entry& e);
+bool DecodeEntryWire(const std::string& payload, Entry& out);
+bool SendWire(int fd, const std::string& payload);
+bool RecvWire(int fd, std::string& payload);
+// Loopback-Helfer (POSIX-TCP, 127.0.0.1, ephemeral Port): listen_fd + port
+// erzeugen, verbinden, accepten. Rueckgabe verbundene fds (client, server).
+bool TcpLoopbackPair(int& client_fd, int& server_fd);
 
 }  // namespace dbengine::raft

@@ -123,6 +123,14 @@ class Part {
                            std::vector<int64_t>* out_ints,
                            std::vector<std::string>* out_strs);
 
+  // s24: persistentes Part-File COL1 (Header + RLE-Ints + Dict-Strings).
+  // Save/Load sind roundtrip-treu (id/name/Rows/Zonemaps). Load gibt
+  // versiegelten Part zurueck.
+  bool Save(const std::string& path) const;
+  static Part Load(const std::string& path);
+  // Sorted-Merge zweier Parts (nach int, stabil): neuer versiegelter Part.
+  static Part Merge(const Part& a, const Part& b, uint64_t new_id = 0);
+
  private:
   uint64_t id_ = 0;
   std::string name_;
@@ -157,6 +165,12 @@ class ColumnarStore {
 
   bool ExportCsv(const std::string& path) const;
   bool ExportBinary(const std::string& path) const;
+
+  // s24: Store-Persistenz (Verzeichnis mit Manifest + part-*.col) + Compaction.
+  bool Save(const std::string& dir) const;
+  bool Load(const std::string& dir);
+  void Compact();
+  const Part& sealed_part(size_t i) const { return parts_.at(i); }
 
   // S3-Tier Stub: kein Upload, nur deterministische URI-Bildung.
   // Real: Parquet-Parts -> S3 Put + Manifest (Follow-up).

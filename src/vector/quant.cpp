@@ -249,6 +249,303 @@ float PqQuantizer::adc_l2_squared(const Vector& query,
   return sub_l2_squared(query.data(), dec.data(), dim_);
 }
 
+// --- PqNQuantizer (M konfigurierbar, echte ADC-Tabellen) ---------------------
+void PqNQuantizer::init(int dim, int num_subspaces) {
+  if (dim <= 0) throw std::invalid_argument("PqNQuantizer::init: dim<=0");
+  if (num_subspaces <= 0 || num_subspaces > 32)
+    throw std::invalid_argument("PqNQuantizer::init: M in 1..32");
+  if (dim < num_subspaces)
+    throw std::invalid_argument("PqNQuantizer::init: dim < M");
+  dim_ = dim;
+  m_ = num_subspaces;
+  setup_subdims();
+  codebooks_.assign(m_, {});
+  fitted_ = false;
+}
+
+void PqNQuantizer::setup_subdims() {
+  subdims_.assign(m_, 0);
+  suboffs_.assign(m_, 0);
+  const int base = dim_ / m_;
+  const int rem = dim_ % m_;
+  int off = 0;
+  for (int i = 0; i < m_; ++i) {
+    subdims_[i] = base + (i < rem ? 1 : 0);
+    suboffs_[i] = off;
+    off += subdims_[i];
+  }
+}
+
+Vector PqNQuantizer::subvec(const Vector& v, int m) const {
+  Vector s(subdims_[m]);
+  for (int i = 0; i < subdims_[m]; ++i) s[i] = v[suboffs_[m] + i];
+  return s;
+}
+
+void PqNQuantizer::fit(const std::vector<Vector>& data, int iters,
+                       unsigned seed) {
+  if (m_ <= 0) throw std::logic_error("PqNQuantizer::fit: init missing");
+  if (data.empty()) throw std::invalid_argument("PqNQuantizer::fit: empty");
+  const int dim = static_cast<int>(data[0].size());
+  if (dim != dim_)
+    throw std::invalid_argument("PqNQuantizer::fit: dim mismatch");
+  for (const auto& v : data)
+    if (static_cast<int>(v.size()) != dim_)
+      throw std::invalid_argument("PqNQuantizer::fit: dim mismatch");
+
+  std::vector<const Vector*> pool;
+  pool.reserve(data.size());
+  for (const auto& v : data) pool.push_back(&v);
+  std::mt19937 rng(seed);
+  std::shuffle(pool.begin(), pool.end(), rng);
+  const size_t nuse = std::min<size_t>(pool.size(), 2048);
+  std::vector<const Vector*> use(pool.begin(), pool.begin() + nuse);
+
+  codebooks_.assign(m_, {});
+  for (int m = 0; m < m_; ++m) {
+    const int sd = subdims_[m];
+    codebooks_[m].assign(kCentroids, Vector(sd, 0.0f));
+    for (int c = 0; c < kCentroids; ++c)
+      codebooks_[m][c] = subvec(*use[c % nuse], m);
+    std::vector<Vector> acc(kCentroids, Vector(sd, 0.0f));
+    std::vector<int> cnt(kCentroids, 0);
+    for (int it = 0; it < iters; ++it) {
+      for (auto& a : acc) std::fill(a.begin(), a.end(), 0.0f);
+      std::fill(cnt.begin(), cnt.end(), 0);
+      for (size_t i = 0; i < nuse; ++i) {
+        Vector s = subvec(*use[i], m);
+        int best = 0;
+        float bestd = std::numeric_limits<float>::infinity();
+        for (int c = 0; c < kCentroids; ++c) {
+          float d = sub_l2_squared(s.data(), codebooks_[m][c].data(), sd);
+          if (d < bestd) {
+            bestd = d;
+            best = c;
+          }
+        }
+        for (int d = 0; d < sd; ++d) acc[best][d] += s[d];
+        cnt[best]++;
+      }
+      for (int c = 0; c < kCentroids; ++c) {
+        if (cnt[c] == 0) continue;
+        for (int d = 0; d < sd; ++d)
+          codebooks_[m][c][d] = acc[c][d] / cnt[c];
+      }
+    }
+  }
+  fitted_ = true;
+}
+
+std::vector<uint8_t> PqNQuantizer::encode(const Vector& v) const {
+  if (!fitted_) throw std::logic_error("PqNQuantizer::encode: not fitted");
+  if (static_cast<int>(v.size()) != dim_)
+    throw std::invalid_argument("PqNQuantizer::encode: dim mismatch");
+  std::vector<uint8_t> code(m_);
+  for (int m = 0; m < m_; ++m) {
+    Vector s = subvec(v, m);
+    int best = 0;
+    float bestd = std::numeric_limits<float>::infinity();
+    for (int c = 0; c < kCentroids; ++c) {
+      float d =
+          sub_l2_squared(s.data(), codebooks_[m][c].data(), subdims_[m]);
+      if (d < bestd) {
+        bestd = d;
+        best = c;
+      }
+    }
+    code[m] = static_cast<uint8_t>(best);
+  }
+  return code;
+}
+
+Vector PqNQuantizer::decode(const std::vector<uint8_t>& code) const {
+  if (!fitted_) throw std::logic_error("PqNQuantizer::decode: not fitted");
+  if (static_cast<int>(code.size()) != m_)
+    throw std::invalid_argument("PqNQuantizer::decode: code size mismatch");
+  Vector v(dim_, 0.0f);
+  for (int m = 0; m < m_; ++m) {
+    const Vector& c = codebooks_[m][code[m]];
+    for (int i = 0; i < subdims_[m]; ++i) v[suboffs_[m] + i] = c[i];
+  }
+  return v;
+}
+
+PqNQuantizer::AdcTable PqNQuantizer::build_adc_table(
+    const Vector& query) const {
+  if (!fitted_) throw std::logic_error("PqNQuantizer::adc_table: not fitted");
+  if (static_cast<int>(query.size()) != dim_)
+    throw std::invalid_argument("PqNQuantizer::adc_table: dim mismatch");
+  AdcTable t(m_, std::vector<float>(kCentroids, 0.0f));
+  for (int m = 0; m < m_; ++m) {
+    Vector qs = subvec(query, m);
+    for (int c = 0; c < kCentroids; ++c)
+      t[m][c] =
+          sub_l2_squared(qs.data(), codebooks_[m][c].data(), subdims_[m]);
+  }
+  return t;
+}
+
+float PqNQuantizer::adc_with_table(
+    const AdcTable& t, const std::vector<uint8_t>& code) const {
+  if (static_cast<int>(code.size()) != m_ ||
+      static_cast<int>(t.size()) != m_)
+    throw std::invalid_argument("PqNQuantizer::adc_with_table: size mismatch");
+  double acc = 0.0;
+  for (int m = 0; m < m_; ++m) acc += t[m][code[m]];
+  return static_cast<float>(acc);
+}
+
+float PqNQuantizer::adc_l2_squared(
+    const Vector& query, const std::vector<uint8_t>& code) const {
+  AdcTable t = build_adc_table(query);
+  return adc_with_table(t, code);
+}
+
+// --- IvfPqIndex ---------------------------------------------------------------
+void IvfPqIndex::train(const std::vector<Vector>& data, int coarse_iters,
+                       int pq_iters, unsigned seed) {
+  if (dim_ <= 0 || nlist_ <= 0)
+    throw std::logic_error("IvfPqIndex::train: dim/nlist missing");
+  if (data.empty()) throw std::invalid_argument("IvfPqIndex::train: empty");
+  for (const auto& v : data)
+    if (static_cast<int>(v.size()) != dim_)
+      throw std::invalid_argument("IvfPqIndex::train: dim mismatch");
+  if (static_cast<int>(data.size()) < nlist_)
+    throw std::invalid_argument("IvfPqIndex::train: N < nlist");
+
+  // Coarse k-means (deterministisch): init via geshuffelte Samples.
+  std::vector<const Vector*> pool;
+  for (const auto& v : data) pool.push_back(&v);
+  std::mt19937 rng(seed);
+  std::shuffle(pool.begin(), pool.end(), rng);
+  coarse_.assign(nlist_, Vector(dim_, 0.0f));
+  for (int c = 0; c < nlist_; ++c) coarse_[c] = *pool[c % pool.size()];
+
+  const size_t nuse = std::min<size_t>(data.size(), 4096);
+  std::vector<const Vector*> use(pool.begin(), pool.begin() + nuse);
+  std::vector<int> assign(nuse, 0);
+  std::vector<Vector> acc(nlist_, Vector(dim_, 0.0f));
+  std::vector<int> cnt(nlist_, 0);
+  for (int it = 0; it < coarse_iters; ++it) {
+    for (auto& a : acc) std::fill(a.begin(), a.end(), 0.0f);
+    std::fill(cnt.begin(), cnt.end(), 0);
+    for (size_t i = 0; i < nuse; ++i) {
+      int best = 0;
+      float bestd = std::numeric_limits<float>::infinity();
+      for (int c = 0; c < nlist_; ++c) {
+        float d = sub_l2_squared(use[i]->data(), coarse_[c].data(), dim_);
+        if (d < bestd) {
+          bestd = d;
+          best = c;
+        }
+      }
+      assign[i] = best;
+      for (int d = 0; d < dim_; ++d) acc[best][d] += (*use[i])[d];
+      cnt[best]++;
+    }
+    for (int c = 0; c < nlist_; ++c) {
+      if (cnt[c] == 0) continue;
+      for (int d = 0; d < dim_; ++d) coarse_[c][d] = acc[c][d] / cnt[c];
+    }
+  }
+  // PQ auf vollen Daten (nicht-residual, bewusst simpel + rerank-stark).
+  pq_.fit(data, pq_iters, seed + 1);
+  trained_ = true;
+  built_ = false;
+}
+
+void IvfPqIndex::build(const std::vector<Vector>& data) {
+  if (!trained_) throw std::logic_error("IvfPqIndex::build: train missing");
+  invlists_.assign(nlist_, {});
+  for (size_t i = 0; i < data.size(); ++i) {
+    int best = 0;
+    float bestd = std::numeric_limits<float>::infinity();
+    for (int c = 0; c < nlist_; ++c) {
+      float d = sub_l2_squared(data[i].data(), coarse_[c].data(), dim_);
+      if (d < bestd) {
+        bestd = d;
+        best = c;
+      }
+    }
+    Posting p;
+    p.id = static_cast<int>(i);
+    p.code = pq_.encode(data[i]);
+    invlists_[best].push_back(std::move(p));
+  }
+  ntotal_ = data.size();
+  built_ = true;
+}
+
+std::vector<int> IvfPqIndex::pick_probes(const Vector& query,
+                                        int nprobe) const {
+  std::vector<std::pair<float, int>> scored;
+  scored.reserve(nlist_);
+  for (int c = 0; c < nlist_; ++c)
+    scored.emplace_back(
+        sub_l2_squared(query.data(), coarse_[c].data(), dim_), c);
+  if (nprobe > nlist_) nprobe = nlist_;
+  std::nth_element(scored.begin(), scored.begin() + nprobe, scored.end(),
+                   [](const auto& a, const auto& b) {
+                     return a.first < b.first;
+                   });
+  std::sort(scored.begin(), scored.begin() + nprobe,
+            [](const auto& a, const auto& b) {
+              if (a.first != b.first) return a.first < b.first;
+              return a.second < b.second;
+            });
+  std::vector<int> out;
+  out.reserve(nprobe);
+  for (int i = 0; i < nprobe; ++i) out.push_back(scored[i].second);
+  return out;
+}
+
+std::vector<SearchHit> IvfPqIndex::search(
+    const Vector& query, const std::vector<Vector>& base_data, int k,
+    int nprobe, int ef_rerank) const {
+  if (!trained_ || !built_)
+    throw std::logic_error("IvfPqIndex::search: train+build missing");
+  if (static_cast<int>(query.size()) != dim_)
+    throw std::invalid_argument("IvfPqIndex::search: dim mismatch");
+  if (k <= 0) return {};
+  if (nprobe <= 0) nprobe = 1;
+  if (nprobe > nlist_) nprobe = nlist_;
+  auto probes = pick_probes(query, nprobe);
+  auto table = pq_.build_adc_table(query);
+  std::vector<std::pair<float, int>> scored;
+  size_t total = 0;
+  for (int c : probes) total += invlists_[c].size();
+  scored.reserve(total);
+  for (int c : probes)
+    for (const auto& p : invlists_[c])
+      scored.emplace_back(pq_.adc_with_table(table, p.code), p.id);
+  int ef = std::min<int>(static_cast<int>(scored.size()), ef_rerank);
+  if (ef < k) ef = std::min<int>(static_cast<int>(scored.size()), k);
+  if (ef <= 0) return {};
+  std::nth_element(scored.begin(), scored.begin() + ef, scored.end(),
+                   [](const auto& a, const auto& b) {
+                     return a.first < b.first;
+                   });
+  scored.resize(ef);
+  std::vector<SearchHit> cand;
+  cand.reserve(ef);
+  for (auto& [approx_d, id] : scored)
+    cand.push_back({id, l2_distance(query, base_data[id])});
+  if (static_cast<int>(cand.size()) > k) {
+    std::nth_element(cand.begin(), cand.begin() + k, cand.end(),
+                     [](const SearchHit& a, const SearchHit& b) {
+                       if (a.dist != b.dist) return a.dist < b.dist;
+                       return a.id < b.id;
+                     });
+    cand.resize(k);
+  }
+  std::sort(cand.begin(), cand.end(),
+            [](const SearchHit& a, const SearchHit& b) {
+              if (a.dist != b.dist) return a.dist < b.dist;
+              return a.id < b.id;
+            });
+  return cand;
+}
+
 // --- DiskSpill --------------------------------------------------------------
 DiskSpill::DiskSpill(DiskSpill&& other) noexcept
     : base_(other.base_),

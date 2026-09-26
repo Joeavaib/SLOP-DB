@@ -28,6 +28,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <random>
 #include <vector>
 
 namespace dbengine::vector {
@@ -83,7 +84,14 @@ class SQ8Quantizer {
 };
 
 // ---------------------------------------------------------------------------
-// HnswIndex: HNSW-lite, Layer0, M=16 default, ef runtime-tunbar.
+// HnswIndex: echter mehrschichtiger HNSW (s21), abwaertskompatibel zu s08.
+//   - Level-Sampling: l = floor(-ln(U) * mL), mL = 1/ln(M).
+//   - M getrennt: Level0 Mmax0 = 2*M, obere Layer Mmax = M.
+//   - efConstruction runtime-tunbar (Default 64), ef Suchzeit pro Query.
+//   - Inkrementelles Insert: add() bei gebautem Index fuegt sofort ein
+//     (kein O(N^2)-Rebuild); build() fuegt nur fehlende Knoten ein.
+//   - Filter+ANN gemeinsam auf Layer0 (wie s08), obere Layer ungefiltert
+//     als Entry-Navigation.
 // ---------------------------------------------------------------------------
 class HnswIndex {
  public:
@@ -97,14 +105,20 @@ class HnswIndex {
   [[nodiscard]] int ef_default() const;
   void set_m(int m);
   [[nodiscard]] int m() const;
+  void set_ef_construction(int ef);
+  [[nodiscard]] int ef_construction() const;
+  void set_rng_seed(unsigned seed);
+  [[nodiscard]] int max_level() const;
+  [[nodiscard]] int level(int id) const;
 
   // --- Schreibpfad ---
   // Gibt interne ID (0..size()-1) zurueck. Dim-Mismatch -> invalid_argument.
   int add(const Vector& v);
   void clear();
 
-  // Baut den Layer0 k-NN-Graphen (exakt, k=M). Muss nach add() vor search()
-  // aufgerufen werden (erneut nach weiteren add()s). O(N^2 * dim).
+  // Baut den Mehrschicht-Graphen inkrementell (O(N log N)): deterministisch
+  // mit Seed 42, Level-Sampling, efConstruction-Beam pro Insert.
+  // Nach build() ist sofortiges add() ohne Rebuild moeglich.
   void build();
   [[nodiscard]] bool built() const;
 
@@ -128,17 +142,33 @@ class HnswIndex {
  private:
   [[nodiscard]] float dist(const Vector& a, const Vector& b) const;
   [[nodiscard]] float dist_to_stored(const Vector& q, int id) const;
+  // --- s21 Mehrschicht-Interna ---
+  int random_level();
+  [[nodiscard]] std::vector<SearchHit> search_layer(const Vector& q,
+                                                   int entry_id, int ef,
+                                                   int lc) const;
+  int greedy_closest(const Vector& q, int entry_id, int lc) const;
+  void insert_node(int id);
+  [[nodiscard]] std::vector<int> select_neighbors(
+      const Vector& q, const std::vector<SearchHit>& cand, int mm) const;
+  void shrink_layer(int id, int lc, int max_m);
 
   int dim_;
-  int m_;           // max. Nachbarn nominal (Layer0 fully-connected k)
+  int m_;           // max. Nachbarn nominal (obere Layer)
   int ef_default_;  // Default-Beam-Breite, runtime-tunbar pro Query via ef
+  int ef_construction_ = 64;
   DistanceMetric metric_;
+  double ml_ = 0.36;  // 1/ln(M), bei set_m neu berechnet
 
   std::vector<Vector> data_;
   std::vector<float> norms_;  // L2-Normen (fuer Cosine, parallel zu data_)
-  std::vector<std::vector<int>> adj_;  // Layer0-Adjazenz
+  std::vector<int> levels_;   // Level pro Knoten
+  // links_[id][lc] = Nachbarn auf Layer lc (lc <= levels_[id])
+  std::vector<std::vector<std::vector<int>>> links_;
   int entry_ = 0;
+  int max_level_ = -1;
   bool built_ = false;
+  std::mt19937 rng_{42};
 };
 
 }  // namespace dbengine::vector

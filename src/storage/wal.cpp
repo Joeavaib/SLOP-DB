@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -188,7 +189,7 @@ void Wal::ensure_open() {
 }
 
 void Wal::open() {
-  std::lock_guard<std::mutex> g(mu_);
+  std::unique_lock<std::mutex> g(mu_);
   if (fd_ >= 0) return;
   int fd = ::open(path_.c_str(), O_RDWR | O_CREAT, 0644);
   if (fd < 0)
@@ -205,12 +206,15 @@ void Wal::open() {
     fsync_file(fd);
   }
   next_lsn_ = s.max_lsn + 1;
+  durable_lsn_ = s.max_lsn;  // nach Truncate+fsync ist Dateiinhalt dauerhaft
   // Append-Position ans Ende.
   if (::lseek(fd, 0, SEEK_END) < 0) {
     ::close(fd);
     throw std::runtime_error(std::string("WAL lseek-end: ") + std::strerror(errno));
   }
   fd_ = fd;
+  g.unlock();
+  cv_.notify_all();
 }
 
 uint64_t Wal::append(std::string_view payload) {
@@ -227,13 +231,41 @@ uint64_t Wal::append(std::string_view payload) {
   write_all(fd_, hdr, sizeof(hdr));
   if (len) write_all(fd_, payload.data(), len);
   // KEIN fsync hier — flush() macht Group-Commit (Performance).
+  ++appends_;
   return lsn;
 }
 
-void Wal::flush() {
+std::vector<uint64_t> Wal::append_many(
+    const std::vector<std::string>& payloads) {
   std::lock_guard<std::mutex> g(mu_);
   ensure_open();
+  std::vector<uint64_t> out;
+  out.reserve(payloads.size());
+  for (const auto& p : payloads) {
+    if (p.size() > kMaxPayload) throw std::runtime_error("WAL payload too large");
+    uint64_t lsn = next_lsn_++;
+    uint32_t len = static_cast<uint32_t>(p.size());
+    char hdr[4 + 8 + 4 + 4];
+    put_u32le(hdr, kMagic);
+    put_u64le(hdr + 4, lsn);
+    put_u32le(hdr + 12, len);
+    put_u32le(hdr + 16, record_crc(lsn, len, p.data()));
+    write_all(fd_, hdr, sizeof(hdr));
+    if (len) write_all(fd_, p.data(), len);
+    ++appends_;
+    out.push_back(lsn);
+  }
+  return out;
+}
+
+void Wal::flush() {
+  std::unique_lock<std::mutex> g(mu_);
+  ensure_open();
   fsync_file(fd_);
+  durable_lsn_ = (next_lsn_ == 0) ? 0 : next_lsn_ - 1;
+  ++flushes_;
+  g.unlock();
+  cv_.notify_all();
 }
 
 std::vector<WalRecord> Wal::replay() {
@@ -259,7 +291,7 @@ std::vector<WalRecord> Wal::replay_file(const std::string& path) {
 }
 
 void Wal::checkpoint(uint64_t checkpoint_lsn) {
-  std::lock_guard<std::mutex> g(mu_);
+  std::unique_lock<std::mutex> g(mu_);
   ensure_open();
   ScanResult s = scan(fd_);
   std::string tmp = path_ + ".chkpt.tmp";
@@ -296,6 +328,9 @@ void Wal::checkpoint(uint64_t checkpoint_lsn) {
   fd_ = fd;
   next_lsn_ = max_kept + 1;
   if (next_lsn_ == 0) next_lsn_ = 1;
+  if (max_kept + 1 == next_lsn_) durable_lsn_ = max_kept;
+  g.unlock();
+  cv_.notify_all();
 }
 
 void Wal::close() {
@@ -309,6 +344,48 @@ void Wal::close() {
 uint64_t Wal::next_lsn() const {
   std::lock_guard<std::mutex> g(mu_);
   return next_lsn_;
+}
+
+uint64_t Wal::durable_lsn() const {
+  std::lock_guard<std::mutex> g(mu_);
+  return durable_lsn_;
+}
+
+Wal::GroupStats Wal::group_stats() const {
+  std::lock_guard<std::mutex> g(mu_);
+  return GroupStats{appends_, flushes_};
+}
+
+bool Wal::wait_for_lsn(uint64_t target, int timeout_ms) const {
+  std::unique_lock<std::mutex> g(mu_);
+  auto pred = [&] { return durable_lsn_ >= target; };
+  if (pred()) return true;
+  if (timeout_ms < 0) {
+    cv_.wait(g, pred);
+    return true;
+  }
+  if (timeout_ms == 0) return false;
+  return cv_.wait_for(g, std::chrono::milliseconds(timeout_ms), pred);
+}
+
+std::vector<WalRecord> Wal::read_from(uint64_t from_lsn, size_t max_records) {
+  // replay() lockt intern; hier nicht halten (kein Double-Lock).
+  std::vector<WalRecord> all = replay();
+  std::vector<WalRecord> out;
+  out.reserve(all.size());
+  for (auto& r : all) {
+    if (r.lsn < from_lsn) continue;
+    out.push_back(std::move(r));
+    if (max_records && out.size() >= max_records) break;
+  }
+  return out;
+}
+
+std::vector<WalRecord> WalCdcSlot::poll(size_t max_records) {
+  if (!wal_) return {};
+  auto recs = wal_->read_from(cursor_, max_records);
+  if (!recs.empty()) cursor_ = recs.back().lsn + 1;
+  return recs;
 }
 
 }  // namespace dbengine::storage

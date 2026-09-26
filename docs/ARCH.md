@@ -1,8 +1,11 @@
-# dbengine — Architektur (V1, embedded-first)
+# dbengine — Architektur (V2, embedded-first)
 
 > Stand: 09/2026. Ziel: OLTP+OLAP+Vektor+TS in einem Kern, Start embedded
 > (SQLite/DuckDB-Vorbild), Cluster-Pfad vorbereitet. Details siehe
 > `ANFORDERUNGEN.md` (F1–F6, N1–N7, Phasen 0–3).
+>
+> V1 (s01–s20): Row-Kern + Stubs. V2 (s21–s26): echte Implementierungen —
+> siehe Kapitel 8 (HNSW-multi, PQ-N/IVF, WAL-Group-Commit, COL1-File, Raft-TCP).
 
 ## 1. Schichtenmodell
 
@@ -102,8 +105,12 @@ InnoDB-nah (Undo-Log), **bewusst nicht PG-Heap** (kein Bloat, kein Vacuum):
     Fehler (kein Leader / tot / kein Quorum).
   - `killLeader()` + `failover()`: deterministische Neuwahl unter Lebenden
     (in-process µs, Sim-Ziel <100ms). `killNode/reviveNode` mit Catch-up + apply.
-- V1-Grenzen: keine Persistenz des Raft-Logs auf Disk (Sim), keine
-  Membership-Change, keine echten Follower-Reads über Netzwerk.
+- V1-Grenzen (s25 geschlossen, Sim bleibt): persistentes Raft-Log via
+  `SaveLog/LoadLog` (`RAFT1`), Snapshots via `SaveSnapshot/LoadSnapshot`
+  (`RSNP1` + `log_base_`-Compaction), TCP-Framing via Wire-Codec
+  (`Send/RecvWire`, `TcpLoopbackPair`), Follower-Reads (`follower_get`,
+  `is_caught_up`), Split/Merge-Range-Ops. Weiter Sim: keine Membership-Change,
+  keine echten Follower-Reads über Netzwerk.
   Failover-Pfad ist testabgedeckt (`test_raft`).
 
 ## 5. Vektor / Hybrid (`include/dbengine/vector/hnsw.h`, `include/dbengine/search/hybrid.h`)
@@ -155,8 +162,66 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
 - **PGServer** (`server/pgserver.h`): POSIX-TCP, Startup/Q-Flow über Socket,
   `SELECT 1`-Smoke psql-kompatibel.
 
-## 7. Nicht-Ziele V1 / Grenzen
+## 7. Nicht-Ziele V1/V2 / Grenzen (Stand s26)
 
-- Kein verteiltes 2PC/SSI, kein echtes Netzwerk-Raft, kein Auto-Split,
-  kein DiskANN/IVF-PQ (nur Stub), kein Graph/TS-Chunks (s17+), kein Bench-Harness
-  (s18), kein Chaos-Fuzz (s19). Siehe Roadmap `.rfg/roadmap.yaml`.
+- V1-Grenzen (s01–s20, teils in V2 geschlossen): Single-Layer-HNSW → s21
+  mehrschichtig; PQ-2-Stub → s22 PQ-N+IVF; WAL ohne Wait/CDC → s23;
+  Columnar ohne File/Merge → s24; Raft ohne Netz/Persistenz → s25.
+- Weiter offen: verteiltes 2PC/SSI, Auto-Split mit Daten-Move (nur Range-Ops,
+  s25), DiskANN (nur HNSW+PQ+Spill), Graph (V2-Empfehlung Kuzu-embedded),
+  RESP/Arrow-Flight/REST (F6.2), SDKs/WASM (F6.3). Siehe Roadmap
+  `.rfg/roadmap.yaml`.
+
+## 8. V2-Vertiefungen (s21–s25, alle STL/POSIX-only, Apache-2.0)
+
+### 8.1 Mehrschichtiger filterbarer HNSW (s21, `vector/hnsw.h`)
+
+- Level-Sampling `l = floor(-ln(U) * mL)`, `mL = 1/ln(M)`, Cap 8.
+- `M` (obere Layer) vs. `Mmax0 = 2*M` (Layer0), `efConstruction` (Default 64,
+  `set_ef_construction`), `ef` pro Query, deterministischer Seed 42.
+- Inkrementelles `add()` (sofortiges Insert, kein O(N²)-Rebuild),
+  `build()` deterministischer Neuaufbau O(N log N).
+- Filter+ANN gemeinsam auf Layer0 (s08-Semantik), obere Layer ungefilterter
+  Descent. Messung 1000×64-dim: Recall@10 avg 0.988 (ef=64), p95 0.06ms.
+
+### 8.2 PQ-N + IVF-Coarse + ADC (s22, `vector/quant.h`)
+
+- `PqNQuantizer(dim, M)`, M=1..32 (2/4/8/16): k-means deterministisch,
+  echte ADC-Tabellen `build_adc_table()` (M×256 L2²) + `adc_with_table()`.
+  `PqQuantizer` (M=2 fix) und SQ8 bleiben kompatibel erhalten.
+- `IvfPqIndex(dim, M, nlist)`: Coarse-k-means, Inverted Lists,
+  `search(q, base, k, nprobe, ef_rerank)` mit ADC-Coarse + exaktem Re-Rank.
+- Bench 10k×64-dim uniform (Worst-Case): PQ-N+M16+ReRank200 → Recall 1.0;
+  IVF nprobe=nlist → 1.0 bei ~0.6ms (Teilscan-Tradeoff dokumentiert).
+
+### 8.3 WAL Group-Commit + LSN-Wait + CDC (s23, `storage/wal.h`)
+
+- `append_many()` (ein Lock für N Records) + ein `flush()`-fsync:
+  500 appends → 1 flush (`group_stats()`).
+- `durable_lsn()` + `wait_for_lsn(target, timeout_ms)` (CondVar,
+  Notify bei flush/open/checkpoint) — `WAIT FOR LSN`-Analogie (F2.4).
+- CDC: `read_from(from_lsn, max)` + `WalCdcSlot::poll/seek` (Cursor-Pollen).
+- Crash-Safety unverändert: write ohne fsync, fdatasync pro flush,
+  torn-tail-cap, tmp+rename-Checkpoint.
+
+### 8.4 COL1-File + Merge + Compaction (s24, `columnar/store.h`)
+
+- `Part::Save/Load`: `COL1`-Format (Header id/name/rows/min/max + RLE-Ints +
+  Dict-Strings + Codes), roundtrip-treu inkl. Zonemaps.
+- `Part::Merge(a, b, id)`: stabiler Sorted-Merge nach int, frische Zonemaps.
+- `ColumnarStore::Save/Load(dir)`: Manifest + `part-<id>.col` je sealed Part;
+  `Compact()` merged alle sealed Parts sortiert zu einem.
+- `SumLessThan` block-vektorisiert (2048er-Blöcke, gleiche Pruning-Semantik).
+
+### 8.5 Raft-Transport + Log + Snapshots (s25, `raft/shard.h`)
+
+- Wire-Codec: `Encode/DecodeEntryWire` (term/index/cmd, BE) +
+  `Send/RecvWire` (u32-Längen-Framing, 16MB-Cap) + `TcpLoopbackPair`
+  (127.0.0.1 ephemeral, POSIX-TCP).
+- `SaveLog/LoadLog` (`RAFT1`: term/commit/base + lückenlose Entries).
+- `SaveSnapshot/LoadSnapshot` (`RSNP1`: last_index + KV-Map) mit echter
+  Log-Compaction via `log_base_` (Append/Replikation/Apply basis-bewusst;
+  Base 0 = V1-Semantik).
+- `follower_get` + `is_caught_up` (read_index light),
+  `Shard::split(mid)` (binärer ID-Baum, Range-validiert) + `can_merge_with`
+  (Adjazenz); Daten-Move als Follow-up dokumentiert.
