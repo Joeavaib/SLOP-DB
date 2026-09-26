@@ -167,6 +167,13 @@ class ColumnarStore {
   bool ExportBinary(const std::string& path) const;
 
   // s24: Store-Persistenz (Verzeichnis mit Manifest + part-*.col) + Compaction.
+  // Save persistiert sealed Parts als part-<id>.col plus -- falls nicht leer --
+  // den aktiven (unsealed) Part als part-<id>-active.col; Manifest-Zeilen sind
+  // "<id> <fname> <rows> <active 0/1>" (0 = sealed, 1 = aktiv). Manifest wird
+  // ZULETZT atomar (tmp + rename + fsync) geschrieben; leere Active => kein
+  // File (Verhalten wie bisher). Load stellt aktive Rows unsealed/mutabel
+  // wieder her (TotalRows identisch) und gibt false bei fehlendem/korruptem
+  // Part-File zurueck.
   bool Save(const std::string& dir) const;
   bool Load(const std::string& dir);
   void Compact();

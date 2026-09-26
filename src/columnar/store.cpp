@@ -9,8 +9,12 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace dbengine::columnar {
 
@@ -36,6 +40,44 @@ bool ReadI64(std::ifstream& in, int64_t& v) {
 }
 bool ReadU32(std::ifstream& in, uint32_t& v) {
   return static_cast<bool>(in.read(reinterpret_cast<char*>(&v), sizeof(v)));
+}
+
+// Crash-Safety nach WAL-Vorbild (src/storage/wal.cpp): tmp-File + rename +
+// fsync File + fsync Directory. File-fsync ist hart (false bei Fehler),
+// Dir-fsync best-effort (wie Wal::fsync_dir_of).
+bool FsyncFileByPath(const std::string& path) {
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return false;
+  int r = ::fsync(fd);
+  ::close(fd);
+  return r == 0;
+}
+
+void FsyncDirOf(const std::string& path) {
+  auto slash = path.find_last_of('/');
+  std::string dir =
+      (slash == std::string::npos) ? "." : path.substr(0, slash);
+  if (dir.empty()) dir = ".";
+  int dfd = ::open(dir.c_str(), O_RDONLY
+#ifdef O_DIRECTORY
+                                   | O_DIRECTORY
+#endif
+  );
+  if (dfd < 0) return;  // best effort (z.B. exotisches FS)
+  (void)::fsync(dfd);
+  ::close(dfd);
+}
+
+void FsyncDirPath(const std::string& dir) {
+  std::string d = dir.empty() ? "." : dir;
+  int dfd = ::open(d.c_str(), O_RDONLY
+#ifdef O_DIRECTORY
+                                   | O_DIRECTORY
+#endif
+  );
+  if (dfd < 0) return;  // best effort
+  (void)::fsync(dfd);
+  ::close(dfd);
 }
 }  // namespace
 
@@ -250,33 +292,50 @@ bool Part::DecodeBinary(const std::string& path,
 // i64 min | i64 max | u64 nruns | runs(value i64, count u64) |
 // u64 dict_size | per entry u32 len + bytes | u64 ncodes | codes u32
 bool Part::Save(const std::string& path) const {
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) return false;
-  out.write("COL1", 4);
-  WriteU64(out, id_);
-  WriteU64(out, static_cast<uint64_t>(name_.size()));
-  if (!name_.empty()) out.write(name_.data(), (std::streamsize)name_.size());
-  const uint64_t rows = static_cast<uint64_t>(size());
-  WriteU64(out, rows);
-  WriteI64(out, empty() ? 0 : Min());
-  WriteI64(out, empty() ? 0 : Max());
-  auto runs = EncodeRle(ints_.data());
-  WriteU64(out, static_cast<uint64_t>(runs.size()));
-  for (const auto& r : runs) {
-    WriteI64(out, r.value);
-    WriteU64(out, r.count);
+  // Crash-safe: tmp-File schreiben + fsync + rename + dir-fsync (WAL-Vorbild).
+  // Serialisierung unveraendert (COL1-Layout, s. Kommentar unten).
+  const std::string tmp_path = path + ".tmp";
+  {
+    std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write("COL1", 4);
+    WriteU64(out, id_);
+    WriteU64(out, static_cast<uint64_t>(name_.size()));
+    if (!name_.empty()) out.write(name_.data(), (std::streamsize)name_.size());
+    const uint64_t rows = static_cast<uint64_t>(size());
+    WriteU64(out, rows);
+    WriteI64(out, empty() ? 0 : Min());
+    WriteI64(out, empty() ? 0 : Max());
+    auto runs = EncodeRle(ints_.data());
+    WriteU64(out, static_cast<uint64_t>(runs.size()));
+    for (const auto& r : runs) {
+      WriteI64(out, r.value);
+      WriteU64(out, r.count);
+    }
+    const auto& dict = strs_.dict_values();
+    const auto& codes = strs_.codes();
+    WriteU64(out, static_cast<uint64_t>(dict.size()));
+    for (const auto& s : dict) {
+      WriteU32(out, static_cast<uint32_t>(s.size()));
+      if (!s.empty()) out.write(s.data(), (std::streamsize)s.size());
+    }
+    WriteU64(out, static_cast<uint64_t>(codes.size()));
+    for (uint32_t c : codes) WriteU32(out, c);
+    out.flush();
+    if (!out) return false;
+    out.close();
+    if (!out) return false;
   }
-  const auto& dict = strs_.dict_values();
-  const auto& codes = strs_.codes();
-  WriteU64(out, static_cast<uint64_t>(dict.size()));
-  for (const auto& s : dict) {
-    WriteU32(out, static_cast<uint32_t>(s.size()));
-    if (!s.empty()) out.write(s.data(), (std::streamsize)s.size());
+  if (!FsyncFileByPath(tmp_path)) return false;
+  std::error_code ec;
+  std::filesystem::rename(tmp_path, path, ec);
+  if (ec) {
+    std::error_code ec2;
+    std::filesystem::remove(tmp_path, ec2);
+    return false;
   }
-  WriteU64(out, static_cast<uint64_t>(codes.size()));
-  for (uint32_t c : codes) WriteU32(out, c);
-  out.flush();
-  return static_cast<bool>(out);
+  FsyncDirOf(path);
+  return true;
 }
 
 Part Part::Load(const std::string& path) {
@@ -459,53 +518,138 @@ bool ColumnarStore::ExportBinary(const std::string& path) const {
 }
 
 bool ColumnarStore::Save(const std::string& dir) const {
+  namespace fs = std::filesystem;
   std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
+  fs::create_directories(dir, ec);
   if (ec) return false;
-  std::ofstream man(std::filesystem::path(dir) / "manifest.txt",
-                    std::ios::trunc);
-  if (!man) return false;
-  man << parts_.size() << "\n";
-  for (const auto& p : parts_) {
-    const std::string fname = "part-" + std::to_string(p.id()) + ".col";
-    man << p.id() << " " << fname << " " << p.size() << "\n";
-  }
-  man.flush();
-  if (!man) return false;
+  // Reihenfolge (Crash-Safety): erst alle Part-Files (je tmp+rename+fsync
+  // via Part::Save), Manifest ZULETZT (tmp+rename+fsync). Crash vor Manifest
+  // => altes Manifest bleibt gueltig; Crash nach Manifest => alles da.
+  const bool has_active = !active_.empty();
+  const std::string active_fname =
+      "part-" + std::to_string(active_.id()) + "-active.col";
   for (const auto& p : parts_) {
     const std::string fpath =
-        (std::filesystem::path(dir) / ("part-" + std::to_string(p.id()) + ".col"))
+        (fs::path(dir) / ("part-" + std::to_string(p.id()) + ".col"))
             .string();
     if (!p.Save(fpath)) return false;
   }
+  if (has_active) {
+    const std::string fpath = (fs::path(dir) / active_fname).string();
+    if (!active_.Save(fpath)) return false;
+  }
+  // Manifest atomar schreiben.
+  const std::string man_path = (fs::path(dir) / "manifest.txt").string();
+  const std::string man_tmp = man_path + ".tmp";
+  {
+    std::ofstream man(man_tmp, std::ios::trunc);
+    if (!man) return false;
+    const size_t n = parts_.size() + (has_active ? 1 : 0);
+    man << n << "\n";
+    for (const auto& p : parts_) {
+      const std::string fname = "part-" + std::to_string(p.id()) + ".col";
+      man << p.id() << " " << fname << " " << p.size() << " 0\n";
+    }
+    if (has_active) {
+      man << active_.id() << " " << active_fname << " " << active_.size()
+          << " 1\n";
+    }
+    man.flush();
+    if (!man) return false;
+    man.close();
+    if (!man) return false;
+  }
+  if (!FsyncFileByPath(man_tmp)) return false;
+  fs::rename(man_tmp, man_path, ec);
+  if (ec) {
+    std::error_code ec2;
+    fs::remove(man_tmp, ec2);
+    return false;
+  }
+  FsyncDirPath(dir);
   return true;
 }
 
 bool ColumnarStore::Load(const std::string& dir) {
-  std::ifstream man(std::filesystem::path(dir) / "manifest.txt");
+  namespace fs = std::filesystem;
+  std::ifstream man(fs::path(dir) / "manifest.txt");
   if (!man) return false;
   size_t n = 0;
   if (!(man >> n)) return false;
+  std::string eol;
+  std::getline(man, eol);  // Rest der Count-Zeile konsumieren
+  struct Entry {
+    uint64_t id = 0;
+    std::string fname;
+    uint64_t rows = 0;
+    int active = 0;
+  };
+  std::vector<Entry> entries;
+  entries.reserve(n);
+  for (size_t i = 0; i < n; ++i) {
+    std::string line;
+    if (!std::getline(man, line)) return false;
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty()) return false;
+    std::istringstream iss(line);
+    uint64_t id = 0, rows_expect = 0;
+    std::string fname;
+    if (!(iss >> id >> fname >> rows_expect)) return false;
+    int active = 0;  // fehlende 4. Spalte = altes Format => sealed
+    if (iss >> active) {
+      if (active != 0 && active != 1) return false;
+      std::string extra;
+      if (iss >> extra) return false;
+    }
+    // Pfad-Traversal abwehren: nur flache Dateinamen.
+    if (fname.empty() || fname.find('/') != std::string::npos ||
+        fname.find('\\') != std::string::npos ||
+        fname.find("..") != std::string::npos)
+      return false;
+    entries.push_back({id, fname, rows_expect, active});
+  }
+  size_t active_count = 0;
+  for (const auto& e : entries) active_count += (e.active == 1 ? 1 : 0);
+  if (active_count > 1) return false;
+  // Erst in Locals laden, erst bei vollem Erfolg zuweisen (atomar).
   std::vector<Part> parts;
   parts.reserve(n);
   uint64_t max_id = 0;
-  for (size_t i = 0; i < n; ++i) {
-    uint64_t id = 0, rows_expect = 0;
-    std::string fname;
-    if (!(man >> id >> fname >> rows_expect)) return false;
-    const std::string fpath = (std::filesystem::path(dir) / fname).string();
+  bool have_any = false;
+  bool have_active = false;
+  Part pending_active(0);
+  for (const auto& e : entries) {
+    const std::string fpath = (fs::path(dir) / e.fname).string();
     try {
       Part p = Part::Load(fpath);
-      if (p.size() != rows_expect) return false;
-      max_id = std::max(max_id, p.id());
-      parts.push_back(std::move(p));
+      if (p.size() != static_cast<size_t>(e.rows)) return false;
+      if (p.id() != e.id) return false;
+      if (!have_any || p.id() > max_id) max_id = p.id();
+      have_any = true;
+      if (e.active == 1) {
+        // Unsealed wiederherstellen (mutable): Rows kopieren, nicht sealen.
+        Part act(p.id(), p.name());
+        for (size_t i = 0; i < p.size(); ++i)
+          act.Append(p.ints().data()[i], p.strs().At(i));
+        pending_active = std::move(act);
+        have_active = true;
+      } else {
+        parts.push_back(std::move(p));
+      }
     } catch (...) {
       return false;
     }
   }
   parts_ = std::move(parts);
-  next_id_ = max_id + 1;
-  active_ = Part(next_id_++);
+  if (have_active) {
+    active_ = std::move(pending_active);
+    next_id_ = max_id + 1;
+    if (next_id_ == 0) next_id_ = 1;  // Ueberlauf-Paranoia
+  } else {
+    next_id_ = have_any ? max_id + 1 : 1;
+    if (next_id_ == 0) next_id_ = 1;
+    active_ = Part(next_id_++);
+  }
   return true;
 }
 

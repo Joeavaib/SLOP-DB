@@ -2,7 +2,9 @@
 
 #include "dbengine/sql/executor.h"
 
+#include <cctype>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 namespace dbengine::sql {
@@ -482,8 +484,11 @@ Result Executor::execSelect(const SelectStmt& s) {
   std::vector<std::vector<Value>> allRows;
   allRows.reserve(kvs.size());
   for (auto& [k, v] : kvs) {
-    std::string enc = v;
-    if (auto mv = mvcc_.Read(rtxn, k); mv.has_value()) enc = *mv;
+    (void)v;  // Key-Menge aus KV, Wert NUR aus MVCC (kein KV-Fallback).
+    // Dirty-Read-Fix: KV-only Keys ohne committed MVCC-Version sind unsichtbar.
+    auto mv = mvcc_.Read(rtxn, k);
+    if (!mv.has_value()) continue;
+    const std::string& enc = *mv;
     try {
       allRows.push_back(decodeRow(enc, sch.columns.size()));
     } catch (...) {
@@ -521,44 +526,90 @@ void Executor::applyCreateRecord(const std::string& table,
   kv_.Put("sql/__schema/" + norm, schemaEnc);
 }
 
-void Executor::applyInsertRecord(const std::string& table, const std::string& key,
+bool Executor::applyInsertRecord(const std::string& table, const std::string& key,
                                  const std::string& rowEnc) {
   const std::string norm = normalizeTable(table);
-  if (tables_.find(norm) == tables_.end()) return;  // ohne Schema nicht replaybar
+  if (tables_.find(norm) == tables_.end()) return false;  // ohne Schema nicht replaybar
   kv_.Put(key, rowEnc);
   txn::Transaction w = mvcc_.BeginWriteBlocking();
   if (mvcc_.Write(w, key, rowEnc)) {
-    mvcc_.Commit(w);
-  } else {
+    if (mvcc_.Commit(w)) return true;
     mvcc_.Abort(w);
+    return false;
   }
+  mvcc_.Abort(w);
+  return false;
 }
 
-void Executor::recover() {
-  if (wal_ == nullptr) return;
+std::size_t Executor::recover() {
+  recover_skipped_ = 0;
+  recover_applied_ = 0;
+  if (wal_ == nullptr) return 0;
   auto recs = wal_->replay();
   for (auto& r : recs) {
     auto parts = splitWal(r.data);
-    if (parts.empty()) continue;
+    if (parts.empty()) {
+      ++recover_skipped_;
+      continue;
+    }
     if (parts[0] == "C" && parts.size() == 3) {
       try {
         applyCreateRecord(parts[1], parts[2]);
+        ++recover_applied_;
       } catch (...) {
-        continue;
+        ++recover_skipped_;
       }
     } else if (parts[0] == "I" && parts.size() == 4) {
       try {
-        applyInsertRecord(parts[1], walUnescape(parts[2]), parts[3]);
+        if (applyInsertRecord(parts[1], walUnescape(parts[2]), parts[3])) {
+          ++recover_applied_;
+        } else {
+          ++recover_skipped_;
+        }
+      } catch (...) {
+        ++recover_skipped_;
+      }
+    } else {
+      ++recover_skipped_;  // unbekannter Opcode / falsche Arity
+    }
+  }
+  // RowID-Counter aus MAX-Suffix aller "#<id>"-Keys heben (statt Key-Anzahl):
+  // Suffixe wurden aus next_rowid generiert, daher ist max+1 der naechste
+  // kollisionsfreie Suffix. Nur anheben, nie absenken.
+  for (auto& [t, sch] : tables_) {
+    const auto kvs = kv_.Scan(tablePrefix(t));
+    bool found = false;
+    std::uint64_t maxId = 0;
+    for (auto& [key, val] : kvs) {
+      (void)val;
+      const std::size_t pos = key.rfind('#');
+      if (pos == std::string::npos || pos + 1 >= key.size()) continue;
+      bool allDigits = true;
+      for (std::size_t i = pos + 1; i < key.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(key[i]))) {
+          allDigits = false;
+          break;
+        }
+      }
+      if (!allDigits) continue;
+      try {
+        const auto id =
+            static_cast<std::uint64_t>(std::stoull(key.substr(pos + 1)));
+        if (!found || id > maxId) maxId = id;
+        found = true;
       } catch (...) {
         continue;
       }
     }
+    if (found) {
+      if (maxId == std::numeric_limits<std::uint64_t>::max()) {
+        sch.next_rowid = maxId;  // Overflow-Schutz (praktisch unerreichbar)
+      } else if (maxId + 1 > sch.next_rowid) {
+        sch.next_rowid = maxId + 1;
+      }
+    }
   }
-  // RowID-Counter auf Key-Anzahl heben (Kollisions-Suffixe bleiben eindeutig).
-  for (auto& [t, sch] : tables_) {
-    std::size_t n = kv_.Scan(tablePrefix(t)).size();
-    if (n > sch.next_rowid) sch.next_rowid = static_cast<std::uint64_t>(n);
-  }
+  return recover_skipped_;
 }
 
 }  // namespace dbengine::sql

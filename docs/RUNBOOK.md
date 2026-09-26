@@ -49,13 +49,18 @@ SLO-Richtwerte (N1): KV Point-Lookup p99 <1ms, SQL-PK <5ms, HNSW Recall@10
 ## 4. Recovery
 
 WAL ist Single Source of Truth für Crash-Recovery (A3: <30s bei 100GB,
-kein Verlust bei Kill -9):
+Kill-9-sicher nur nach `flush()`; ungeflushte `append`s gehen verloren —
+per Design, siehe `wal.h`):
 
 1. `open()` beim Start: `scan()` + Torn-Tail-Cap + `max-LSN`-Bestimmung.
 2. `replay()` / `replay_file(path)` anwenden (Prefix-Semantik bei CRC-Fehler).
 3. Weiter mit `next_lsn = max+1`; kein Checkpoint beim Start nötig.
 4. `checkpoint(lsn)` erst nach durablem Snapshot der State-Machine
    (Pager/Columnar-Flush), crash-sicher via `tmp+rename`.
+
+Persistenzgrenzen: Columnar aktiver Part erst nach `Seal`/`Save` dauerhaft
+(nach s27 inkl. Active-Save); Raft nur nach explizitem `SaveLog`/`SaveSnapshot`
+bzw. Opt-in-Autosave dauerhaft, sonst in-memory — kein Auto-Persist bei `append`.
 
 Manuelle Prüfung:
 

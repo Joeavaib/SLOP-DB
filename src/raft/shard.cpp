@@ -1,11 +1,14 @@
 #include "dbengine/raft/shard.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
@@ -68,6 +71,33 @@ bool ReadFull(int fd, char* buf, std::size_t n) {
   }
   return true;
 }
+// Crash-Safety (analog storage/wal.cpp): tmp-File fsyncen, rename, Dir fsyncen.
+bool FsyncFileFd(int fd) {
+#ifdef __linux__
+  if (::fdatasync(fd) == 0) return true;
+#endif
+  return ::fsync(fd) == 0;
+}
+bool FsyncFileByPath(const std::string& path) {
+  int fd = ::open(path.c_str(), O_RDONLY);
+  if (fd < 0) return false;
+  bool ok = FsyncFileFd(fd);
+  ::close(fd);
+  return ok;
+}
+void FsyncDirOf(const std::string& path) {
+  auto slash = path.find_last_of('/');
+  std::string dir = (slash == std::string::npos) ? "." : path.substr(0, slash);
+  if (dir.empty()) dir = ".";
+  int dfd = ::open(dir.c_str(), O_RDONLY
+#ifdef O_DIRECTORY
+                                 | O_DIRECTORY
+#endif
+  );
+  if (dfd < 0) return;  // best effort
+  (void)::fsync(dfd);
+  ::close(dfd);
+}
 }  // namespace
 
 RaftGroup::RaftGroup(int shard_id, std::string range_start, std::string range_end)
@@ -92,6 +122,7 @@ RaftGroup::RaftGroup(RaftGroup&& other) noexcept {
   leader_id_ = other.leader_id_;
   term_ = other.term_;
   log_base_ = other.log_base_;
+  autosave_path_ = std::move(other.autosave_path_);
 }
 
 RaftGroup& RaftGroup::operator=(RaftGroup&& other) noexcept {
@@ -102,6 +133,7 @@ RaftGroup& RaftGroup::operator=(RaftGroup&& other) noexcept {
     leader_id_ = other.leader_id_;
     term_ = other.term_;
     log_base_ = other.log_base_;
+    autosave_path_ = std::move(other.autosave_path_);
   }
   return *this;
 }
@@ -256,15 +288,34 @@ std::uint64_t RaftGroup::append(std::string command) {
   if (!replicateToFollowers(entry)) {
     return 0;  // kein Quorum — Eintrag bleibt uncommitted
   }
-  std::lock_guard<std::mutex> lock(mutex_);
-  for (auto& n : nodes_) {
-    if (!n.alive) continue;
-    if (!n.log.empty() && n.log.back().index >= entry.index) {
-      if (n.commit_index < entry.index) n.commit_index = entry.index;
-      apply(n);
+  std::string autosave;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& n : nodes_) {
+      if (!n.alive) continue;
+      if (!n.log.empty() && n.log.back().index >= entry.index) {
+        if (n.commit_index < entry.index) n.commit_index = entry.index;
+        apply(n);
+      }
     }
+    autosave = autosave_path_;
+  }
+  // Opt-in Autosave (best effort, ausserhalb des Locks: SaveLog lockt selbst).
+  // Fehler lassen den Commit gueltig; naechster append versucht erneut.
+  if (!autosave.empty()) {
+    (void)SaveLog(autosave);
   }
   return entry.index;
+}
+
+void RaftGroup::set_autosave_log(std::string path) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  autosave_path_ = std::move(path);
+}
+
+void RaftGroup::clear_autosave() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  autosave_path_.clear();
 }
 
 void RaftGroup::killLeader() {
@@ -372,25 +423,45 @@ bool RaftGroup::is_caught_up(int node_id) const {
 
 // ---- s25: persistentes Log -------------------------------------------------
 bool RaftGroup::SaveLog(const std::string& path) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (leader_id_ < 0) return false;
-  const Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) return false;
-  out.write("RAFT1", 5);
-  W64(out, term_);
-  W64(out, leader.commit_index);
-  W64(out, log_base_);
-  W64(out, static_cast<std::uint64_t>(leader.log.size()));
-  for (const auto& e : leader.log) {
-    W64(out, e.term);
-    W64(out, e.index);
-    W32(out, static_cast<std::uint32_t>(e.command.size()));
-    if (!e.command.empty()) out.write(e.command.data(), (std::streamsize)e.command.size());
+  // Zustand unter Lock kopieren, dann ohne Lock schreiben (kein Blocken von
+  // append/elect waehrend File-IO; crash-sicher via tmp + rename + fsync).
+  std::uint64_t term = 0, commit = 0, base = 0;
+  std::vector<Entry> log;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (leader_id_ < 0) return false;
+    const Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
+    term = term_;
+    commit = leader.commit_index;
+    base = log_base_;
+    log = leader.log;
+  }
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write("RAFT1", 5);
+    W64(out, term);
+    W64(out, commit);
+    W64(out, base);
+    W64(out, static_cast<std::uint64_t>(log.size()));
+    for (const auto& e : log) {
+      W64(out, e.term);
+      W64(out, e.index);
+      W32(out, static_cast<std::uint32_t>(e.command.size()));
+      if (!e.command.empty()) out.write(e.command.data(), (std::streamsize)e.command.size());
+      if (!out) return false;
+    }
+    out.flush();
     if (!out) return false;
   }
-  out.flush();
-  return static_cast<bool>(out);
+  if (!FsyncFileByPath(tmp)) return false;
+  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  FsyncDirOf(path);
+  return true;
 }
 
 bool RaftGroup::LoadLog(const std::string& path) {
@@ -420,7 +491,11 @@ bool RaftGroup::LoadLog(const std::string& path) {
   for (auto& nd : nodes_) {
     nd.log = log;
     nd.commit_index = commit;
-    if (nd.last_applied < base || nd.last_applied > commit) nd.last_applied = base;
+    // Phantom-Schutz: applied komplett neu aufbauen (keine Keys aus frueherem
+    // Zustand), last_applied auf Basis zuruecksetzen. Gilt auch fuer tote
+    // Knoten (konsistent fuers spaetere revive via Catch-up + apply).
+    nd.applied.clear();
+    nd.last_applied = base;
     if (nd.alive) apply(nd);
   }
   return true;
@@ -428,23 +503,39 @@ bool RaftGroup::LoadLog(const std::string& path) {
 
 // ---- s25: Snapshots --------------------------------------------------------
 bool RaftGroup::SaveSnapshot(const std::string& path) const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (leader_id_ < 0) return false;
-  const Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) return false;
-  out.write("RSNP1", 5);
-  W64(out, leader.commit_index);  // last_included_index
-  W64(out, static_cast<std::uint64_t>(leader.applied.size()));
-  for (const auto& [k, v] : leader.applied) {
-    W32(out, static_cast<std::uint32_t>(k.size()));
-    if (!k.empty()) out.write(k.data(), (std::streamsize)k.size());
-    W32(out, static_cast<std::uint32_t>(v.size()));
-    if (!v.empty()) out.write(v.data(), (std::streamsize)v.size());
+  std::uint64_t last_idx = 0;
+  std::map<std::string, std::string> snap;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (leader_id_ < 0) return false;
+    const Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
+    last_idx = leader.commit_index;
+    snap = leader.applied;
+  }
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write("RSNP1", 5);
+    W64(out, last_idx);  // last_included_index
+    W64(out, static_cast<std::uint64_t>(snap.size()));
+    for (const auto& [k, v] : snap) {
+      W32(out, static_cast<std::uint32_t>(k.size()));
+      if (!k.empty()) out.write(k.data(), (std::streamsize)k.size());
+      W32(out, static_cast<std::uint32_t>(v.size()));
+      if (!v.empty()) out.write(v.data(), (std::streamsize)v.size());
+      if (!out) return false;
+    }
+    out.flush();
     if (!out) return false;
   }
-  out.flush();
-  return static_cast<bool>(out);
+  if (!FsyncFileByPath(tmp)) return false;
+  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  FsyncDirOf(path);
+  return true;
 }
 
 bool RaftGroup::LoadSnapshot(const std::string& path) {
@@ -483,10 +574,13 @@ bool RaftGroup::LoadSnapshot(const std::string& path) {
   for (auto& nd : nodes_) {
     nd.log = tail;
     nd.applied = snap;
+    // commit nie zuruecksetzen; last_applied bewusst auf last_idx (NICHT auf
+    // commit), damit apply() den committeten Tail (Index > last_idx,
+    // <= commit) re-applied und kein Commit bei aelterem Snapshot verloren
+    // geht. Tote Knoten nur mit Zustand belegen (apply bei revive).
     nd.commit_index = std::max(nd.commit_index, last_idx);
-    if (nd.commit_index < last_idx) nd.commit_index = last_idx;
-    nd.last_applied = nd.commit_index;
-    if (nd.alive) apply(nd);  // no-op wenn nichts ueber last_idx committet
+    nd.last_applied = last_idx;
+    if (nd.alive) apply(nd);
   }
   return true;
 }

@@ -28,12 +28,8 @@ struct FileHeader {
 };
 
 float sub_l2_squared(const float* a, const float* b, int n) {
-  double acc = 0.0;
-  for (int i = 0; i < n; ++i) {
-    const double d = static_cast<double>(a[i]) - b[i];
-    acc += d * d;
-  }
-  return static_cast<float>(acc);
+  // Heisser Pfad (PQ-Lloyd, IVF-Coarse, ADC-Tabellen): AVX2-Kern teilen.
+  return dbengine::vector::detail::l2_squared_kernel(a, b, n);
 }
 }  // namespace
 

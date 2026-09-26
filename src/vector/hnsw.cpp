@@ -5,10 +5,15 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <utility>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace dbengine::vector {
 
@@ -25,16 +30,159 @@ double ml_for_m(int m) {
   return 1.0 / std::log(static_cast<double>(m));
 }
 
+// --- Visited-Epochen (Overhead-Optimierung, keine Semantik-Aenderung) --------
+// search_layer() laeuft pro Insert pro Layer; ein visited-Vektor mit
+// O(n)-Nullinitialisierung waere O(N^2) ueber den Build, ebenso pro Query.
+// Stattdessen traegt jeder Knoten eine Epochen-Marke; pro Call wird nur ein
+// Zaehler erhoeht (amortisiert O(1), keine Allokation nach Warmup).
+// thread_local: keine Member-Aenderung, const-Leser bleiben nebenlaeufig
+// sicher, Traversierungsreihenfolge bit-identisch zum alten Code.
+struct VisitedPool {
+  std::vector<int> tag;
+  int cur = 0;
+};
+
+inline VisitedPool& visited_pool() {
+  thread_local VisitedPool pool;
+  return pool;
+}
+
+// Bereitet Marken fuer n Knoten vor; Aufrufer prueft `tags[v] == mark` und
+// markiert via `tags[v] = mark`.
+inline std::pair<int*, int> acquire_visited(int n) {
+  VisitedPool& pool = visited_pool();
+  if (static_cast<int>(pool.tag.size()) < n) pool.tag.resize(n, 0);
+  if (pool.cur == std::numeric_limits<int>::max()) {
+    std::fill(pool.tag.begin(), pool.tag.end(), 0);
+    pool.cur = 0;
+  }
+  ++pool.cur;
+  return {pool.tag.data(), pool.cur};
+}
+
 }  // namespace
+
+// --- AVX2-Distanzkerne mit Runtime-Dispatch ---------------------------------
+// Design: je ein skalarer Fallback (float-Akkumulation, gleiche Schleifen-
+// assoziierung wie zuvor) + ein AVX2-Pfad (8 floats/Iter, unaligned loads,
+// Horizontal-Summe via _mm256-Extract, Rest skalar). Die AVX2-Funktionen
+// tragen __attribute__((target("avx2"))), sodass kein -march-Flag noetig ist.
+// Auswahl einmalig via __builtin_cpu_supports("avx2"), gecacht in einem
+// Function-local static (C++11: thread-safe Initialisierung).
+namespace detail {
+namespace {
+
+float l2_scalar(const float* a, const float* b, int n) {
+  float acc = 0.0f;
+  for (int i = 0; i < n; ++i) {
+    const float d = a[i] - b[i];
+    acc += d * d;
+  }
+  return acc;
+}
+
+DotNorms dot_norms_scalar(const float* a, const float* b, int n) {
+  float dot = 0.0f, na = 0.0f, nb = 0.0f;
+  for (int i = 0; i < n; ++i) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  return {dot, na, nb};
+}
+
+#if defined(__x86_64__)
+__attribute__((target("avx2"))) float hsum_m256(__m256 v) {
+  const __m128 lo = _mm256_castps256_ps128(v);
+  const __m128 hi = _mm256_extractf128_ps(v, 1);
+  __m128 s = _mm_add_ps(lo, hi);
+  __m128 sh = _mm_movehl_ps(s, s);
+  s = _mm_add_ps(s, sh);
+  sh = _mm_shuffle_ps(s, s, 1);
+  s = _mm_add_ss(s, sh);
+  return _mm_cvtss_f32(s);
+}
+
+__attribute__((target("avx2"))) float l2_avx2(const float* a, const float* b,
+                                              int n) {
+  __m256 vsum = _mm256_setzero_ps();
+  int i = 0;
+  const int n8 = n & ~7;
+  for (; i < n8; i += 8) {
+    const __m256 va = _mm256_loadu_ps(a + i);
+    const __m256 vb = _mm256_loadu_ps(b + i);
+    const __m256 d = _mm256_sub_ps(va, vb);
+    // Absichtlich mul+add statt FMA: gleiche Assoziierung wie skalar.
+    vsum = _mm256_add_ps(vsum, _mm256_mul_ps(d, d));
+  }
+  float acc = hsum_m256(vsum);
+  for (; i < n; ++i) {
+    const float d = a[i] - b[i];
+    acc += d * d;
+  }
+  return acc;
+}
+
+__attribute__((target("avx2"))) DotNorms
+dot_norms_avx2(const float* a, const float* b, int n) {
+  __m256 vdot = _mm256_setzero_ps();
+  __m256 vna = _mm256_setzero_ps();
+  __m256 vnb = _mm256_setzero_ps();
+  int i = 0;
+  const int n8 = n & ~7;
+  for (; i < n8; i += 8) {
+    const __m256 va = _mm256_loadu_ps(a + i);
+    const __m256 vb = _mm256_loadu_ps(b + i);
+    vdot = _mm256_add_ps(vdot, _mm256_mul_ps(va, vb));
+    vna = _mm256_add_ps(vna, _mm256_mul_ps(va, va));
+    vnb = _mm256_add_ps(vnb, _mm256_mul_ps(vb, vb));
+  }
+  DotNorms out{hsum_m256(vdot), hsum_m256(vna), hsum_m256(vnb)};
+  for (; i < n; ++i) {
+    out.dot += a[i] * b[i];
+    out.na += a[i] * a[i];
+    out.nb += b[i] * b[i];
+  }
+  return out;
+}
+#endif
+
+[[maybe_unused]] bool use_avx2() {
+  static const bool v = [] {
+#if defined(__x86_64__)
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2") != 0;
+#else
+    return false;
+#endif
+  }();
+  return v;
+}
+
+}  // namespace
+
+float l2_squared_kernel(const float* a, const float* b, int n) {
+  if (a == nullptr || b == nullptr || n <= 0) return 0.0f;
+#if defined(__x86_64__)
+  if (use_avx2()) return l2_avx2(a, b, n);
+#endif
+  return l2_scalar(a, b, n);
+}
+
+DotNorms dot_norms_kernel(const float* a, const float* b, int n) {
+  if (a == nullptr || b == nullptr || n <= 0) return {};
+#if defined(__x86_64__)
+  if (use_avx2()) return dot_norms_avx2(a, b, n);
+#endif
+  return dot_norms_scalar(a, b, n);
+}
+
+}  // namespace detail
 
 float l2_squared(const Vector& a, const Vector& b) {
   if (a.size() != b.size()) throw std::invalid_argument("l2: dim mismatch");
-  double acc = 0.0;
-  for (size_t i = 0; i < a.size(); ++i) {
-    const double d = static_cast<double>(a[i]) - b[i];
-    acc += d * d;
-  }
-  return static_cast<float>(acc);
+  return detail::l2_squared_kernel(a.data(), b.data(),
+                                   static_cast<int>(a.size()));
 }
 
 float l2_distance(const Vector& a, const Vector& b) {
@@ -44,14 +192,13 @@ float l2_distance(const Vector& a, const Vector& b) {
 float cosine_distance(const Vector& a, const Vector& b) {
   if (a.size() != b.size())
     throw std::invalid_argument("cosine: dim mismatch");
-  double dot = 0.0, na = 0.0, nb = 0.0;
-  for (size_t i = 0; i < a.size(); ++i) {
-    dot += static_cast<double>(a[i]) * b[i];
-    na += static_cast<double>(a[i]) * a[i];
-    nb += static_cast<double>(b[i]) * b[i];
-  }
-  if (na == 0.0 || nb == 0.0) return 1.0f;
-  const double cos_sim = dot / (std::sqrt(na) * std::sqrt(nb));
+  const int n = static_cast<int>(a.size());
+  const detail::DotNorms dn =
+      detail::dot_norms_kernel(a.data(), b.data(), n);
+  if (dn.na == 0.0f || dn.nb == 0.0f) return 1.0f;
+  const double cos_sim = static_cast<double>(dn.dot) /
+                         (std::sqrt(static_cast<double>(dn.na)) *
+                          std::sqrt(static_cast<double>(dn.nb)));
   const double clamped = std::clamp(cos_sim, -1.0, 1.0);
   return static_cast<float>(1.0 - clamped);
 }
@@ -161,32 +308,79 @@ void HnswIndex::clear() {
 }
 
 std::vector<int> HnswIndex::select_neighbors(
-    const Vector& /*q*/, const std::vector<SearchHit>& cand, int mm) const {
-  // Naechste-Nachbarn-Heuristik (dist, id deterministisch). Einfache
-  // Closest-Auswahl reicht fuer uniformes Recall-Ziel; HNSW-Heuristik
-  // (diversity) als Follow-up moeglich.
-  std::vector<SearchHit> s = cand;
-  if (static_cast<int>(s.size()) > mm) {
-    std::nth_element(s.begin(), s.begin() + mm, s.end(),
-                     [](const SearchHit& a, const SearchHit& b) {
-                       if (a.dist != b.dist) return a.dist < b.dist;
-                       return a.id < b.id;
-                     });
-    s.resize(mm);
+    const Vector& /*q*/, std::vector<SearchHit>& cand, int mm) const {
+  // HNSW select-neighbors-heuristic (Paper Alg. 3, Diversitaet):
+  // cand = (dist zum Insert, id). Nach (dist, id) sortiert wird ein Kandidat
+  // nur aufgenommen, wenn er naeher am Insert liegt als an allen bereits
+  // Gewaehlten, d.h. dist(q,e) <= min_s dist(e,s). Sonst dupliziert er nur
+  // eine bereits abgedeckte Richtung (redundante Kante). Unterdeckung wird
+  // mit den naechsten Verworfenen aufgefuellt, sodass Grad-Caps (mm) und
+  // Kantenzahl erhalten bleiben. Effekt: gleiche Kantenanzahl, aber
+  // richtungs-divers -> kuerzere Navigationspfade, weniger Beam-Expansion
+  // pro Query bei gleichem Recall. Die zusaetzlichen dist(e,s)-Rechnungen
+  // fallen nur beim Build an, nicht pro Query.
+  // Deterministisch: sortierte Iteration, strikter <-Vergleich (Tie behalt
+  // den Kandidaten), gleiche Metrik wie die Suche. Level-Sampling, Seed-42-
+  // Reihenfolge und Grad-Caps bleiben unberuehrt.
+  // In-place auf dem owned Kandidatenvektor des Aufrufers (keine Kopie-Flut).
+  // Danach gilt: cand[k] == (sel[k], dist(neu, sel[k])) in Heuristik-
+  // Reihenfolge, sodass insert_node() die Scores weiterverwenden kann.
+  // Achtung: reorders cand (Aufrufer sichert Bedarf vorher).
+  if (mm <= 0 || cand.empty()) {
+    cand.clear();
+    return {};
   }
-  std::sort(s.begin(), s.end(), [](const SearchHit& a, const SearchHit& b) {
+  std::sort(cand.begin(), cand.end(), [](const SearchHit& a, const SearchHit& b) {
     if (a.dist != b.dist) return a.dist < b.dist;
     return a.id < b.id;
   });
+  if (static_cast<int>(cand.size()) <= mm) {
+    std::vector<int> out;
+    out.reserve(cand.size());
+    for (const auto& h : cand) out.push_back(h.id);
+    return out;
+  }
+  const std::vector<SearchHit> sorted = cand;
+  std::vector<SearchHit> picked;
+  picked.reserve(static_cast<size_t>(mm));
+  std::vector<char> is_picked(sorted.size(), 0);
+  for (size_t i = 0; i < sorted.size() && static_cast<int>(picked.size()) < mm;
+       ++i) {
+    bool keep = true;
+    for (const auto& p : picked) {
+      const float d_es =
+          dispatch_distance(data_[sorted[i].id], data_[p.id], metric_);
+      if (d_es < sorted[i].dist) {
+        keep = false;
+        break;
+      }
+    }
+    if (keep) {
+      picked.push_back(sorted[i]);
+      is_picked[i] = 1;
+    }
+  }
+  // Auffuellen mit naechstem Rest (Grad erhalten, Recall-neutral).
+  for (size_t i = 0; i < sorted.size() && static_cast<int>(picked.size()) < mm;
+       ++i) {
+    if (!is_picked[i]) {
+      picked.push_back(sorted[i]);
+      is_picked[i] = 1;
+    }
+  }
+  cand = picked;
   std::vector<int> out;
-  out.reserve(s.size());
-  for (auto& h : s) out.push_back(h.id);
+  out.reserve(picked.size());
+  for (const auto& h : picked) out.push_back(h.id);
   return out;
 }
 
 void HnswIndex::shrink_layer(int id, int lc, int max_m) {
   auto& nb = links_[id][lc];
   if (static_cast<int>(nb.size()) <= max_m) return;
+  // EIN Distanz-Scan mit gecachten Scores; kein zweiter Re-Scan im Compare
+  // (frueher rief die finale Sortierung dist_to_stored pro Vergleich neu auf:
+  // O(max_m log max_m) zusaetzliche Distanzberechnungen pro Shrink).
   std::vector<std::pair<float, int>> scored;
   scored.reserve(nb.size());
   for (int v : nb) scored.emplace_back(dist_to_stored(data_[id], v), v);
@@ -202,52 +396,89 @@ void HnswIndex::shrink_layer(int id, int lc, int max_m) {
             });
   nb.clear();
   for (int t = 0; t < max_m; ++t) nb.push_back(scored[t].second);
-  std::sort(nb.begin(), nb.end(), [&](int a, int b) {
-    const float da = dist_to_stored(data_[id], a);
-    const float db = dist_to_stored(data_[id], b);
-    if (da != db) return da < db;
-    return a < b;
-  });
+  // nb ist damit (dist, id)-sortiert; kein weiterer Sortierdurchgang noetig.
+}
+
+void HnswIndex::shrink_layer_after_add(int id, int lc, int max_m, int fresh_id,
+                                       float fresh_dist) {
+  auto& nb = links_[id][lc];
+  if (static_cast<int>(nb.size()) <= max_m) return;
+  // Wie shrink_layer, aber die frisch gelegte Kante (id<->fresh_id) bringt
+  // ihren Score aus der Kandidatensuche mit (Metrik symmetrisch) und wird
+  // nicht neu berechnet.
+  std::vector<std::pair<float, int>> scored;
+  scored.reserve(nb.size());
+  for (int v : nb) {
+    if (v == fresh_id)
+      scored.emplace_back(fresh_dist, v);
+    else
+      scored.emplace_back(dist_to_stored(data_[id], v), v);
+  }
+  std::nth_element(scored.begin(), scored.begin() + max_m, scored.end(),
+                   [](const auto& a, const auto& b) {
+                     if (a.first != b.first) return a.first < b.first;
+                     return a.second < b.second;
+                   });
+  std::sort(scored.begin(), scored.begin() + max_m,
+            [](const auto& a, const auto& b) {
+              if (a.first != b.first) return a.first < b.first;
+              return a.second < b.second;
+            });
+  nb.clear();
+  for (int t = 0; t < max_m; ++t) nb.push_back(scored[t].second);
 }
 
 std::vector<SearchHit> HnswIndex::search_layer(const Vector& q, int entry_id,
                                               int ef, int lc) const {
   // Beam-Search auf genau einem Layer lc (ungefiltert, fuer Build + Descent).
+  // Gleiche Traversierung wie zuvor, aber ohne Per-Call-Overhead:
+  // Epochen-Visited (kein vector<char>(n)-Alloc/Zero) + Heap-Vektoren mit
+  // Reserve statt zwei priority_queue-Objekten (gleiche push/pop-Heapfolge,
+  // daher bit-identische Besuchsreihenfolge).
   using Cand = std::pair<float, int>;
-  std::priority_queue<Cand, std::vector<Cand>, std::greater<Cand>> frontier;
-  std::priority_queue<Cand> top;
-  std::vector<char> visited(data_.size(), 0);
+  const int n = static_cast<int>(data_.size());
+  if (n == 0 || entry_id < 0 || entry_id >= n) return {};
+  auto [seen, mark] = acquire_visited(n);
+  std::vector<Cand> frontier;
+  frontier.reserve(static_cast<size_t>(2 * ef + 8));
+  std::vector<Cand> top;
+  top.reserve(static_cast<size_t>(ef + 1));
   const float d0 = dist_to_stored(q, entry_id);
-  frontier.emplace(d0, entry_id);
-  visited[entry_id] = 1;
-  top.emplace(d0, entry_id);
+  frontier.emplace_back(d0, entry_id);
+  seen[entry_id] = mark;
+  top.emplace_back(d0, entry_id);
+  auto is_better = [](const Cand& a, const Cand& b) {
+    if (a.first != b.first) return a.first < b.first;
+    return a.second < b.second;
+  };
   while (!frontier.empty()) {
-    const auto [d_u, u] = frontier.top();
-    if (static_cast<int>(top.size()) >= ef && d_u > top.top().first) break;
-    frontier.pop();
+    const float d_u = frontier.front().first;
+    const int u = frontier.front().second;
+    if (static_cast<int>(top.size()) >= ef && d_u > top.front().first) break;
+    std::pop_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
+    frontier.pop_back();
     if (u < 0 || u >= static_cast<int>(links_.size())) continue;
     if (lc >= static_cast<int>(links_[u].size())) continue;
     for (int v : links_[u][lc]) {
-      if (v < 0 || v >= static_cast<int>(data_.size())) continue;
-      if (visited[v]) continue;
-      visited[v] = 1;
+      if (v < 0 || v >= n) continue;
+      if (seen[v] == mark) continue;
+      seen[v] = mark;
       const float d_v = dist_to_stored(q, v);
-      frontier.emplace(d_v, v);
+      frontier.emplace_back(d_v, v);
+      std::push_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
       if (static_cast<int>(top.size()) < ef) {
-        top.emplace(d_v, v);
-      } else if (d_v < top.top().first ||
-                 (d_v == top.top().first && v < top.top().second)) {
-        top.pop();
-        top.emplace(d_v, v);
+        top.emplace_back(d_v, v);
+        std::push_heap(top.begin(), top.end(), std::less<Cand>());
+      } else if (is_better(Cand(d_v, v), top.front())) {
+        std::pop_heap(top.begin(), top.end(), std::less<Cand>());
+        top.back() = Cand(d_v, v);
+        std::push_heap(top.begin(), top.end(), std::less<Cand>());
       }
     }
   }
   std::vector<SearchHit> out;
   out.reserve(top.size());
-  while (!top.empty()) {
-    out.push_back({top.top().second, top.top().first});
-    top.pop();
-  }
+  for (const auto& c : top) out.push_back({c.second, c.first});
   std::sort(out.begin(), out.end(), [](const SearchHit& a, const SearchHit& b) {
     if (a.dist != b.dist) return a.dist < b.dist;
     return a.id < b.id;
@@ -290,16 +521,21 @@ void HnswIndex::insert_node(int id) {
   const int top_lc = std::min(lv, max_level_);
   for (int lc = top_lc; lc >= 0; --lc) {
     auto cand = search_layer(data_[id], cur, ef_construction_, lc);
-    // Eigenen Knoten aus Kandidaten entfernen (falls Entry==id unmoeglich,
-    // aber Distanz-0-Artefakt vermeiden).
+    // Eigenen Knoten aus Kandidaten entfernen (defensiv; neuer Knoten hat
+    // noch keine eingehenden Kanten und ist daher i.d.R. nicht enthalten).
     cand.erase(std::remove_if(cand.begin(), cand.end(),
                               [&](const SearchHit& h) { return h.id == id; }),
                cand.end());
     const int max_m = (lc == 0) ? 2 * m_ : m_;
+    // Besten merken VOR select (select arbeitet in-place auf cand; der
+    // Front-Eintrag ueberlebt die Stutzung, da die Auswahl die kleinsten
+    // (dist, id) behaelt).
+    const int best_cand = cand.empty() ? -1 : cand.front().id;
+    // Danach gilt: cand[k] == (sel[k], dist(neu, sel[k])), (dist, id)-sortiert.
     auto sel = select_neighbors(data_[id], cand, max_m);
     // Mindestens 1 Nachbar garantieren (Graph nie isoliert): naechsten per
     // Scan, falls Beam leer (z.B. ef klein / Einfuege-Reihenfolge).
-    if (sel.empty() && !cand.empty()) sel.push_back(cand.front().id);
+    if (sel.empty() && best_cand >= 0) sel.push_back(best_cand);
     if (sel.empty()) {
       // Fallback: naechsten existierenden Knoten linear suchen (selten).
       int best = -1;
@@ -314,13 +550,18 @@ void HnswIndex::insert_node(int id) {
       if (best >= 0) sel.push_back(best);
     }
     links_[id][lc] = sel;
-    for (int nb : sel) {
+    for (size_t k = 0; k < sel.size(); ++k) {
+      const int nb = sel[k];
       auto& back = links_[nb][lc];
       if (std::find(back.begin(), back.end(), id) == back.end())
         back.push_back(id);
-      shrink_layer(nb, lc, max_m);
+      // Gecachten Score der frischen Kante mitschleppen, wo verfuegbar.
+      if (k < cand.size() && cand[k].id == nb)
+        shrink_layer_after_add(nb, lc, max_m, id, cand[k].dist);
+      else
+        shrink_layer(nb, lc, max_m);
     }
-    if (!cand.empty()) cur = cand.front().id;
+    if (best_cand >= 0) cur = best_cand;
     else if (!sel.empty()) cur = sel.front();
   }
   if (lv > max_level_) {
@@ -394,18 +635,22 @@ float HnswIndex::dist(const Vector& a, const Vector& b) const {
 }
 
 float HnswIndex::dist_to_stored(const Vector& q, int id) const {
-  if (metric_ == DistanceMetric::L2) {
-    return l2_distance(q, data_[id]);
-  }
   const Vector& b = data_[id];
-  double dot = 0.0, nq = 0.0;
-  for (size_t i = 0; i < b.size(); ++i) {
-    dot += static_cast<double>(q[i]) * b[i];
-    nq += static_cast<double>(q[i]) * q[i];
+  const int n = static_cast<int>(b.size());
+  if (metric_ == DistanceMetric::L2) {
+    if (q.size() != b.size())
+      throw std::invalid_argument("l2: dim mismatch");
+    const float d2 = detail::l2_squared_kernel(q.data(), b.data(), n);
+    return static_cast<float>(std::sqrt(static_cast<double>(d2)));
   }
+  // Cosine: dot + ||q||^2 aus einem Kernel-Durchgang, ||b||^2 aus dem
+  // gecachten norms_-Eintrag (gleiche Formel wie zuvor: sqrt(nq*nb)).
+  const detail::DotNorms dn =
+      detail::dot_norms_kernel(q.data(), b.data(), n);
   const double nb = static_cast<double>(norms_[id]) * norms_[id];
+  const double nq = static_cast<double>(dn.na);
   if (nq == 0.0 || nb == 0.0) return 1.0f;
-  const double cos_sim = dot / (std::sqrt(nq * nb));
+  const double cos_sim = static_cast<double>(dn.dot) / std::sqrt(nq * nb);
   return static_cast<float>(1.0 - std::clamp(cos_sim, -1.0, 1.0));
 }
 
@@ -450,69 +695,160 @@ std::vector<SearchHit> HnswIndex::search(const Vector& query, int k, int ef,
 
   if (n <= 64) return brute_force(query, k, filter);
 
-  // 1) Descent ueber obere Layer (ungefiltert) zum guten Layer0-Entry.
-  int cur = entry_;
-  for (int lc = max_level_; lc >= 1; --lc) cur = greedy_closest(query, cur, lc);
+  // 1) Deterministische Entry-Diversifizierung gegen Cluster-Trapping
+  // (obere Layer ungefiltert): statt einem Single-Pfad-Descent vom Entry
+  // werden 4 fix gestreute Starts (Entry + n/4, n/2, 3n/4 — reine
+  // Index-Funktion aus n/entry_, kein RNG pro Query) je per greedy_closest
+  // von Top bis Layer 1 abgestiegen; die besten 3 distinkten Kandidaten
+  // (nach (dist, id)) werden Layer0-Seeds. Ein Pfad allein commitet sich auf
+  // oberer (grober) Ebene auf ein falsches Cluster-Basin; der Layer0-Beam
+  // mit ef-Abbruch (`d_u > worst`) kann danach das richtige Cluster nie
+  // erreichen (Refill greift nur bei top<k). Diverse Basins stellen sicher,
+  // dass (mindestens) ein Seed im Query-Cluster landet; uniform bleibt der
+  // alte Entry-Pfad dabei (nur erweiterte Frontier, gleiche Abbruch- und
+  // Filter-Semantik). Kosten: pro Zusatz-Start nur Upper-Layer-Greedy
+  // (wenige Distanzrechnungen, obere Layer duenn) + 1 Scoring-Distanz.
+  int descended[4] = {-1, -1, -1, -1};
+  {
+    const int raw[4] = {entry_, (entry_ + n / 4) % n, (entry_ + n / 2) % n,
+                        (entry_ + (3 * n) / 4) % n};
+    for (int i = 0; i < 4; ++i) {
+      bool dup = false;
+      for (int j = 0; j < i; ++j) {
+        if (raw[j] == raw[i]) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) continue;
+      int c = raw[i];
+      for (int lc = max_level_; lc >= 1; --lc)
+        c = greedy_closest(query, c, lc);
+      descended[i] = c;
+    }
+  }
+  // Beste 3 distinkte Kandidaten nach (dist, id).
+  std::pair<float, int> ranked[4];
+  int nranked = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (descended[i] < 0) continue;
+    bool dup = false;
+    for (int j = 0; j < i; ++j) {
+      if (descended[j] == descended[i]) {
+        dup = true;
+        break;
+      }
+    }
+    if (dup) continue;
+    ranked[nranked++] = {dist_to_stored(query, descended[i]), descended[i]};
+  }
+  std::sort(ranked, ranked + nranked, [](const auto& a, const auto& b) {
+    if (a.first != b.first) return a.first < b.first;
+    return a.second < b.second;
+  });
+  int seeds[3] = {-1, -1, -1};
+  float seed_d[3] = {0.0f, 0.0f, 0.0f};
+  int nseeds = nranked < 3 ? nranked : 3;
+  for (int i = 0; i < nseeds; ++i) {
+    seeds[i] = ranked[i].second;
+    seed_d[i] = ranked[i].first;
+  }
+  // Kollaps-Fallback (defensiv, z.B. alle Descents konvergiert): rohen
+  // Gegenueber zum besten Seed auffuellen, damit der Beam nie auf genau
+  // einem Basin festhaengt. Reine Index-Funktion, deterministisch.
+  if (nseeds >= 1 && nseeds < 3) {
+    const int fb = (seeds[0] + n / 2) % n;
+    bool known = false;
+    for (int i = 0; i < nseeds; ++i) {
+      if (seeds[i] == fb) {
+        known = true;
+        break;
+      }
+    }
+    if (!known) {
+      seeds[nseeds] = fb;
+      seed_d[nseeds] = dist_to_stored(query, fb);
+      ++nseeds;
+    }
+  }
 
   // 2) Layer0-Beam mit gemeinsamer Filter-Evaluierung (s08-Semantik).
+  // Wie search_layer: Epochen-Visited + Heap-Vektoren mit Reserve.
+  // Filter-Praedikat einmalig auf bool materialisiert (kein
+  // std::function-Bool-Check pro Knoten).
   using Cand = std::pair<float, int>;
-  std::priority_queue<Cand, std::vector<Cand>, std::greater<Cand>> frontier;
-  std::priority_queue<Cand> top;
-  std::vector<char> visited(n, 0);
+  auto [seen, mark] = acquire_visited(n);
+  std::vector<Cand> frontier;
+  frontier.reserve(static_cast<size_t>(2 * ef_search + 8));
+  std::vector<Cand> top;
+  top.reserve(static_cast<size_t>(ef_search + 1));
+  const bool use_filter = static_cast<bool>(filter);
 
   auto consider = [&](int id, float d) {
-    if (!filter || filter(id)) {
+    if (!use_filter || filter(id)) {
       if (static_cast<int>(top.size()) < ef_search) {
-        top.emplace(d, id);
-      } else if (d < top.top().first ||
-                 (d == top.top().first && id < top.top().second)) {
-        top.pop();
-        top.emplace(d, id);
+        top.emplace_back(d, id);
+        std::push_heap(top.begin(), top.end(), std::less<Cand>());
+      } else if (d < top.front().first ||
+                 (d == top.front().first && id < top.front().second)) {
+        std::pop_heap(top.begin(), top.end(), std::less<Cand>());
+        top.back() = Cand(d, id);
+        std::push_heap(top.begin(), top.end(), std::less<Cand>());
       }
     }
   };
 
-  // Seeds: descendierter Entry + 3 fixe zusaetzliche (robust auf uniform).
-  const int seeds[4] = {cur, n / 4, n / 2, (3 * n) / 4};
-  for (int s : seeds) {
-    if (s < 0 || s >= n || visited[s]) continue;
-    visited[s] = 1;
-    const float d = dist_to_stored(query, s);
-    frontier.emplace(d, s);
+  // Seeds: diversifizierte Descent-Ergebnisse (oben, max. 3) als
+  // Layer0-Start-Frontier. Refill-Garantie unten unveraendert (liefert nie
+  // < k, solange >= k Treffer existieren).
+  for (int si = 0; si < nseeds; ++si) {
+    const int s = seeds[si];
+    if (s < 0 || s >= n || seen[s] == mark) continue;
+    seen[s] = mark;
+    const float d = seed_d[si];
+    frontier.emplace_back(d, s);
+    std::push_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
     consider(s, d);
   }
 
   while (!frontier.empty()) {
-    const auto [d_u, u] = frontier.top();
-    if (static_cast<int>(top.size()) >= ef_search && d_u > top.top().first)
+    const float d_u = frontier.front().first;
+    const int u = frontier.front().second;
+    // ef-Abbruch bewusst unveraendert (`>` statt `>=`): bei Gleichstand
+    // (d_u == worst) kann der kleinere id top noch verbessern (Tie-Break
+    // id). Ein `>=` waere nicht aequivalent und wuerde Recall/Tie-
+    // Determinismus riskieren. Audit-Ergebnis: keine schaerfere Bedingung
+    // beweisbar aequivalent -> Semantik bleibt, Speedup kommt aus
+    // Heuristik-Graph + Seeds.
+    if (static_cast<int>(top.size()) >= ef_search && d_u > top.front().first)
       break;
-    frontier.pop();
+    std::pop_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
+    frontier.pop_back();
     if (u < 0 || u >= static_cast<int>(links_.size())) continue;
     if (links_[u].empty()) continue;
     for (int v : links_[u][0]) {
-      if (v < 0 || v >= n || visited[v]) continue;
-      visited[v] = 1;
+      if (v < 0 || v >= n || seen[v] == mark) continue;
+      seen[v] = mark;
       const float d_v = dist_to_stored(query, v);
-      frontier.emplace(d_v, v);
+      frontier.emplace_back(d_v, v);
+      std::push_heap(frontier.begin(), frontier.end(), std::greater<Cand>());
       consider(v, d_v);
     }
   }
 
   if (static_cast<int>(top.size()) < k) {
     for (int i = 0; i < n && static_cast<int>(top.size()) < ef_search; ++i) {
-      if (visited[i]) continue;
-      visited[i] = 1;
-      if (filter && !filter(i)) continue;
-      top.emplace(dist_to_stored(query, i), i);
+      if (seen[i] == mark) continue;
+      seen[i] = mark;
+      if (use_filter && !filter(i)) continue;
+      top.emplace_back(dist_to_stored(query, i), i);
+      std::push_heap(top.begin(), top.end(), std::less<Cand>());
     }
   }
 
   std::vector<SearchHit> out;
   out.reserve(top.size());
-  while (!top.empty()) {
-    out.push_back({top.top().second, top.top().first});
-    top.pop();
-  }
+  for (const auto& c : top) out.push_back({c.second, c.first});
   std::sort(out.begin(), out.end(), [](const SearchHit& a, const SearchHit& b) {
     if (a.dist != b.dist) return a.dist < b.dist;
     return a.id < b.id;

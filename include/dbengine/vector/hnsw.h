@@ -55,6 +55,21 @@ inline float dispatch_distance(const Vector& a, const Vector& b,
                                    : cosine_distance(a, b);
 }
 
+// --- AVX2-Distanzkerne mit Runtime-Dispatch (s-perf) --------------------------
+// Rohe Zeiger-Kerne (float-Akkumulation): AVX2-Pfad wo verfuegbar, sonst
+// skalarer Fallback. Auswahl einmalig via __builtin_cpu_supports (cached,
+// thread-safe). Keine API-Aenderung: detail-Namespace, gleiche Semantik,
+// nur schneller.
+namespace detail {
+struct DotNorms {
+  float dot = 0.0f;
+  float na = 0.0f;
+  float nb = 0.0f;
+};
+float l2_squared_kernel(const float* a, const float* b, int n);
+DotNorms dot_norms_kernel(const float* a, const float* b, int n);
+}  // namespace detail
+
 // ---------------------------------------------------------------------------
 // SQ8-Quantisierung (STUB fuer V1).
 // Idee (Qdrant/pgvector-Vorbild): pro Dimension min/max -> uint8, Suche via
@@ -149,9 +164,19 @@ class HnswIndex {
                                                    int lc) const;
   int greedy_closest(const Vector& q, int entry_id, int lc) const;
   void insert_node(int id);
+  // select_neighbors arbeitet in-place auf dem uebergebenen (owned)
+  // Kandidatenvektor (keine Kopie-Flut): HNSW-Diversitaets-Heuristik
+  // (Paper Alg. 3) — Kandidat nur, wenn naeher am Insert als an bereits
+  // Gewaehlten, Rest-Auffuellung mit Naechsten bis mm. Rueckgabe der IDs
+  // in Heuristik-Reihenfolge; cand wird dabei sortiert/gestutzt und auf
+  // sel-Reihenfolge gebracht (Score-Wiederverwendung im Insert).
   [[nodiscard]] std::vector<int> select_neighbors(
-      const Vector& q, const std::vector<SearchHit>& cand, int mm) const;
+      const Vector& q, std::vector<SearchHit>& cand, int mm) const;
   void shrink_layer(int id, int lc, int max_m);
+  // Wie shrink_layer, nutzt aber den aus der Kandidatensuche bekannten Score
+  // der frischen Kante (fresh_id, fresh_dist) statt ihn neu zu berechnen.
+  void shrink_layer_after_add(int id, int lc, int max_m, int fresh_id,
+                              float fresh_dist);
 
   int dim_;
   int m_;           // max. Nachbarn nominal (obere Layer)

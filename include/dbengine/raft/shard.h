@@ -95,16 +95,32 @@ class RaftGroup {
   [[nodiscard]] bool is_caught_up(int node_id) const;
 
   // ---- s25: persistentes Log (Datei + Replay) -------------------------------
-  // Format "RAFT1": term u64, commit u64, n u64, je Entry term/index/cmd.
-  // Save: Leader-Log + term/commit. Load: stellt Log auf allen lebenden
-  // Knoten wieder her (commit/apply). Gibt false bei IO-/Formatfehler.
+  // Format "RAFT1": term u64, commit u64, base u64, n u64,
+  // je Entry term/index/cmd.
+  // Save: Leader-Log + term/commit, crash-sicher via tmp-File + rename +
+  // fsync (File + Directory), analog storage/wal.cpp. Laesst bestehende
+  // Zieldatei bei Fehler unversehrt. Load: stellt Log auf allen Knoten
+  // wieder her (commit/apply). Gibt false bei IO-/Formatfehler.
   bool SaveLog(const std::string& path) const;
   bool LoadLog(const std::string& path);
 
+  // ---- s25: Opt-in Autosave -------------------------------------------------
+  // Wenn gesetzt, schreibt append() nach jedem erfolgreichen Commit das volle
+  // Leader-Log via SaveLog(pfad) zusaetzlich auf Platte (best effort: Fehler
+  // lassen den Commit gueltig, naechster append versucht erneut).
+  // KOSTEN: O(n)-Rewrite pro append (volles Log, n = Eintraege); nur fuer
+  // kleine Gruppen/Tests bzw. explizites Durability-Opt-in gedacht, kein
+  // inkrementelles Anhaengen.
+  void set_autosave_log(std::string path);
+  void clear_autosave();
+
   // ---- s25: Snapshots (State-Machine dump/load + Log-Compaction) ------------
   // Format "RSNP1": last_index u64, n u64, je Paar klen/vlen + bytes.
-  // Load: setzt applied-Maps, kappt Log <= last_index, commit/last_applied
-  // auf max(commit, last_index).
+  // Save: crash-sicher via tmp-File + rename + fsync (File + Directory).
+  // Load: setzt applied-Maps, kappt Log <= last_index, commit =
+  // max(commit, last_index), last_applied = last_index + apply() (Tail
+  // > last_index, <= commit wird re-applied; kein Commit-Verlust bei
+  // aelterem Snapshot).
   bool SaveSnapshot(const std::string& path) const;
   bool LoadSnapshot(const std::string& path);
 
@@ -124,6 +140,8 @@ class RaftGroup {
   // s25: Log-Basis (kompaktierte Prefix-Laenge via Snapshot). Eintrag an
   // Position p hat Index log_base_ + p + 1. Ohne Snapshot 0 (V1-Semantik).
   std::uint64_t log_base_ = 0;
+  // s25: Opt-in Autosave-Ziel (leer = aus). Unter mutex_, s. set/clear oben.
+  std::string autosave_path_;
 };
 
 // Shard/Tablet: id + Key-Range [range_start, range_end), traegt eine RaftGroup.

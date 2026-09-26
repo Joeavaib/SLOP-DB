@@ -14,6 +14,7 @@
 #include <utility>
 
 #include <sys/stat.h>
+#include <sys/uio.h>
 
 namespace dbengine::storage {
 namespace {
@@ -73,12 +74,53 @@ void fsync_dir_of(const std::string& path) {
   if (dir.empty()) dir = ".";
   int dfd = ::open(dir.c_str(), O_RDONLY
 #ifdef O_DIRECTORY
-                                | O_DIRECTORY
+                                 | O_DIRECTORY
 #endif
   );
   if (dfd < 0) return;  // best effort
   (void)::fsync(dfd);
   ::close(dfd);
+}
+
+// Ein writev()-Syscall pro Record (Header+Payload atomar im Syscall-Sinn,
+// weiterhin ohne fsync). Loop nur fuer Partial-Writes/EINTR; Bytes/Format/CRC
+// identisch zu vorher zwei write().
+void writev_all(int fd, struct iovec* iov, int iovcnt) {
+  while (iovcnt > 0) {
+    ssize_t w = ::writev(fd, iov, iovcnt);
+    if (w < 0) {
+      if (errno == EINTR) continue;
+      throw std::runtime_error(std::string("WAL writev: ") + std::strerror(errno));
+    }
+    if (w == 0) continue;  // dürfte bei len>0 nicht passieren; erneut versuchen
+    ssize_t left = w;
+    while (left > 0 && iovcnt > 0) {
+      size_t cur = iov[0].iov_len;
+      if (static_cast<size_t>(left) >= cur) {
+        left -= static_cast<ssize_t>(cur);
+        ++iov;
+        --iovcnt;
+      } else {
+        iov[0].iov_base = static_cast<char*>(iov[0].iov_base) + left;
+        iov[0].iov_len = cur - static_cast<size_t>(left);
+        left = 0;
+      }
+    }
+  }
+}
+
+inline void write_record(int fd, const char hdr[20], const char* payload,
+                         uint32_t len) {
+  struct iovec iov[2];
+  iov[0].iov_base = const_cast<char*>(hdr);
+  iov[0].iov_len = 20;
+  int cnt = 1;
+  if (len) {
+    iov[1].iov_base = const_cast<char*>(payload);
+    iov[1].iov_len = len;
+    cnt = 2;
+  }
+  writev_all(fd, iov, cnt);
 }
 
 }  // namespace
@@ -228,8 +270,7 @@ uint64_t Wal::append(std::string_view payload) {
   put_u64le(hdr + 4, lsn);
   put_u32le(hdr + 12, len);
   put_u32le(hdr + 16, record_crc(lsn, len, payload.data()));
-  write_all(fd_, hdr, sizeof(hdr));
-  if (len) write_all(fd_, payload.data(), len);
+  write_record(fd_, hdr, payload.data(), len);
   // KEIN fsync hier — flush() macht Group-Commit (Performance).
   ++appends_;
   return lsn;
@@ -250,8 +291,7 @@ std::vector<uint64_t> Wal::append_many(
     put_u64le(hdr + 4, lsn);
     put_u32le(hdr + 12, len);
     put_u32le(hdr + 16, record_crc(lsn, len, p.data()));
-    write_all(fd_, hdr, sizeof(hdr));
-    if (len) write_all(fd_, p.data(), len);
+    write_record(fd_, hdr, p.data(), len);
     ++appends_;
     out.push_back(lsn);
   }
@@ -307,8 +347,7 @@ void Wal::checkpoint(uint64_t checkpoint_lsn) {
     put_u64le(hdr + 4, r.lsn);
     put_u32le(hdr + 12, len);
     put_u32le(hdr + 16, record_crc(r.lsn, len, r.data.data()));
-    write_all(tfd, hdr, sizeof(hdr));
-    if (len) write_all(tfd, r.data.data(), len);
+    write_record(tfd, hdr, r.data.data(), len);
     max_kept = r.lsn;
   }
   fsync_file(tfd);
