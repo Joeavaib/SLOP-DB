@@ -265,3 +265,15 @@ add_executable(dbbackup src/server/backup.cpp)
 target_include_directories(dbbackup PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dbbackup PRIVATE dbengine_wal dbengine_raft columnar)
 target_compile_options(dbbackup PRIVATE -Wall -Wextra -Wpedantic)
+
+# s72-dbfile: Container-Datei (Magic+Version+Region-Table+CRC, tmp+rename+fsync)
+add_library(dblib STATIC src/db.cpp)
+target_include_directories(dblib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(dblib PRIVATE -Wall -Wextra -Wpedantic)
+
+add_executable(test_db tests/test_db.cpp)
+target_link_libraries(test_db PRIVATE dblib)
+target_include_directories(test_db PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_db PRIVATE -Wall -Wextra -Wpedantic)
+
+add_test(NAME dbfile COMMAND test_db)
