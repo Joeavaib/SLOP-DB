@@ -618,3 +618,10 @@ steps:
     verify: "cmake --build build -j4 && ./build/dbengine --help && ./build/dbengine /tmp/s74_smoke.db --exec \"CREATE TABLE t (a INT); INSERT INTO t VALUES (1); SELECT * FROM t;\" && rm -f /tmp/s74_smoke.db*"
     engine: implement
     want: "dbengine-CLI: open(foo.db) + --exec/--sql/REPL ueber Executor, Persistenz ueber Restart, --help, alte Tests gruene"
+  - id: s75-persistduel
+    title: s75-persistduel
+    paths:
+      - docs/PHASE0-DUELL.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R dbfile --output-on-failure && test -f docs/PHASE0-DUELL.md
+    engine: implement
+    want: "Persistenz-Duellbericht: foo.db-CLI vs SQLite-Datei bei 1M (Insert, Restart-Replay, SUM-Scan), Methodik + Zahlen + ehrliches Urteil in docs/PHASE0-DUELL.md"
