@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Phase 0 MVP (embedded vs SQLite): EIN Datendatei-Container mit open(foo.db) (Header+Regionen+Recovery), pager-gestuetztes persistentes B-Tree-KV statt std::map, dbengine-Binary oeffnet echte DB + SQL, Duell persistent 1M vs SQLite."
+  statement: "C++ DB Engine Welle 17: Partition-Simulator sauber mit Tests, pg_stat_statements, DiskANN-ANN-Build, TPC-H-Rematch-Doku, SCRAM-Auth. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -684,3 +684,47 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"pager|btreekv|kv\" --output-on-failure"
     engine: implement
     want: Pager-Batch-Insert (ein Image-Rewrite pro Flush) + BTree-Persist nutzt ihn, alte Tests gruene
+  - id: s81-prodsim
+    title: s81-prodsim
+    paths:
+      - src/raft/shard.cpp
+      - include/dbengine/raft/shard.h
+      - tests/test_raft.cpp
+      - tests/test_prodsim.cpp
+      - tools/prodsim_cluster.cpp
+      - CMakeLists.txt
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"raft|prodsim\" --output-on-failure"
+    engine: implement
+    want: "Partition-Simulator sauber: isolate/heal/drop mit Tests (Quorum unter Partition, Heilung), Default fully meshed, alte Tests gruene"
+  - id: s82-pgstat
+    title: s82-pgstat
+    paths:
+      - src/sql/executor.cpp
+      - include/dbengine/sql/executor.h
+      - src/server/metrics.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"executor|sql\" --output-on-failure && ./build/dbmetrics --selfcheck"
+    engine: implement
+    want: "pg_stat_statements: pro Query-Text Calls/Zeiten/Rows im Executor, Export via Metrics-Snapshot, alte Tests gruene"
+  - id: s83-diskannbuild
+    title: s83-diskannbuild
+    paths:
+      - src/vector/quant.cpp
+      - include/dbengine/vector/quant.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R quant --output-on-failure
+    engine: implement
+    want: DiskANN-Build via ANN-Graph (statt O(N2) exakt), Recall >= Stand, Build-Zeit deutlich kleiner, alte Tests gruene
+  - id: s84-tpcrematch
+    title: s84-tpcrematch
+    paths:
+      - docs/TPC-H-REMATCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R bench --output-on-failure && test -f docs/TPC-H-REMATCH.md
+    engine: implement
+    want: "TPC-H-Rematch-Bericht: Q1/Q6 1M nach Replika vs SQLite/DuckDB, Methodik + Zahlen + Urteil"
+  - id: s85-scram
+    title: s85-scram
+    paths:
+      - src/server/pgserver.cpp
+      - include/dbengine/server/pgserver.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
+    engine: implement
+    want: "SCRAM-SHA-256-Auth: R(10)-Flow mit Nonce/Proof-Verifikation (OpenSSL wenn da, sonst explizit deaktiviert), Default Trust-All, alte Tests gruene"
