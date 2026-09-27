@@ -1322,10 +1322,92 @@ void Executor::clearQueryStats() {
   pgstat_.clear();
 }
 
+// ---- Slow-Query-Log ----------------------------------------------------------
+// Nur Sammlung (kein stderr, kein Metrics-Export): Threshold + Cap + Eviction
+// s. Doku bei SlowQueryStat in executor.h. Ein Lock (pgstat_mu_) mit pgstat_
+// gemeinsam; Aufruf nur aus execute() mit gehaltenem Lock.
+void Executor::setSlowLogThresholdMs(double ms) {
+  std::lock_guard<std::mutex> lk(pgstat_mu_);
+  slow_threshold_ms_ = (ms > 0.0) ? ms : 0.0;  // NaN/<=0 = aus
+}
+
+double Executor::slowLogThresholdMs() const {
+  std::lock_guard<std::mutex> lk(pgstat_mu_);
+  return slow_threshold_ms_;
+}
+
+void Executor::recordSlowLocked(const std::string& key, double ms,
+                                std::uint64_t rows) {
+  if (!(slow_threshold_ms_ > 0.0)) return;  // aus (deckt 0/negativ/NaN ab)
+  if (!(ms >= slow_threshold_ms_)) return;  // Grenze inklusiv; NaN-ms nie slow
+  auto it = slowlog_.find(key);
+  if (it != slowlog_.end()) {
+    SlowQueryStat& e = it->second;
+    ++e.calls;
+    if (ms > e.max_ms) e.max_ms = ms;
+    e.last_ms = ms;
+    e.rows_out += rows;
+    return;
+  }
+  if (slowlog_.size() < kSlowLogCap) {
+    SlowQueryStat e;
+    e.query = key;
+    e.calls = 1;
+    e.max_ms = ms;
+    e.last_ms = ms;
+    e.rows_out = rows;
+    slowlog_.emplace(key, std::move(e));
+    return;
+  }
+  // Voll: schnellsten Eintrag (kleinstes max_ms) suchen; neu nur bei strikt
+  // groesserem ms aufnehmen (Gleichstand = drop, deterministisch, kein Churn).
+  auto minIt = slowlog_.end();
+  for (auto j = slowlog_.begin(); j != slowlog_.end(); ++j) {
+    if (minIt == slowlog_.end() || j->second.max_ms < minIt->second.max_ms)
+      minIt = j;
+  }
+  if (minIt != slowlog_.end() && ms > minIt->second.max_ms) {
+    slowlog_.erase(minIt);
+    SlowQueryStat e;
+    e.query = key;
+    e.calls = 1;
+    e.max_ms = ms;
+    e.last_ms = ms;
+    e.rows_out = rows;
+    slowlog_.emplace(key, std::move(e));
+  }
+  // Sonst: drop (schnelle Queries verdringen bei voller Map nichts).
+}
+
+std::vector<SlowQueryStat> Executor::slowQueries(std::size_t top_n) const {
+  std::lock_guard<std::mutex> lk(pgstat_mu_);
+  std::vector<SlowQueryStat> v;
+  v.reserve(slowlog_.size());
+  for (const auto& [k, st] : slowlog_) {
+    (void)k;
+    v.push_back(st);
+  }
+  std::sort(v.begin(), v.end(), [](const SlowQueryStat& a,
+                                   const SlowQueryStat& b) {
+    if (a.max_ms != b.max_ms) return a.max_ms > b.max_ms;
+    if (a.calls != b.calls) return a.calls > b.calls;
+    return a.query < b.query;
+  });
+  if (top_n != 0 && v.size() > top_n) v.resize(top_n);
+  return v;
+}
+
+void Executor::clearSlowLog() {
+  std::lock_guard<std::mutex> lk(pgstat_mu_);
+  slowlog_.clear();
+}
+
 Result Executor::execute(const std::string& sql) {
   // Einstiegspunkt aller Statements: genau ein chrono-Paar + genau ein
   // Map-Lookup pro Aufruf (Erfolg oder Fehler). Fehler (parse/RBAC/exec)
   // zaehlen calls + errors, Erfolge calls + rows_out (rows.size()+affected).
+  // Slow-Log (falls scharf): derselbe Lock, ein double-Vergleich + ggf. ein
+  // zweiter Map-Lookup nur fuer slow-Ausfuehrungen (aus = kein Zusatz-Lookup).
   std::string key = normalizeQuery(sql);
   const auto t0 = std::chrono::steady_clock::now();
   try {
@@ -1343,6 +1425,7 @@ Result Executor::execute(const std::string& sql) {
       ++e.calls;
       e.total_ms += ms;
       e.rows_out += n;
+      recordSlowLocked(key, ms, n);
     }
     return r;
   } catch (...) {
@@ -1356,6 +1439,7 @@ Result Executor::execute(const std::string& sql) {
       ++e.calls;
       e.total_ms += ms;
       ++e.errors;
+      recordSlowLocked(key, ms, 0);  // Fehler: slow mit rows 0
     }
     throw;
   }

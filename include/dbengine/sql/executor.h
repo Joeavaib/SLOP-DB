@@ -59,6 +59,36 @@ struct QueryStat {
   std::uint64_t errors = 0;    // geworfene SqlError/sonstige Exceptions
 };
 
+// ---- Slow-Query-Log (session-lokal, keine Persistenz, kein stderr) ----------
+// Entscheidung (s. Aufgabe): KEIN stderr-Spam im Lib-Code, KEINE Metrics.cpp-
+// Integration (verboten), KEIN Export in den queryStats-Dump (QueryStat-Format
+// stabil fuer Metrics-Render). Nur Sammlung + Getter, Executor-seitig:
+//   setSlowLogThresholdMs(ms): Schwellwert in ms; <= 0 / NaN = aus (Default).
+//   slowQueries(n): Top-N nach max_ms absteigend (limit == 0 -> alle, max Cap).
+//   clearSlowLog(): leert nur das Slow-Log (clearQueryStats tastet es nicht an).
+// Speicherung: pro normalisiertem Query-Text (identisch zu normalizeQuery) EIN
+// Eintrag mit max/last-Zeit (kein unbegrenztes Per-Statement-Log):
+//   calls = Anzahl der als-slow gewerteten Ausfuehrungen (Subset von
+//           QueryStat.calls, Fehler inkl. mit rows 0), max_ms = Maximum,
+//           last_ms = letzte slow-Ausfuehrung, rows_out = Summe rows_out der
+//           slow-Ausfuehrungen (SELECT rows.size()+affected, Fehler = 0).
+// Schranke: kSlowLogCap = 64 Eintraege. Eviction bei voller Map: neuer Key wird
+// nur aufgenommen, wenn sein ms strikt groesser ist als das kleinste max_ms;
+// dann wird genau dieser schnellste Eintrag verdraengt (O(Cap) Scan, Cap klein).
+// Aktualisierung bestehender Keys immer (max = max, last = ms).
+// Aufzeichnung: nur wenn threshold > 0 UND ms >= threshold (Grenze inklusiv).
+// Thread-Safety: derselbe pgstat_mu_ wie pgstat_ (ein Lock pro execute()).
+// Overhead bei deaktiviertem Log: ein double-Vergleich unter dem bestehenden
+// Lock (kein Zusatz-Lock, keine Allok). Session-lokal: recover()/Restart setzt
+// NICHT zurueck, keine WAL-/Disk-Persistenz.
+struct SlowQueryStat {
+  std::string query;  // normalisierter Query-Text
+  std::uint64_t calls = 0;  // slow-Ausfuehrungen (Fehler inkl.)
+  double max_ms = 0.0;
+  double last_ms = 0.0;
+  std::uint64_t rows_out = 0;  // Summe rows_out der slow-Ausfuehrungen
+};
+
 class Executor {
  public:
   Executor(kv::KVStore& kv, txn::MvccStore& mvcc, storage::Wal* wal = nullptr);
@@ -75,6 +105,16 @@ class Executor {
   // limit == 0 -> alle Eintraege.
   std::vector<QueryStat> queryStats(std::size_t top_n = 5) const;
   void clearQueryStats();
+
+  // Slow-Query-Log: Schwellwert in ms (Default aus/0). ms <= 0 oder NaN = aus.
+  // Aufzeichnung in execute(): ms >= threshold (Grenze inklusiv, Erfolg+Fehler).
+  static constexpr std::size_t kSlowLogCap = 64;
+  void setSlowLogThresholdMs(double ms);
+  double slowLogThresholdMs() const;
+  // Top-N nach max_ms absteigend (Tie: calls absteigend, dann query aufsteigend).
+  // limit == 0 -> alle Eintraege (max kSlowLogCap).
+  std::vector<SlowQueryStat> slowQueries(std::size_t top_n = 0) const;
+  void clearSlowLog();
 
   // ---- Mirror-Checkpoint (BTreeKV-Sidecar, Default: aus) --------------------
   // enableMirror(path) oeffnet (ggf. erzeugt) das Sidecar und laedt dessen
@@ -163,8 +203,15 @@ class Executor {
   std::size_t recover_skipped_ = 0;  // Skips des letzten recover()-Laufs
   std::size_t recover_applied_ = 0;  // erfolgreich angewendete Records
   // ---- pg_stat_statements-light-State (session-lokal, keine Persistenz) ----
+  // pgstat_mu_ schuetzt pgstat_, slowlog_ und slow_threshold_ms_ gemeinsam
+  // (genau ein Lock pro execute(), keine Lock-Ordnung noetig).
   mutable std::mutex pgstat_mu_;
   std::map<std::string, QueryStat> pgstat_;  // normalisierter Text -> Stat
+  // ---- Slow-Query-Log-State (Schranke kSlowLogCap, s. Doku bei SlowQueryStat)
+  double slow_threshold_ms_ = 0.0;  // <= 0 = aus (Default)
+  std::map<std::string, SlowQueryStat> slowlog_;  // norm. Text -> max/last
+  // Muss mit gehaltenem pgstat_mu_ aufgerufen werden (nur aus execute()).
+  void recordSlowLocked(const std::string& key, double ms, std::uint64_t rows);
   // ---- Mirror-Checkpoint-State -------------------------------------------
   std::unique_ptr<kv::BTreeKV> mirror_;
   std::string mirror_path_;

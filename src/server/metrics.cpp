@@ -6,7 +6,9 @@
 #include "dbengine/server/metrics.h"
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -297,12 +299,180 @@ void MetricsServer::handleConn(int fd) {
   ::close(fd);
 }
 
+// ---- OTLP-HTTP-Export (handgerollt, STL/POSIX-only) --------------------------
+namespace {
+
+std::string otlpEscapeJson(const std::string& s) {
+  std::string o;
+  o.reserve(s.size() + 2);
+  for (char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\b': o += "\\b"; break;
+      case '\f': o += "\\f"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char tmp[7];
+          std::snprintf(tmp, sizeof(tmp), "\\u%04x", static_cast<unsigned int>(static_cast<unsigned char>(c)));
+          o += tmp;
+        } else {
+          o += c;
+        }
+        break;
+    }
+  }
+  return o;
+}
+
+// Parst "HTTP/1.x CODE ..." -> CODE, -1 bei Fehler.
+int parseHttpStatus(const std::string& resp) {
+  std::size_t eol = resp.find("\r\n");
+  std::string line = eol == std::string::npos ? resp : resp.substr(0, eol);
+  std::size_t sp1 = line.find(' ');
+  if (sp1 == std::string::npos) return -1;
+  std::size_t sp2 = line.find(' ', sp1 + 1);
+  std::string code = line.substr(sp1 + 1, sp2 == std::string::npos ? std::string::npos
+                                                                   : sp2 - sp1 - 1);
+  if (code.size() != 3) return -1;
+  if (code[0] < '0' || code[0] > '9' || code[1] < '0' || code[1] > '9' || code[2] < '0' ||
+      code[2] > '9')
+    return -1;
+  return (code[0] - '0') * 100 + (code[1] - '0') * 10 + (code[2] - '0');
+}
+
+}  // namespace
+
+void OtlpExporter::configure(const std::string& host, int port, const std::string& path) {
+  std::lock_guard<std::mutex> lk(mu_);
+  host_ = host.empty() ? "127.0.0.1" : host;
+  port_ = port;
+  if (!path.empty() && path[0] == '/')
+    path_ = path;
+  else
+    path_ = "/" + path;
+}
+
+std::string OtlpExporter::host() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return host_;
+}
+
+int OtlpExporter::port() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return port_;
+}
+
+std::string OtlpExporter::path() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return path_;
+}
+
+std::string OtlpExporter::buildJson(const std::vector<OtlpSpan>& spans) {
+  // OTLP/JSON-Shape (TraceService): resourceSpans[] -> scopeSpans[] -> spans[].
+  // Keys bewusst OTLP-kanonisch ("resourceSpans", "traceId", "spanId",
+  // "startTimeUnixNano", ...) damit Kollektoren/Fake-Collector matchen.
+  std::string j;
+  j.reserve(256 + spans.size() * 256);
+  j += "{\"resourceSpans\":[{\"resource\":{},\"scopeSpans\":[{\"scope\":{\"name\":\"dbengine\"},";
+  j += "\"spans\":[";
+  for (std::size_t i = 0; i < spans.size(); ++i) {
+    const OtlpSpan& s = spans[i];
+    if (i > 0) j += ',';
+    j += "{\"traceId\":\"" + otlpEscapeJson(s.trace_id) + "\"";
+    j += ",\"spanId\":\"" + otlpEscapeJson(s.span_id) + "\"";
+    j += ",\"name\":\"" + otlpEscapeJson(s.name) + "\"";
+    j += ",\"startTimeUnixNano\":\"" + std::to_string(s.start_ns) + "\"";
+    j += ",\"endTimeUnixNano\":\"" + std::to_string(s.end_ns) + "\"";
+    j += ",\"attributes\":[";
+    bool first = true;
+    for (const auto& kv : s.attributes) {
+      if (!first) j += ',';
+      first = false;
+      j += "{\"key\":\"" + otlpEscapeJson(kv.first) + "\",\"value\":{\"stringValue\":\"" +
+           otlpEscapeJson(kv.second) + "\"}}";
+    }
+    j += "],\"status\":{}}";
+  }
+  j += "]}]}]}";
+  return j;
+}
+
+bool OtlpExporter::exportSpans(const std::vector<OtlpSpan>& spans) const {
+  if (spans.empty()) return true;  // Batch-Ack trivial
+  std::string host;
+  int port = 0;
+  std::string path;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    host = host_;
+    port = port_;
+    path = path_;
+  }
+  if (port < 0 || port > 65535) return false;
+
+  std::string body = buildJson(spans);
+  std::string req = "POST " + path + " HTTP/1.0\r\nHost: " + host +
+                    "\r\nContent-Type: application/json\r\nContent-Length: " +
+                    std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+
+  // Eigener TCP-Client (POSIX, getaddrinfo damit host-Namen gehen).
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* list = nullptr;
+  std::string port_str = std::to_string(port);
+  if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &list) != 0) return false;
+
+  int fd = -1;
+  for (addrinfo* ai = list; ai != nullptr; ai = ai->ai_next) {
+    int tmp = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (tmp < 0) continue;
+    if (::connect(tmp, ai->ai_addr, ai->ai_addrlen) == 0) {
+      fd = tmp;
+      break;
+    }
+    ::close(tmp);
+  }
+  ::freeaddrinfo(list);
+  if (fd < 0) return false;
+
+  bool sent = sendAll(fd, req);
+  if (!sent) {
+    ::close(fd);
+    return false;
+  }
+  // Response lesen (Statuszeile reicht, Body wird ignoriert).
+  std::string resp;
+  resp.reserve(512);
+  char buf[1024];
+  while (resp.size() < 64 * 1024) {
+    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    if (n == 0) break;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      ::close(fd);
+      return false;
+    }
+    resp.append(buf, static_cast<std::size_t>(n));
+    if (resp.find("\r\n\r\n") != std::string::npos) break;
+  }
+  ::close(fd);
+  int code = parseHttpStatus(resp);
+  return code >= 200 && code < 300;
+}
+
 }  // namespace dbengine::metrics
 
 // ---- dbmetrics-main (klein, im gleichen TU) ---------------------------------
 namespace {
 
 using dbengine::metrics::MetricsServer;
+using dbengine::metrics::OtlpExporter;
+using dbengine::metrics::OtlpSpan;
 using dbengine::metrics::Snapshot;
 
 // Baut Demo-Snapshot aus echten Mini-Stores (WAL+KV+Writes, Raft, Columnar, HNSW).
@@ -418,6 +588,147 @@ std::string ScrapeMetrics(int port) {
   return out;
 }
 
+// ---- OTLP Fake-Kollektor fuer --selfcheck -----------------------------------
+// Lokaler TCP-Server auf ephemeral Port: nimmt EINEN POST entgegen (Header +
+// Content-Length-Body), antwortet 200 {} und speichert Raw-Request. Danach
+// assertet SelfCheck OTLP-JSON-Keywords ("resourceSpans"/"traceId") + dass
+// OtlpExporter::exportSpans den Batch ackt (2xx).
+bool OtlpFakeCollectorSelfcheck(std::string& err) {
+  int lfd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (lfd < 0) {
+    err = "fake-collector: socket() failed";
+    return false;
+  }
+  int one = 1;
+  ::setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(0);  // ephemeral
+  if (::bind(lfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+      ::listen(lfd, 1) != 0) {
+    ::close(lfd);
+    err = "fake-collector: bind/listen failed";
+    return false;
+  }
+  sockaddr_in bound{};
+  socklen_t blen = sizeof(bound);
+  if (::getsockname(lfd, reinterpret_cast<sockaddr*>(&bound), &blen) != 0) {
+    ::close(lfd);
+    err = "fake-collector: getsockname failed";
+    return false;
+  }
+  int fake_port = ntohs(bound.sin_port);
+
+  std::string captured;
+  bool accepted = false;
+  std::thread worker([lfd, &captured, &accepted]() {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(lfd, &rfds);
+    timeval tv{};
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    int r = ::select(lfd + 1, &rfds, nullptr, nullptr, &tv);
+    if (r <= 0) return;
+    int cfd = ::accept(lfd, nullptr, nullptr);
+    if (cfd < 0) return;
+    accepted = true;
+    std::string req;
+    char buf[4096];
+    // 1) Header bis "\r\n\r\n" lesen.
+    while (req.find("\r\n\r\n") == std::string::npos && req.size() < 256 * 1024) {
+      ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
+      if (n == 0) break;
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+      req.append(buf, static_cast<std::size_t>(n));
+    }
+    // 2) Body per Content-Length nachlesen.
+    std::size_t hlen = req.find("\r\n\r\n");
+    std::size_t body_have = (hlen == std::string::npos) ? 0 : req.size() - hlen - 4;
+    std::size_t want_len = 0;
+    std::size_t cl = req.find("Content-Length:");
+    if (cl == std::string::npos) cl = req.find("content-length:");
+    if (cl != std::string::npos) {
+      std::size_t eol = req.find("\r\n", cl);
+      std::string clline = req.substr(cl, eol == std::string::npos ? std::string::npos
+                                                                   : eol - cl);
+      std::size_t dig = clline.find_first_of("0123456789");
+      if (dig != std::string::npos) {
+        try {
+          want_len = static_cast<std::size_t>(std::stoul(clline.substr(dig)));
+        } catch (...) {
+          want_len = 0;
+        }
+      }
+    }
+    while (body_have < want_len && req.size() < 1024 * 1024) {
+      ssize_t n = ::recv(cfd, buf, sizeof(buf), 0);
+      if (n == 0) break;
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        break;
+      }
+      req.append(buf, static_cast<std::size_t>(n));
+      body_have += static_cast<std::size_t>(n);
+    }
+    captured = req;
+    const std::string resp =
+        "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n"
+        "Connection: close\r\n\r\n{}";
+    std::size_t off = 0;
+    while (off < resp.size()) {
+      ssize_t n = ::send(cfd, resp.data() + off, resp.size() - off, MSG_NOSIGNAL);
+      if (n <= 0) {
+        if (n < 0 && errno == EINTR) continue;
+        break;
+      }
+      off += static_cast<std::size_t>(n);
+    }
+    ::close(cfd);
+  });
+
+  // Test-Span exportieren (fixe Hex-IDs, Zeiten aus chrono).
+  OtlpExporter exp;
+  exp.configure("127.0.0.1", fake_port, "/v1/traces");
+  auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+  OtlpSpan span;
+  span.name = "selfcheck-span";
+  span.trace_id = "0af7651916cd43dd8448eb211c80319c";
+  span.span_id = "b7ad6b7169203331";
+  span.start_ns = static_cast<std::uint64_t>(now);
+  span.end_ns = static_cast<std::uint64_t>(now) + 1000;
+  span.attributes = {{"test", "selfcheck"}};
+  bool ok = exp.exportSpans({span});
+  worker.join();
+  ::close(lfd);
+
+  if (!ok) {
+    err = "fake-collector: exportSpans nicht acked (kein 2xx)";
+    return false;
+  }
+  if (!accepted || captured.empty()) {
+    err = "fake-collector: kein POST empfangen";
+    return false;
+  }
+  if (captured.find("POST") == std::string::npos) {
+    err = "fake-collector: kein POST-Request";
+    return false;
+  }
+  if (captured.find("resourceSpans") == std::string::npos) {
+    err = "fake-collector: OTLP-Keyword 'resourceSpans' fehlt";
+    return false;
+  }
+  if (captured.find("traceId") == std::string::npos) {
+    err = "fake-collector: OTLP-Keyword 'traceId' fehlt";
+    return false;
+  }
+  return true;
+}
+
 int SelfCheck() {
   try {
     std::string wal_path =
@@ -439,6 +750,11 @@ int SelfCheck() {
         std::fprintf(stderr, "dbmetrics selfcheck: FAIL keyword '%s' missing\n", k);
         return 1;
       }
+    }
+    std::string otlp_err;
+    if (!OtlpFakeCollectorSelfcheck(otlp_err)) {
+      std::fprintf(stderr, "dbmetrics selfcheck: FAIL otlp %s\n", otlp_err.c_str());
+      return 1;
     }
     std::cout << "OK\n";
     return 0;
@@ -512,6 +828,11 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "dbmetrics selfcheck: FAIL keyword '%s' missing\n", k);
             return 1;
           }
+        }
+        std::string otlp_err;
+        if (!OtlpFakeCollectorSelfcheck(otlp_err)) {
+          std::fprintf(stderr, "dbmetrics selfcheck: FAIL otlp %s\n", otlp_err.c_str());
+          return 1;
         }
         std::cout << "OK\n";
         return 0;

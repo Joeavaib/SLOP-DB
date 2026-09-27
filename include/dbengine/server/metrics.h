@@ -7,9 +7,11 @@
 
 #include <atomic>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace dbengine::metrics {
 
@@ -72,6 +74,45 @@ class MetricsServer {
   int port_ = 0;
   std::atomic<bool> running_{false};
   std::thread thread_;
+};
+
+// ---- OTLP-HTTP-Export (handgerollt, STL/POSIX-only, kein SDK) ----------------
+// Spans/Traces als OTLP-JSON ueber HTTP-POST an konfigurierbaren Endpoint
+// (Default-Pfad /v1/traces). Eigenes TCP-Client-Send (Content-Length,
+// Response-Code-Check 2xx). Batch-Ack: exportSpans() gibt true genau dann
+// zurueck, wenn der Kollektor mit 2xx bestaetigt (ganzer Batch acked).
+struct OtlpSpan {
+  std::string name;
+  std::string trace_id;  // Hex, 32 Zeichen (16 Bytes)
+  std::string span_id;   // Hex, 16 Zeichen (8 Bytes)
+  std::uint64_t start_ns = 0;
+  std::uint64_t end_ns = 0;
+  std::map<std::string, std::string> attributes;
+};
+
+class OtlpExporter {
+ public:
+  OtlpExporter() = default;
+
+  void configure(const std::string& host, int port, const std::string& path = "/v1/traces");
+
+  // Exportiert Batch als OTLP/JSON via HTTP-POST. true = 2xx (Batch-Ack).
+  // Leerer Batch = No-Op, true (trivially acked, kein Netzwerk).
+  [[nodiscard]] bool exportSpans(const std::vector<OtlpSpan>& spans) const;
+
+  // Baut OTLP/JSON-Body (enthaelt "resourceSpans"/"traceId"). Failsafe: nie
+  // werfend ausser bad_alloc (Escaping macht gueltiges JSON).
+  [[nodiscard]] static std::string buildJson(const std::vector<OtlpSpan>& spans);
+
+  [[nodiscard]] std::string host() const;
+  [[nodiscard]] int port() const;
+  [[nodiscard]] std::string path() const;
+
+ private:
+  mutable std::mutex mu_;
+  std::string host_ = "127.0.0.1";
+  int port_ = 4318;
+  std::string path_ = "/v1/traces";
 };
 
 }  // namespace dbengine::metrics

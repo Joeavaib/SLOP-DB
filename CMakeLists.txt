@@ -333,3 +333,13 @@ add_executable(dbresp src/server/resp.cpp)
 target_include_directories(dbresp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(dbresp PRIVATE dbengine_kv)
 target_compile_options(dbresp PRIVATE -Wall -Wextra -Wpedantic)
+
+# raft_cluster: echter 3-Prozess-Raft-Cluster via fork() + TCP-Loopback
+# (RequestVote/AppendEntries mit Wire-Codec-Framing, gestaffelte
+# election_timeouts, Heartbeats) + --selfcheck (Leader-Wahl, Put,
+# Mehrheit-Replikation, Follower-Kill + weiter committen).
+add_executable(raft_cluster tools/raft_cluster.cpp)
+target_link_libraries(raft_cluster PRIVATE dbengine_raft)
+target_include_directories(raft_cluster PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(raft_cluster PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME raft_cluster COMMAND raft_cluster --selfcheck)

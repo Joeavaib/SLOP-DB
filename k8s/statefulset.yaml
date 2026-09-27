@@ -77,3 +77,26 @@ spec:
 #      ports:
 #        - name: pgwire-tls
 #          port: 5433
+# S3-Tiering-Sidecar-Skizze (optional, alles auskommentiert — wird nicht deployed):
+# Annahme: Columnar-Save-Verzeichnis liegt unter /data/columnar
+# (Format: manifest.txt + part-<id>.col [+ part-<id>-active.col], s. store.h/store.cpp).
+# Code macht KEINEN Upload — StageToS3 bildet nur die URI s3://<bucket>/<prefix>/columnar-<N>parts/.
+# Secret-Skizze (extern anlegen, Operator-Side; nur Referenz, kein Deploy):
+#      volumes:
+#        - name: s3-cred
+#          secret:
+#            secretName: dbengine-s3
+# Sidecar-Container-Skizze (rclone/minio-client, Operator-Beispiel, Standard-Syntax):
+#      containers:
+#        - name: s3-tier
+#          image: rclone/rclone:stable  # Platzhalter-Beispiel, kein Repo-Image
+#          command: ["sh", "-c", "rclone sync /data/columnar remote:my-bucket/tier1 --checksum"]
+#          volumeMounts:
+#            - name: data
+#              mountPath: /data
+#            - name: s3-cred
+#              mountPath: /etc/s3cred
+#              readOnly: true
+# Alternative (mc, Operator-Beispiel):
+#          command: ["sh", "-c", "mc mirror /data/columnar s3alias/my-bucket/tier1"]
+# Restore-Reihenfolge: Sidecar sync zurueck -> ColumnarStore::Load (manifest.txt zuerst).

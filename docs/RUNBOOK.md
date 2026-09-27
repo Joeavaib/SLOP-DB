@@ -199,3 +199,74 @@ std::string>`) und `PgServer::setAuthRequired(bool)` — es gibt derzeit
 **kein CLI-Flag** (kein `--auth`-o.ä. in `src/server/`). Empfehlung:
 Auth-Hook nur hinter TLS-Sidecar betreiben (s. Abschnitt 7), Credentials
 nie ohne Sidecar übers Netz schicken.
+
+## 11. S3-Tiering (Sidecar-Skizze, kein Code-Upload)
+
+Ehrlicher Stand: es gibt **keinen echten S3-Upload im Code**.
+`ColumnarStore::StageToS3(bucket, prefix)` (Deklaration:
+`include/dbengine/columnar/store.h:211`, Definition:
+`src/columnar/store.cpp:879`) ist ein Stub — er bildet nur deterministisch
+die Ziel-URI, kein Netzwerk/Upload (Kommentar in `store.h:209` +
+`store.cpp:881`: „kein Upload, nur deterministische URI-Bildung“).
+
+URI-Format (belegt aus `src/columnar/store.cpp:884-887`):
+
+```text
+"s3://" + bucket + "/" + prefix-mit-trailing-'/' + "columnar-" + N + "parts/"
+```
+
+Dabei ist `N = parts_.size()` (Anzahl sealed Parts; aktive Replika zählt
+nicht, HTAP-Replika wird laut `store.h:224` von Save/Load nicht
+persistiert). Prefix ohne trailing `/` bekommt einen angehängt
+(`store.cpp:884-885`). Beispiel belegt aus `tests/test_columnar.cpp:144`:
+`StageToS3("my-bucket", "tier1")` → `s3://my-bucket/tier1/columnar-1parts/`.
+
+Was der Sidecar synct (Manifest-Format exakt aus Code-Read):
+
+- Quelle: `ColumnarStore::Save(dir)` (`src/columnar/store.cpp:734`,
+  Doku: `include/dbengine/columnar/store.h:196-203`).
+- Verzeichnisinhalt nach `Save`:
+  - je sealed Part: `part-<id>.col` (`store.cpp:745-749`),
+  - falls aktiver Part nicht leer: genau ein
+    `part-<id>-active.col` (`store.cpp:743-744,751-754`; leere Active
+    => kein File),
+  - `manifest.txt` **zuletzt**, atomar via `tmp+rename+fsync`
+    (`store.cpp:756-784`).
+- `manifest.txt`-Format (`store.cpp:761-770`):
+  - Zeile 1: `<n>` (Anzahl Einträge = sealed + ggf. 1 aktiv),
+  - danach je Zeile: `<id> <fname> <rows> <active 0/1>`
+    (`0` = sealed, `1` = aktiv; Beispiel aus Code:
+    `man << p.id() << " " << fname << " " << p.size() << " 0\n"`).
+- Ziel im Objektstore (Sidecar entscheidet Bucket/Prefix, Code gibt nur
+  die URI-Vorlage): `s3://<bucket>/<prefix>/manifest.txt` +
+  `s3://<bucket>/<prefix>/part-*.col` (flache Namen, keine Unterverzeichnisse;
+  `Load` weist Pfad-Traversal mit `/`, `\`, `..` ab — `store.cpp:818-822`).
+
+Sidecar-Prinzip (Operator-Tooling, nicht Repo-Code):
+
+```sh
+# Backup/Tier: erst lokal sealen+saven, dann syncen (Manifest wurde zuletzt geschrieben,
+# Sidecar kopiert das fertige Verzeichnis als Ganzes):
+rclone sync /data/columnar remote:my-bucket/tier1 --checksum
+# Alternative mit MinIO-Client (Operator-Beispiel, Standard-Syntax):
+# mc mirror /data/columnar s3alias/my-bucket/tier1
+```
+
+(`remote`/`s3alias` ist Operator-Konfiguration des Sidecars; kein Flag/
+Credential ist im Repo belegt — Credentials gehören in ein K8s-Secret,
+s. `k8s/statefulset.yaml` S3-Skizze.)
+
+Restore-Reihenfolge (belegt aus `Load` in `src/columnar/store.cpp:787`):
+
+1. Sidecar kopiert zurück (`rclone sync remote:my-bucket/tier1 /data/columnar`
+   bzw. `mc mirror s3alias/my-bucket/tier1 /data/columnar` — Standard-Syntax,
+   Operator-Beispiel).
+2. `ColumnarStore::Load(dir)` prüft **zuerst** `manifest.txt`
+   (`store.cpp:789-794`), parst `<n>` + `<id> <fname> <rows> <active>`-Zeilen,
+   lehnt `>1` aktive Einträge ab (`store.cpp:825-827`), lädt dann je Eintrag
+   das Part-File und verifiziert `p.size() == rows` und `p.id() == id`
+   (`store.cpp:839-840`); aktive Rows werden unsealed/mutabel wiederhergestellt
+   (`store.cpp:843-849`). Fehlt/korrumpiert ein File → `false`.
+3. Danach ggf. WAL-Tail per Abschnitt 4 (`replay` ab `wal_lsn+1`) — WAL bleibt
+   Single Source of Truth für Crash-Recovery; Columnar-Tiering ersetzt kein
+   `flush()`/`checkpoint()`.
