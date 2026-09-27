@@ -75,7 +75,13 @@
     "s73-btreekv",
     "s74-dbcli",
     "s75-persistduel",
-    "s76-mirrorckpt"
+    "s76-mirrorckpt",
+    "s76b-mirrorbatch",
+    "s78-rbac",
+    "s79-diskann",
+    "s80-docsphase0",
+    "s76c-pagerbatch",
+    "s77-reduel"
   ],
   "verified": [
     "s07-index",
@@ -153,16 +159,22 @@
     "s73-btreekv",
     "s74-dbcli",
     "s75-persistduel",
-    "s76-mirrorckpt"
+    "s76-mirrorckpt",
+    "s76b-mirrorbatch",
+    "s78-rbac",
+    "s79-diskann",
+    "s80-docsphase0",
+    "s76c-pagerbatch",
+    "s77-reduel"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s76-mirrorckpt-1790466763",
-    "step_id": "s76-mirrorckpt",
-    "commit": "18b0bba7f11563685ca7e6adfbd3d7b42e056eba",
+    "id": "cp-s80-docsphase0-1790469536",
+    "step_id": "s80-docsphase0",
+    "commit": "6e47bcb8b4c87b8f2756fd391e4ce228309696e6",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-26T23:52:43.625934+00:00"
+    "created_at": "2026-09-27T00:38:56.654352+00:00"
   },
   "checkpoints": [
     {
@@ -633,6 +645,69 @@
       "commit": "18b0bba7f11563685ca7e6adfbd3d7b42e056eba",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-26T23:52:43.625934+00:00"
+    },
+    {
+      "id": "cp-s76b-mirrorbatch-1790468079",
+      "step_id": "s76b-mirrorbatch",
+      "commit": "7b79d9b1a860c10d3b216361df7a3aebfdbcd610",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:14:39.460936+00:00"
+    },
+    {
+      "id": "cp-s78-rbac-1790468108",
+      "step_id": "s78-rbac",
+      "commit": "adc190daeef1ca7101ceed4d6d8001ee279c1ba0",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:15:08.983180+00:00"
+    },
+    {
+      "id": "cp-s79-diskann-1790468162",
+      "step_id": "s79-diskann",
+      "commit": "66e1f8eec83f8390038faaeeb66747ed8a9a43be",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:16:02.870301+00:00"
+    },
+    {
+      "id": "cp-s80-docsphase0-1790468241",
+      "step_id": "s80-docsphase0",
+      "commit": "bbba86262b4c6cff64c652f00cd0738b09f5a7b2",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:17:21.842193+00:00"
+    },
+    {
+      "id": "cp-s76c-pagerbatch-1790469361",
+      "step_id": "s76c-pagerbatch",
+      "commit": "f55e67fb4d348784b4aff7d570bbe78ce74fb714",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:36:01.201160+00:00"
+    },
+    {
+      "id": "cp-s77-reduel-1790469380",
+      "step_id": "s77-reduel",
+      "commit": "786c07e5d7d15fee9c84e54287de4457d1a95c41",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:36:20.756539+00:00"
+    },
+    {
+      "id": "cp-s78-rbac-1790469411",
+      "step_id": "s78-rbac",
+      "commit": "b99cd7a2a481335a30d31d5f0fe8ef4f94354fdd",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:36:51.001569+00:00"
+    },
+    {
+      "id": "cp-s79-diskann-1790469463",
+      "step_id": "s79-diskann",
+      "commit": "40c7d298452d7ed45cf36b3cd3e4cf1b473daf60",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:37:43.357804+00:00"
+    },
+    {
+      "id": "cp-s80-docsphase0-1790469536",
+      "step_id": "s80-docsphase0",
+      "commit": "6e47bcb8b4c87b8f2756fd391e4ce228309696e6",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T00:38:56.654352+00:00"
     }
   ],
   "claim_step": "",

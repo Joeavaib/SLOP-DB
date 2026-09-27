@@ -634,3 +634,53 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|kv\" --output-on-failure"
     engine: implement
     want: "Mirror-Checkpoint: B-Tree-Spiegel des Latest-State, inkrementell pro Flush, Restart laedt Spiegel + nur WAL-Tail, alte Tests gruene"
+  - id: s77-reduel
+    title: s77-reduel
+    paths:
+      - docs/PHASE0-DUELL.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R dbfile --output-on-failure && test -f docs/PHASE0-DUELL.md
+    engine: implement
+    want: "Re-Duell 1M mit Mirror: Insert/Restart/Scan-Zeiten, Vergleich vorher/nachher + SQLite, Bericht aktualisiert"
+  - id: s78-rbac
+    title: s78-rbac
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+      - src/sql/executor.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "RBAC: GRANT/REVOKE (SELECT/INSERT/UPDATE/DELETE auf Tabellen, Rollen), Enforcement im Executor, Default alles-erlaubt (Tests gruene)"
+  - id: s79-diskann
+    title: s79-diskann
+    paths:
+      - src/vector/quant.cpp
+      - include/dbengine/vector/quant.h
+      - src/vector/hnsw.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R quant --output-on-failure
+    engine: implement
+    want: "DiskANN-Lite: Graph+PQ auf DiskSpill (SSD), Re-Rank exakt, Recall auf 100k dokumentiert, alte Tests gruene"
+  - id: s80-docsphase0
+    title: s80-docsphase0
+    paths:
+      - docs/ARCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "ARCH Phase 0: B-Tree-KV, Mirror-Checkpoint, CLI, Duell-Ergebnisse, stale Aussagen korrigiert"
+  - id: s76b-mirrorbatch
+    title: s76b-mirrorbatch
+    paths:
+      - src/sql/executor.cpp
+      - include/dbengine/sql/executor.h
+      - src/main.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor\" --output-on-failure"
+    engine: implement
+    want: "Mirror-Batching: Flush nur alle 1000 Statements + Checkpoint bei Exit, Watermark-Protokoll exakt, Insert ohne O(n2)"
+  - id: s76c-pagerbatch
+    title: s76c-pagerbatch
+    paths:
+      - src/storage/pager.cpp
+      - include/dbengine/storage/pager.h
+      - src/kv/btree.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"pager|btreekv|kv\" --output-on-failure"
+    engine: implement
+    want: Pager-Batch-Insert (ein Image-Rewrite pro Flush) + BTree-Persist nutzt ihn, alte Tests gruene
