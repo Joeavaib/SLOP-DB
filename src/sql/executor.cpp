@@ -583,12 +583,79 @@ std::vector<Value> decodeRowSelected(const std::string& s, std::size_t ncols,
   return out;
 }
 
+// ---- RBAC minimal (Rollen-Map pro Executor) ---------------------------------
+// executor.h ist fixiert (kein Member, keine setRole-Deklaration moeglich):
+// Rolle + Grants leben file-statisch keyed by Executor* (nicht kopierbar ->
+// Adresse stabil; Destruktor raeumt den Eintrag auf). Rollenumschaltung via
+// SQL (SET ROLE/RESET ROLE, s. parser.h). Semantik wie Database (parser.cpp):
+// "" = Admin (Default, alles erlaubt), DML braucht das jeweilige Privileg,
+// CREATE/DROP/GRANT/REVOKE nur als Admin, ohne Recht -> SQLSTATE 42501.
+// WAL-Opcodes 'G' (GRANT) / 'R' (REVOKE); Replay stellt die Rechte wieder
+// her; Mirror-Sidecar ist KV-only -> G/R dort No-Op (Watermark darf vor).
+struct RbacState {
+  std::string role;  // "" = Admin
+  // norm-Tabelle -> Rolle -> Privilegien (upper).
+  std::map<std::string, std::map<std::string, std::set<std::string>>> grants;
+};
+std::map<const Executor*, RbacState> g_rbac;
+
+RbacState& rbacFor(const Executor* self) { return g_rbac[self]; }
+
+bool rbacHas(const RbacState& st, const std::string& normTable,
+             const std::string& priv) {
+  if (st.role.empty()) return true;
+  auto tit = st.grants.find(normTable);
+  if (tit == st.grants.end()) return false;
+  auto rit = tit->second.find(st.role);
+  if (rit == tit->second.end()) return false;
+  return rit->second.count(priv) > 0;
+}
+
+void rbacRequire(const RbacState& st, const std::string& normTable,
+                 const std::string& priv, const std::string& display) {
+  if (!rbacHas(st, normTable, priv))
+    throw SqlError("permission denied for table " + display +
+                   " (SQLSTATE 42501)");
+}
+
+void rbacRequireAdmin(const RbacState& st, const std::string& what) {
+  if (!st.role.empty())
+    throw SqlError("permission denied (" + what +
+                   " requires admin role, SQLSTATE 42501)");
+}
+
+bool rbacPrivValid(const std::string& p) {
+  return p == "SELECT" || p == "INSERT" || p == "UPDATE" || p == "DELETE";
+}
+
+// "A,B,C" -> validierte Privilegien (unbekannt -> SqlError -> Skip im Replay).
+std::vector<std::string> rbacSplitPrivs(const std::string& s) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s) {
+    if (c == ',') {
+      if (!rbacPrivValid(cur)) throw SqlError("Korrupter GRANT-Record");
+      if (std::find(out.begin(), out.end(), cur) == out.end())
+        out.push_back(cur);
+      cur.clear();
+    } else {
+      cur += c;
+    }
+  }
+  if (!rbacPrivValid(cur)) throw SqlError("Korrupter GRANT-Record");
+  if (std::find(out.begin(), out.end(), cur) == out.end()) out.push_back(cur);
+  return out;
+}
+
 }  // namespace
 
 Executor::Executor(kv::KVStore& kv, txn::MvccStore& mvcc, storage::Wal* wal)
     : kv_(kv), mvcc_(mvcc), wal_(wal) {}
 
-Executor::~Executor() { disableMirror(); }
+Executor::~Executor() {
+  disableMirror();
+  g_rbac.erase(this);
+}
 
 // ---- Mirror-Checkpoint: Format + Protokoll ----------------------------------
 // Spiegel-Format (BTreeKV-Sidecar, geordnetes Latest-State-Abbild):
@@ -735,8 +802,32 @@ bool Executor::enableMirror(const std::string& path, std::string* warn) {
   }
 }
 
-void Executor::disableMirror() {
+bool Executor::mirrorCheckpoint() {
+  if (!mirror_on_ || !mirror_ || wal_ == nullptr) return false;
   try {
+    if (!mirror_->IsOpen()) return false;
+    std::uint64_t durable = 0;
+    try {
+      durable = wal_->durable_lsn();
+    } catch (...) {
+      return false;
+    }
+    if (durable <= mirror_lsn_) {
+      mirror_pending_ = 0;
+      return true;
+    }
+    if (!mirror_->Put(std::string(kMirrorLsnKey), std::to_string(durable)))
+      return false;
+    if (!mirror_->Flush()) return false;
+    mirror_lsn_ = durable;
+    mirror_pending_ = 0;
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+void Executor::disableMirror() {  try {
     if (mirror_) mirror_->Close();  // best effort Flush (BTreeKV::Close)
   } catch (...) {
   }
@@ -791,6 +882,9 @@ bool Executor::applyMirrorRecord(const std::string& data) {
     (void)mirror_->Delete(schemaPfx + norm);  // DROP: Spiegel-Eintraege weg
     return true;
   }
+  if ((parts[0] == "G" || parts[0] == "R") && parts.size() == 4) {
+    return true;  // RBAC: Rechte sind WAL-persistiert, Spiegel ist KV-only
+  }
   return true;  // unbekannter Opcode: recover skipt -> kein State -> Advance ok
 }
 
@@ -835,15 +929,23 @@ void Executor::syncMirrorBatch(const std::vector<std::string>* batch) {
       }
     }
     if (all_ok) {
-      bool ok = false;
-      try {
-        ok = mirror_->Put(std::string(kMirrorLsnKey),
-                          std::to_string(durable));
-        if (ok) ok = mirror_->Flush();
-      } catch (...) {
-        ok = false;
+      // Watermark rueckt nur mit geflushtem Spiegel vor. Flush ist teuer
+      // (B-Tree-Voll-Rewrite), daher gebatcht: alle mirror_interval_
+      // Statements; Crash davor replayt den Tail erneut (idempotent).
+      if (++mirror_pending_ >= mirror_interval_) {
+        bool ok = false;
+        try {
+          ok = mirror_->Put(std::string(kMirrorLsnKey),
+                            std::to_string(durable));
+          if (ok) ok = mirror_->Flush();
+        } catch (...) {
+          ok = false;
+        }
+        if (ok) {
+          mirror_lsn_ = durable;  // atomar geflusht
+          mirror_pending_ = 0;
+        }
       }
-      if (ok) mirror_lsn_ = durable;  // mirror_lsn = durable (atomar geflusht)
     } else {
       // Teilsync crashfest machen; Watermark bleibt alt -> Restart replayt
       // den Tail erneut (last-wins, idempotent).
@@ -970,6 +1072,127 @@ std::vector<Value> Executor::decodeRow(const std::string& s, std::size_t ncols) 
 
 Result Executor::execute(const std::string& sql) {
   Statement st = parseStatement(sql);
+  // ---- RBAC: GRANT/REVOKE/SET-Handling + Enforcement vor jeder
+  // KV/MVCC/WAL-Seiteneffekt (fail fast, keine Halb-Writes bei 42501).
+  {
+    RbacState& rs = rbacFor(this);
+    if (std::holds_alternative<GrantStmt>(st)) {
+      const GrantStmt& g = std::get<GrantStmt>(st);
+      rbacRequireAdmin(rs, "GRANT");
+      const std::string norm = normalizeTable(g.table);
+      if (tables_.find(norm) == tables_.end())
+        throw SqlError("Tabelle unbekannt: " + g.table);
+      for (const auto& p : g.privs) rs.grants[norm][g.role].insert(p);
+      if (wal_ != nullptr) {
+        std::string payload;
+        payload += 'G';
+        payload += kWalSep;
+        payload += norm;
+        payload += kWalSep;
+        payload += walEscape(g.role);
+        payload += kWalSep;
+        for (std::size_t i = 0; i < g.privs.size(); ++i) {
+          if (i) payload += ',';
+          payload += g.privs[i];
+        }
+        wal_->append(payload);
+        wal_->flush();
+        const std::vector<std::string> mirror_batch{payload};
+        syncMirrorBatch(&mirror_batch);
+      }
+      return {{}, {}, "GRANT", 0};
+    }
+    if (std::holds_alternative<RevokeStmt>(st)) {
+      const RevokeStmt& g = std::get<RevokeStmt>(st);
+      rbacRequireAdmin(rs, "REVOKE");
+      const std::string norm = normalizeTable(g.table);
+      if (tables_.find(norm) == tables_.end())
+        throw SqlError("Tabelle unbekannt: " + g.table);
+      auto tit = rs.grants.find(norm);
+      if (tit != rs.grants.end()) {
+        auto rit = tit->second.find(g.role);
+        if (rit != tit->second.end()) {
+          for (const auto& p : g.privs) rit->second.erase(p);
+          if (rit->second.empty()) tit->second.erase(rit);
+        }
+        if (tit->second.empty()) rs.grants.erase(tit);
+      }
+      if (wal_ != nullptr) {
+        std::string payload;
+        payload += 'R';
+        payload += kWalSep;
+        payload += norm;
+        payload += kWalSep;
+        payload += walEscape(g.role);
+        payload += kWalSep;
+        for (std::size_t i = 0; i < g.privs.size(); ++i) {
+          if (i) payload += ',';
+          payload += g.privs[i];
+        }
+        wal_->append(payload);
+        wal_->flush();
+        const std::vector<std::string> mirror_batch{payload};
+        syncMirrorBatch(&mirror_batch);
+      }
+      return {{}, {}, "REVOKE", 0};
+    }
+    if (std::holds_alternative<SetRoleStmt>(st)) {
+      const SetRoleStmt& sr = std::get<SetRoleStmt>(st);
+      // sr.role aus parseRole (unquoted gefoldet, quoted exakt); kein Check
+      // (sonst koennte eine Rolle nie zurueckwechseln). Session-lokal, kein WAL.
+      rs.role = sr.reset ? "" : sr.role;
+      return {{}, {}, sr.reset ? "RESET ROLE" : "SET ROLE", 0};
+    }
+    if (std::holds_alternative<CreateTableStmt>(st)) {
+      rbacRequireAdmin(rs, "CREATE TABLE");
+    } else if (std::holds_alternative<DropTableStmt>(st)) {
+      rbacRequireAdmin(rs, "DROP TABLE");
+    } else if (std::holds_alternative<InsertStmt>(st)) {
+      const InsertStmt& q = std::get<InsertStmt>(st);
+      const std::string norm = normalizeTable(q.table);
+      if (tables_.find(norm) != tables_.end())
+        rbacRequire(rs, norm, "INSERT", q.table);
+      // Unbekannt meldet execInsert ("Tabelle unbekannt").
+    } else if (std::holds_alternative<SelectStmt>(st)) {
+      const SelectStmt& q = std::get<SelectStmt>(st);
+      std::set<std::string> needed;
+      collectSelectTables(q, needed);
+      // Unbekannte Tabellen ueberspringen (execSelect meldet sie exakt).
+      for (const auto& tn : needed) {
+        auto jt = tables_.find(tn);
+        if (jt == tables_.end()) continue;
+        const std::string disp =
+            (tn == normalizeTable(q.table)) ? q.table : tn;
+        rbacRequire(rs, tn, "SELECT", disp);
+      }
+    } else if (std::holds_alternative<UpdateStmt>(st)) {
+      const UpdateStmt& q = std::get<UpdateStmt>(st);
+      const std::string norm = normalizeTable(q.table);
+      if (tables_.find(norm) != tables_.end()) {
+        rbacRequire(rs, norm, "UPDATE", q.table);
+        std::set<std::string> needed;
+        collectWhereTables(q.where, q.where_groups, needed);
+        needed.erase(norm);
+        for (const auto& tn : needed) {
+          if (tables_.find(tn) == tables_.end()) continue;
+          rbacRequire(rs, tn, "SELECT", tn);
+        }
+      }
+    } else if (std::holds_alternative<DeleteStmt>(st)) {
+      const DeleteStmt& q = std::get<DeleteStmt>(st);
+      const std::string norm = normalizeTable(q.table);
+      if (tables_.find(norm) != tables_.end()) {
+        rbacRequire(rs, norm, "DELETE", q.table);
+        std::set<std::string> needed;
+        collectWhereTables(q.where, q.where_groups, needed);
+        needed.erase(norm);
+        for (const auto& tn : needed) {
+          if (tables_.find(tn) == tables_.end()) continue;
+          rbacRequire(rs, tn, "SELECT", tn);
+        }
+      }
+    }
+  }
   if (std::holds_alternative<CreateTableStmt>(st))
     return execCreate(std::get<CreateTableStmt>(st));
   if (std::holds_alternative<InsertStmt>(st))
@@ -1318,6 +1541,7 @@ Result Executor::execute(const std::string& sql) {
     }
     tables_.erase(it);
     replica_.erase(norm);  // HTAP: Scan-Replika konsistent verwerfen
+    rbacFor(this).grants.erase(norm);  // Rechte fallen mit der Tabelle (PG)
     return {{}, {}, "DROP TABLE", 0};
   }
   return execSelect(std::get<SelectStmt>(st));
@@ -1792,12 +2016,38 @@ std::size_t Executor::recover() {
           }
           tables_.erase(norm);
           replica_.erase(norm);  // HTAP: Scan-Replika konsistent verwerfen
+          rbacFor(this).grants.erase(norm);  // Rechte fallen mit (wie live)
           if (ok) {
             ++recover_applied_;
           } else {
             ++recover_skipped_;
           }
         }
+      } catch (...) {
+        ++recover_skipped_;
+      }
+    } else if ((parts[0] == "G" || parts[0] == "R") && parts.size() == 4) {
+      // RBAC-Replay: Rechte wiederherstellen (kein Schema noetig, kein
+      // WAL-Append, kein Mirror-State). Ungueltig -> Skip.
+      try {
+        const std::string norm = normalizeTable(parts[1]);
+        const std::string role = walUnescape(parts[2]);
+        const std::vector<std::string> privs = rbacSplitPrivs(parts[3]);
+        RbacState& rs = rbacFor(this);
+        if (parts[0] == "G") {
+          for (const auto& p : privs) rs.grants[norm][role].insert(p);
+        } else {
+          auto tit = rs.grants.find(norm);
+          if (tit != rs.grants.end()) {
+            auto rit = tit->second.find(role);
+            if (rit != tit->second.end()) {
+              for (const auto& p : privs) rit->second.erase(p);
+              if (rit->second.empty()) tit->second.erase(rit);
+            }
+            if (tit->second.empty()) rs.grants.erase(tit);
+          }
+        }
+        ++recover_applied_;
       } catch (...) {
         ++recover_skipped_;
       }

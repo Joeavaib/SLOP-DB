@@ -309,6 +309,20 @@ bool Pager::insert(std::uint64_t key, std::span<const std::uint8_t> value) {
   return store_image() && flush_raw_pages() && ([this] { ::fsync(fd_); return ensure_mmap(); }());
 }
 
+bool Pager::insert_batch(
+    const std::vector<std::pair<std::uint64_t, std::string>>& kvs) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!open_) return false;
+  for (const auto& [key, value] : kvs) {
+    if (value.size() > kMaxValueBytes) return false;
+    entries_[key] =
+        std::vector<std::uint8_t>(value.begin(), value.end());
+  }
+  image_dirty_ = true;
+  // Ein Image-Rewrite + fsync fuer den ganzen Batch (statt einem pro Key).
+  return store_image() && flush_raw_pages() && ([this] { ::fsync(fd_); return ensure_mmap(); }());
+}
+
 bool Pager::find(std::uint64_t key, std::string& out) const {
   std::vector<std::uint8_t> raw;
   if (!find(key, raw)) return false;

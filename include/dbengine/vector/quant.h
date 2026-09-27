@@ -115,7 +115,13 @@ class PqNQuantizer {
   [[nodiscard]] float adc_with_table(const AdcTable& t,
                                      const std::vector<uint8_t>& code) const;
   [[nodiscard]] float adc_l2_squared(const Vector& query,
-                                     const std::vector<uint8_t>& code) const;
+                                      const std::vector<uint8_t>& code) const;
+
+  // Codebook-Zugriff fuer Persistenz (DiskAnnIndex-Header): read-only Getter
+  // plus validierender Setter (braucht init() vorher, setzt fitted_=true).
+  // Additiv, keine Aenderung am k-means/ADC-Verhalten.
+  [[nodiscard]] const std::vector<std::vector<Vector>>& codebooks() const;
+  void set_codebooks(const std::vector<std::vector<Vector>>& cb);
 
  private:
   void setup_subdims();
@@ -239,6 +245,79 @@ class DiskSpill {
   int dim_ = 0;
   size_t count_ = 0;
   float* payload_ = nullptr;
+};
+
+// --- DiskANN-Lite (Vektoren + PQ-Codes + Graph auf Disk, PQ-RAM, Re-Rank) --
+// Layout (4 Files unter gemeinsamem Prefix, z.B. prefix="/tmp/ann"):
+//   prefix.hdr   : Header{magic[8]="DBEANN1\\0", dim u64, m_pq u64,
+//                  m_graph u64, count u64} + Codebooks float32 LE
+//                  (m_pq x 256 x subdim[m] floats, subdims via
+//                  PqNQuantizer-Regel base+rem aus dim/m_pq, Summe=dim,
+//                  total 256*dim floats).
+//   prefix.vec   : DiskSpill(dim, count) volle float32-Vektoren (Re-Rank).
+//   prefix.pq    : DiskSpill(m_pq, count) PQ-Codes als float-Cast
+//                  (Byte 0..255 -> float, exakt <2^24, Record=fix m_pq).
+//   prefix.graph : DiskSpill(m_graph, count) Adjazenz als float-Cast
+//                  (Nachbar-ID -> float, -1.0f = Padding, Record=fix m_graph).
+// Graph: eigene Beam-Links = exakte M-NN (brute-force L2, (dist,id)-Tie-Break,
+//   deterministisch, kein RNG; HnswIndex nur als Alternative dokumentiert,
+//   nicht noetig -> kein Eingriff in hnsw.h). M (=m_graph) konfigurierbar.
+// Suche: Beam ueber Graph mit PQ-ADC (mmap-Reads via DiskSpill::get, kein
+//   decode, eine ADC-Tabelle pro Query), Top-ef_rerank exakt re-ranken
+//   (volle Vektoren via DiskSpill). Deterministisch (Seed nur im PQ-fit).
+class DiskAnnIndex {
+ public:
+  DiskAnnIndex() = default;
+  DiskAnnIndex(int dim, int num_subspaces, int m_graph) {
+    init(dim, num_subspaces, m_graph);
+  }
+
+  void init(int dim, int num_subspaces, int m_graph);
+
+  // Baut Index aus data und persistiert unter prefix (+.hdr/.vec/.pq/.graph).
+  // PQ-Training: pq_iters Lloyd-Iterationen, Sample-Regel aus PqNQuantizer,
+  // deterministisch via seed. Graph: exakte M-NN (O(N^2), deterministisch).
+  // Bleibt danach geoeffnet (mmap) fuer sofortige search().
+  void build(const std::vector<Vector>& data, const std::string& prefix,
+             int pq_iters = 8, unsigned seed = 42u);
+  // Oeffnet bestehenden Index (Header + 3 DiskSpills, Codebooks aus Header).
+  void open(const std::string& prefix);
+  void close();
+
+  [[nodiscard]] bool is_open() const { return open_; }
+  [[nodiscard]] int dim() const { return dim_; }
+  [[nodiscard]] int num_subspaces() const { return m_pq_; }
+  [[nodiscard]] int m() const { return m_graph_; }
+  [[nodiscard]] size_t size() const { return count_; }
+  [[nodiscard]] const PqNQuantizer& pq() const { return pq_; }
+
+  [[nodiscard]] std::vector<int> neighbors(int id) const;
+  [[nodiscard]] Vector get_vector(int id) const;
+  [[nodiscard]] std::vector<uint8_t> get_code(int id) const;
+
+  // Beam (Breite beam) mit ADC, Re-Rank exakt auf ef_rerank.
+  // beam/ef_rerank werden auf [k, N] geclampt; Rueckgabe Top-k exakt sortiert.
+  [[nodiscard]] std::vector<SearchHit> search(const Vector& query, int k,
+                                             int beam = 64,
+                                             int ef_rerank = 100) const;
+
+ private:
+  [[nodiscard]] std::vector<uint8_t> read_code_row(int id) const;
+  [[nodiscard]] std::vector<int> read_adj_row(int id) const;
+  [[nodiscard]] float adc_of(int id,
+                             const PqNQuantizer::AdcTable& table) const;
+
+  int dim_ = 0;
+  int m_pq_ = 0;
+  int m_graph_ = 0;
+  size_t count_ = 0;
+  int entry_ = 0;
+  bool open_ = false;
+  std::string prefix_;
+  PqNQuantizer pq_;
+  DiskSpill vec_;
+  DiskSpill codes_;
+  DiskSpill graph_;
 };
 
 // --- Gross-Pfad-Empfehlung (HNSW vs. IVF, skaliert Recall/Latenz) --------

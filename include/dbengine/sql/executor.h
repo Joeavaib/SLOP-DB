@@ -141,6 +141,18 @@ class Executor {
   std::string mirror_path_;
   std::uint64_t mirror_lsn_ = 0;
   bool mirror_on_ = false;
+  // Batch-Zaehlung: Mirror-Flush (teuer: B-Tree-Voll-Rewrite) nur alle
+  // mirror_interval_ Statements; Watermark rueckt nur mit Flush vor.
+  std::uint64_t mirror_pending_ = 0;
+  std::uint64_t mirror_interval_ = 1000;
+
+ public:
+  void setMirrorInterval(std::uint64_t n) {
+    mirror_interval_ = (n == 0) ? 1 : n;
+  }
+  // Erzwungener Mirror-Checkpoint (Flush + Watermark = durable).
+  // Fuer sauberes Herunterfahren (main ruft vor Exit).
+  bool mirrorCheckpoint();
 };
 
 }  // namespace dbengine::sql

@@ -18,6 +18,17 @@
 //     SET-Werte sind Literale wie in INSERT, typkoerziert pro Spalte)
 //   DELETE FROM t [WHERE ...]
 //   DROP TABLE [IF EXISTS] t  (kein CASCADE, kein TRUNCATE)
+//   GRANT SELECT|INSERT|UPDATE|DELETE|ALL [, ...] ON t TO r
+//   REVOKE SELECT|INSERT|UPDATE|DELETE|ALL [, ...] ON t FROM r (TO toleriert)
+//   SET ROLE r | RESET ROLE  (r = Identifier/String, Session-lokal, kein WAL;
+//     SET ROLE NONE = RESET)
+// RBAC minimal: Rollen als Strings (unquoted -> lowercase-Folding wie
+// Identifier, "..."/'...' exakt). Privilegien pro (Tabelle, Rolle); ALL =
+// alle vier DML-Privilegien. Default-Rolle "" = Admin (alles erlaubt wie
+// bisher). SELECT/INSERT/UPDATE/DELETE brauchen das jeweilige Privileg auf
+// allen gelesenen/geschriebenen Tabellen (JOIN-Seiten + Subquery-Tabellen
+// inklusive); CREATE/DROP/GRANT/REVOKE nur als Admin. Ohne Recht -> SqlError
+// mit SQLSTATE 42501. GRANT/REVOKE-Tags: "GRANT"/"REVOKE".
 //   Qualifizierte Refs `t.c` (Tabelle oder Alias als Prefix) in SELECT, WHERE,
 //     ON, GROUP BY, ORDER BY und Aggregat-Argumenten; unqualifiziert + in
 //     beiden Tabellen vorhanden -> SqlError (ambiguous).
@@ -45,6 +56,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -132,6 +144,27 @@ struct DeleteStmt {
 struct DropTableStmt {
   std::string table;
   bool if_exists = false;
+};
+
+// RBAC: GRANT/REVOKE pro (Tabelle, Rolle). privs upper-kanonisch
+// ("SELECT"/"INSERT"/"UPDATE"/"DELETE", ALL bereits expandiert, deduped).
+// role lower-gefoldet bei unquoted Identifiern, exakt bei "..."/'...'.
+struct GrantStmt {
+  std::string table;
+  std::vector<std::string> privs;
+  std::string role;
+};
+
+struct RevokeStmt {
+  std::string table;
+  std::vector<std::string> privs;
+  std::string role;
+};
+
+// SET ROLE r / RESET ROLE (r wie GrantStmt::role). Session-lokal.
+struct SetRoleStmt {
+  std::string role;  // "" bei reset
+  bool reset = false;
 };
 
 // Arithmetischer Ausdruck als Aggregat-Argument (Q6): Spalte | Literal |
@@ -223,7 +256,8 @@ struct SelectStmt {
 };
 
 using Statement = std::variant<CreateTableStmt, InsertStmt, SelectStmt,
-                                  UpdateStmt, DeleteStmt, DropTableStmt>;
+                                   UpdateStmt, DeleteStmt, DropTableStmt,
+                                   GrantStmt, RevokeStmt, SetRoleStmt>;
 
 struct Result {
   std::vector<std::string> columns;
@@ -268,16 +302,32 @@ class Database {
   Result execUpdate(const UpdateStmt& s);
   Result execDelete(const DeleteStmt& s);
   Result execDrop(const DropTableStmt& s);
+  Result execGrant(const GrantStmt& s);
+  Result execRevoke(const RevokeStmt& s);
+  Result execSetRole(const SetRoleStmt& s);
+
+  // RBAC: aktuelle Rolle ("" = Admin, Default: alles erlaubt wie bisher).
+  // Input wird wie ein unquoted Identifier nach lowercase gefaltet.
+  void setRole(const std::string& role);
+  const std::string& role() const { return role_; }
 
   bool hasTable(const std::string& name) const;
   const Table& getTable(const std::string& name) const;
 
  private:
+  // true wenn Admin ("") oder priv auf (Tabelle, Rolle) gewaehrt.
+  bool hasPriv(const std::string& table, const std::string& priv) const;
+  void requirePriv(const std::string& table, const std::string& priv) const;
+  void requireAdmin(const std::string& what) const;
   std::map<std::string, Table> tables_;
+  std::string role_;  // lower-gefoldet, "" = Admin
+  // norm-Tabelle -> norm-Rolle -> Privilegien (upper).
+  std::map<std::string, std::map<std::string, std::set<std::string>>> grants_;
 };
 
 Statement parseStatement(const std::string& sql);
 std::string statementKind(
-    const Statement& s);  // "CREATE"/"INSERT"/"SELECT"/"UPDATE"/"DELETE"/"DROP"
+    const Statement& s);  // "CREATE"/"INSERT"/"SELECT"/"UPDATE"/"DELETE"/"DROP"/
+                          // "GRANT"/"REVOKE"/"SET"
 
 }  // namespace dbengine::sql

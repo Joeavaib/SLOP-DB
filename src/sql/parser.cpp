@@ -220,12 +220,16 @@ class Parser {
     if (matchKeyword("UPDATE")) return parseUpdate();
     if (matchKeyword("DELETE")) return parseDelete();
     if (matchKeyword("DROP")) return parseDropTable();
+    if (matchKeyword("GRANT")) return parseGrant();
+    if (matchKeyword("REVOKE")) return parseRevoke();
+    if (matchKeyword("SET")) return parseSetRole();
+    if (matchKeyword("RESET")) return parseResetRole();
     if (peekKeyword("TRUNCATE"))
       throw SqlError(
           "TRUNCATE wird nicht unterstuetzt (DELETE FROM ... verwenden)");
     throw SqlError(
-        "Nur CREATE TABLE / INSERT / SELECT / UPDATE / DELETE / DROP TABLE "
-        "werden unterstuetzt");
+        "Nur CREATE TABLE / INSERT / SELECT / UPDATE / DELETE / DROP TABLE / "
+        "GRANT / REVOKE / SET ROLE / RESET ROLE werden unterstuetzt");
   }
 
  private:
@@ -418,6 +422,100 @@ class Parser {
     const Token& t = peek();
     if (t.kind == TokKind::Symbol && t.text == ",")
       throw SqlError("Nur eine Tabelle pro DROP TABLE wird unterstuetzt");
+    return s;
+  }
+
+  // RBAC: Privilegliste "SELECT [, INSERT ...]" / ALL (expandiert, deduped).
+  std::vector<std::string> parsePrivList() {
+    std::vector<std::string> out;
+    auto add = [&](const std::string& p) {
+      if (p == "ALL") {
+        for (const char* q : {"SELECT", "INSERT", "UPDATE", "DELETE"}) {
+          if (std::find(out.begin(), out.end(), q) == out.end())
+            out.emplace_back(q);
+        }
+        return;
+      }
+      if (std::find(out.begin(), out.end(), p) == out.end())
+        out.push_back(p);
+    };
+    while (true) {
+      const Token& t = peek();
+      if (t.kind != TokKind::Ident)
+        throw SqlError(
+            "Erwartet Privileg (SELECT/INSERT/UPDATE/DELETE/ALL)");
+      std::string u = toUpper(t.text);
+      if (u != "SELECT" && u != "INSERT" && u != "UPDATE" &&
+          u != "DELETE" && u != "ALL")
+        throw SqlError("Unbekanntes Privileg: " + t.text +
+                       " (SELECT/INSERT/UPDATE/DELETE/ALL erwartet)");
+      ++pos_;
+      add(u);
+      if (matchSymbol(",")) continue;
+      break;
+    }
+    if (out.empty())
+      throw SqlError("GRANT/REVOKE ohne Privilegien");
+    return out;
+  }
+
+  // Rolle: unquoted Identifier -> lowercase-Folding (PG), "..."/'...' exakt.
+  std::string parseRole() {
+    const Token& t = peek();
+    if (t.kind == TokKind::Ident) {
+      ++pos_;
+      return foldIdent(t.text);
+    }
+    if (t.kind == TokKind::QuotedIdent || t.kind == TokKind::String) {
+      ++pos_;
+      return t.text;
+    }
+    throw SqlError("Erwartet Rolle nach TO/FROM");
+  }
+
+  GrantStmt parseGrant() {
+    GrantStmt s;
+    s.privs = parsePrivList();
+    expectKeyword("ON");
+    s.table = parseIdent();
+    expectKeyword("TO");
+    s.role = parseRole();
+    return s;
+  }
+
+  RevokeStmt parseRevoke() {
+    RevokeStmt s;
+    s.privs = parsePrivList();
+    expectKeyword("ON");
+    s.table = parseIdent();
+    if (matchKeyword("FROM")) {
+      // PG-Standard
+    } else if (matchKeyword("TO")) {
+      // toleriert (symmetrisch zu GRANT ... TO)
+    } else {
+      throw SqlError("Erwartet FROM nach Tabellennamen in REVOKE");
+    }
+    s.role = parseRole();
+    return s;
+  }
+
+  SetRoleStmt parseSetRole() {
+    expectKeyword("ROLE");
+    SetRoleStmt s;
+    const Token& t = peek();
+    if (t.kind == TokKind::Ident && toUpper(t.text) == "NONE") {
+      ++pos_;
+      s.reset = true;
+      return s;
+    }
+    s.role = parseRole();
+    return s;
+  }
+
+  SetRoleStmt parseResetRole() {
+    expectKeyword("ROLE");
+    SetRoleStmt s;
+    s.reset = true;
     return s;
   }
 
@@ -2893,6 +2991,9 @@ std::string statementKind(const Statement& s) {
   if (std::holds_alternative<UpdateStmt>(s)) return "UPDATE";
   if (std::holds_alternative<DeleteStmt>(s)) return "DELETE";
   if (std::holds_alternative<DropTableStmt>(s)) return "DROP";
+  if (std::holds_alternative<GrantStmt>(s)) return "GRANT";
+  if (std::holds_alternative<RevokeStmt>(s)) return "REVOKE";
+  if (std::holds_alternative<SetRoleStmt>(s)) return "SET";
   return "SELECT";
 }
 
@@ -2906,7 +3007,66 @@ const Table& Database::getTable(const std::string& name) const {
   return it->second;
 }
 
+// ---------- RBAC (minimal) ----------
+
+void Database::setRole(const std::string& role) { role_ = foldIdent(role); }
+
+bool Database::hasPriv(const std::string& table,
+                       const std::string& priv) const {
+  if (role_.empty()) return true;  // Admin: alles erlaubt (Default wie bisher)
+  auto tit = grants_.find(foldIdent(table));
+  if (tit == grants_.end()) return false;
+  auto rit = tit->second.find(role_);
+  if (rit == tit->second.end()) return false;
+  return rit->second.count(priv) > 0;
+}
+
+void Database::requirePriv(const std::string& table,
+                           const std::string& priv) const {
+  if (!hasPriv(table, priv))
+    throw SqlError("permission denied for table " + table +
+                   " (SQLSTATE 42501)");
+}
+
+void Database::requireAdmin(const std::string& what) const {
+  if (!role_.empty())
+    throw SqlError("permission denied (" + what +
+                   " requires admin role, SQLSTATE 42501)");
+}
+
+Result Database::execGrant(const GrantStmt& s) {
+  requireAdmin("GRANT");
+  auto it = tables_.find(foldIdent(s.table));
+  if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  auto& set = grants_[foldIdent(s.table)][s.role];
+  for (auto& p : s.privs) set.insert(p);
+  return {{}, {}, "GRANT", 0};
+}
+
+Result Database::execRevoke(const RevokeStmt& s) {
+  requireAdmin("REVOKE");
+  auto it = tables_.find(foldIdent(s.table));
+  if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  auto tit = grants_.find(foldIdent(s.table));
+  if (tit != grants_.end()) {
+    auto rit = tit->second.find(s.role);
+    if (rit != tit->second.end()) {
+      for (auto& p : s.privs) rit->second.erase(p);
+      if (rit->second.empty()) tit->second.erase(rit);
+    }
+    if (tit->second.empty()) grants_.erase(tit);
+  }
+  return {{}, {}, "REVOKE", 0};
+}
+
+Result Database::execSetRole(const SetRoleStmt& s) {
+  // s.role kommt aus parseRole (unquoted bereits gefoldet, quoted exakt).
+  role_ = s.reset ? "" : s.role;
+  return {{}, {}, s.reset ? "RESET ROLE" : "SET ROLE", 0};
+}
+
 Result Database::execCreate(const CreateTableStmt& s) {
+  requireAdmin("CREATE TABLE");
   std::string key = foldIdent(s.table);
   auto it = tables_.find(key);
   if (it != tables_.end()) {
@@ -2922,6 +3082,7 @@ Result Database::execCreate(const CreateTableStmt& s) {
 Result Database::execInsert(const InsertStmt& s) {
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  requirePriv(s.table, "INSERT");
   Table& t = it->second;
   // Zielspalten aufloesen
   std::vector<int> colMap;  // pro Eingabeposition -> Tabellenindex
@@ -2954,6 +3115,7 @@ Result Database::execInsert(const InsertStmt& s) {
 Result Database::execUpdate(const UpdateStmt& s) {
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  requirePriv(s.table, "UPDATE");
   Table& t = it->second;
   // SET-Spalten aufloesen (unbekannt -> SqlError, vor jeder Mutation).
   std::vector<int> setIdx;
@@ -3020,6 +3182,7 @@ Result Database::execUpdate(const UpdateStmt& s) {
 Result Database::execDelete(const DeleteStmt& s) {
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  requirePriv(s.table, "DELETE");
   Table& t = it->second;
   if (g_scopes.size() >= static_cast<std::size_t>(kMaxSubqueryDepth))
     throw SqlError("Subquery-Tiefe ueberschritten (max 8)");
@@ -3072,12 +3235,14 @@ Result Database::execDelete(const DeleteStmt& s) {
 }
 
 Result Database::execDrop(const DropTableStmt& s) {
+  requireAdmin("DROP TABLE");
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) {
     if (s.if_exists) return { {}, {}, "DROP TABLE", 0 };
     throw SqlError("Tabelle unbekannt: " + s.table);
   }
   tables_.erase(it);
+  grants_.erase(foldIdent(s.table));  // Rechte fallen mit der Tabelle (PG)
   return { {}, {}, "DROP TABLE", 0 };
 }
 
@@ -3120,6 +3285,8 @@ Result Database::execSelect(const SelectStmt& s) {
     auto rit = tables_.find(foldIdent(s.join_table));
     if (rit == tables_.end())
       throw SqlError("Tabelle unbekannt: " + s.join_table);
+    requirePriv(s.table, "SELECT");
+    requirePriv(s.join_table, "SELECT");
     JoinCtx j;
     j.left = &lit->second;
     j.right = &rit->second;
@@ -3139,6 +3306,7 @@ Result Database::execSelect(const SelectStmt& s) {
   }
   auto it = tables_.find(foldIdent(s.table));
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  requirePriv(s.table, "SELECT");
   const Table& t = it->second;
   // Filter (AND bzw. DNF bei OR; ohne Subqueries exakt der Altpfad)
   std::vector<std::vector<Value>> kept;
@@ -3230,6 +3398,12 @@ Result Database::execute(const std::string& sql) {
     return execDelete(std::get<DeleteStmt>(st));
   if (std::holds_alternative<DropTableStmt>(st))
     return execDrop(std::get<DropTableStmt>(st));
+  if (std::holds_alternative<GrantStmt>(st))
+    return execGrant(std::get<GrantStmt>(st));
+  if (std::holds_alternative<RevokeStmt>(st))
+    return execRevoke(std::get<RevokeStmt>(st));
+  if (std::holds_alternative<SetRoleStmt>(st))
+    return execSetRole(std::get<SetRoleStmt>(st));
   return execSelect(std::get<SelectStmt>(st));
 }
 

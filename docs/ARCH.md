@@ -9,6 +9,7 @@
 > Welle 8–10 (s38–s52): SQL-Aggregate/Session/Filter, Metrics/Backup/Kill-9,
 > Pager-Atomaritaet, HNSW/IVF-Skala, Auth/TLS — siehe Kapitel 9.
 > Welle 11–12: JOIN/DDL/COL2/SoA/Audit/TPC-H/Parallel-Build/Extended — siehe Kapitel 10.
+> Phase 0 (s72–s77): Single-File-Container/BTreeKV/CLI/Mirror/Autotune/Duell — siehe Kapitel 11.
 
 ## 1. Schichtenmodell
 
@@ -510,3 +511,206 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
   SoA-Primärspeicher + `thread_local`-`get()` (10.3)
   (Beleg: `include/dbengine/vector/hnsw.h:33-45,283-286`,
   `src/vector/hnsw.cpp:1021-1030`).
+
+## 11. Phase 0 (s72–s77, alle STL/POSIX-only)
+
+### 11.1 Single-File-Container — Magic/Regionen (`db.h`, `src/db.cpp`)
+
+- Format fix, little-endian (`include/dbengine/db.h:5-18`):
+  `magic[6]="DBEN01"` @0, `version u32=1` @6, Region-Table @10
+  (4× `{offset u64, size u64}`: `[catalog, wal-seg, pager, meta]`),
+  `crc32 u32` @74 über Bytes `[0,74)` (IEEE `0xEDB88320`, Seed 0),
+  Header total `kHeaderSize=78`.
+- Body lückenlos, genullt reserviert (`include/dbengine/db.h:41-48`):
+  `catalog @78/4096`, `wal-seg @4174/16384`, `pager @20558/16384`,
+  `meta @36942/4096`, Datei total `kFileSize=41038`.
+  Inhalte in s72 NUR reserviert+genullt, Befüllung erst s73/s74
+  (`include/dbengine/db.h:16-18`).
+- `build_header` serialisiert 78 Bytes inkl. CRC (`src/db.cpp:82-103`);
+  `create_new` via `tmp+fsync+rename+dir-fsync`, nie torn-mix
+  (`src/db.cpp:110-145`); `Db::open` erzeugt falls fehlend, sonst
+  validiert Magic/Version/Region-Table (lückenlos, sortiert, im File)/
+  CRC/Größe, Fehler → Exception ohne Teilzustand (`src/db.cpp:202-256`).
+
+### 11.2 BTreeKV — Fanout/Split/Shadow-Paging, LoadAll-Loch-Fix (`kv/btree.h`, `src/kv/btree.cpp`)
+
+- CLRS-B-Baum, Mindestgrad `t=32` (`src/kv/btree.cpp:26-29`,
+  `include/dbengine/kv/btree.h:21-29`): max. `2t-1=63` Keys /
+  max. `2t=64` Kinder je Knoten (Fanout 64), `t-1..2t-1` Keys außer
+  Wurzel, gleiche Blatttiefe, Keys sortiert, Keys+Values in inneren
+  Knoten wie Blättern (kein B+-Overhead, Range via In-Order).
+- Split beim Abstieg (Median steigt auf, `src/kv/btree.cpp:500-525`),
+  Löschen mit Auffüllen (Ausleihen `BorrowFromPrev/Next` ab `>=t`,
+  sonst `MergeChild`, leere Wurzel schrumpft via `ShrinkRoot`,
+  `src/kv/btree.cpp:527-663`).
+- Persistenz Shadow-Paging/CoW (`include/dbengine/kv/btree.h:31-44`):
+  Knoten als wenige-KiB-Records im Pager-Image (Superblock unter
+  Pager-Key 0, Knoten-Id n unter Key n, Ids ab 1), Mutationen erst RAM,
+  `Flush()` schreibt dirty Knoten + kippt Superblock
+  (`root/next/count/seq`) in EINEM `Pager::insert` (tmp+rename+fsync
+  → atomar, `src/kv/btree.cpp:776-793`); `WriteBatch` validiert zuerst
+  (alles-oder-nichts) + flusht automatisch; Einzel-Put/Delete erst nach
+  `Flush()/Write()/Close()` crash-fest. Absichtlich NICHT Raw-Page-API
+  (`include/dbengine/kv/btree.h:46-50`).
+- Serialisierung: Knoten `magic(8)=BTREEPG1/ver(4)/leaf/n/keys/vals/
+  childs/checksum(FNV-1a64)` (`src/kv/btree.cpp:103-159`), Superblock
+  `BTREESB1/root/next/count/seq/checksum`, Freelist nicht persistiert
+  (GC-Rekonstruktion, `src/kv/btree.cpp:161-202`).
+- LoadAll-Loch-Fix (`src/kv/btree.cpp:701-774`): IDs ohne Pager-Record
+  sind freigegebene, nie persistierte Knoten (`FreeNode` vor Flush) →
+  `continue`, kein Fehler, bleiben frei (`src/kv/btree.cpp:728-734`);
+  danach Erreichbarkeit ab Wurzel + `reachable_keys==count`-Abgleich
+  (`src/kv/btree.cpp:739-761`); Waisen-GC löscht Reste abgebrochener
+  Commits, IDs wiederverwendbar (`src/kv/btree.cpp:762-772`);
+  `next`-Schranke gegen korrupte Werte (`src/kv/btree.cpp:719-722`).
+
+### 11.3 CLI — open/Replay/REPL (`src/main.cpp`)
+
+- Aufruf `prog <db-datei> [--exec "SQL;..."] [--sql datei.sql]...`,
+  ohne Flags REPL auf stdin, `--help/--version` (`src/main.cpp:24-35,267-320`).
+- Statement-Split per `;`, Quote-bewusst (`'...'`+`''`-Escape,
+  `"..."`+`""`-Escape, Parser = ein Statement/Aufruf,
+  `src/main.cpp:92-139`); REPL-Mehrzeiler via `popComplete`,
+  `.quit/.exit`, leere Zeilen skip, SQL-Fehler drucken+weiter, EOF-Rest
+  ausführen (`src/main.cpp:141-188,231-263`).
+- Ablauf: `Db::open` (erzeugt falls fehlend, Fehler→exit 1,
+  `src/main.cpp:322-335`) + `KVStore+MvccStore+Wal("<db>.wal")`
+  (`src/main.cpp:337-349`) + Mirror-Sidecar `"<db>.btree"` tolerant
+  (`enableMirror`, fehlend/korrupt→Voll-Replay+Warnung,
+  `src/main.cpp:350-370`) + `recover()` (Skips→Warnung,
+  `src/main.cpp:371-380`); Batch-Modus exit 1 bei ≥1 SQL-Fehler, REPL
+  bleibt 0 (`src/main.cpp:383-392`).
+- Persistenz-Modell ehrlich im `--help` (`src/main.cpp:39-55`): `<db>`
+  NUR Container (Magic+Version+Region-Table+CRC), SQL-Daten NICHT im
+  Body; Schema+Rows pro Statement ins WAL (`<db>.wal`, flush pro
+  Statement), Restart NUR via WAL (ohne WAL leer, Verlust=Verlust,
+  Torn-Tail→Prefix gewinnt); Mirror siehe 11.4.
+- Ausgabe: `SELECT`→Tabelle (`|`-Trenner, `valueToString`),
+  sonst Executor-Message, Fehler→stderr `ERROR: ` (`src/main.cpp:190-221`).
+
+### 11.4 Mirror-Checkpoint — B-Tree-Spiegel, Batch-Protokoll, Restart (`sql/executor.h`, `src/sql/executor.cpp`)
+
+- Format (`src/sql/executor.cpp:593-620`): `BTreeKV`-Sidecar
+  (`<db>.btree`) als Latest-State: Row-/Schema-Keys 1:1 wie KVStore
+  (`sql/<tabelle>/<pk>`, `sql/__schema/<tabelle>`, gleiche Codec-Helper),
+  Meta-Key `"\0mirror/lsn"` (NUL→keine Kollision, kein Prefix-Scan)
+  = dezimale durable-LSN bis zu der der Spiegel den WAL abbildet.
+- Protokoll inkrementell: Statements spiegeln gerade geschriebene
+  Payloads via `syncMirrorBatch(O(Batch))` ohne WAL-Re-Read;
+  `recover()`-Catch-up via `syncMirrorFromWal(Vollscan, selten)`
+  (`src/sql/executor.cpp:601-607`); danach `mirror_lsn=durable` in
+  EINEM `BTreeKV`-Flush (Shadow-Paging→atomar, Crash davor=alter
+  Spiegel+alte LSN=konsistent, Tail-Replay holt Rest,
+  `src/sql/executor.cpp:604-607,837-853`).
+- Laden (`src/sql/executor.cpp:622-730`, `include/dbengine/sql/executor.h:54-68`):
+  Sidecar öffnen/erzeugen, LSN parsen (korrupt→degradiert `lsn=0`),
+  Pass 1 Schemas, Pass 2 nur Rows bekannter Tabellen (Phantom-Schutz),
+  chunkweise `4096` in KV (`WriteBatch`)+MVCC (frische Single-Version-
+  Ketten, committed, ohne aktive Txns sichtbar)+Replika; fremde Keys/
+  Fehler→degradiert, WAL bleibt Wahrheit (Voll-Replay, last-wins,
+  nie Datenverlust durch Spiegel).
+- Replay mit Spiegel (`src/sql/executor.cpp:1685-1703`): nur Tail
+  `read_from(mirror_lsn+1)` falls `mirror_on+open+lsn>0`, sonst Voll-
+  `replay()` (+Fallback bei `read_from`-Fehler); danach
+  `syncMirrorFromWal` als Checkpoint-Catch-up
+  (`src/sql/executor.cpp:1844-1846`); Seiteneffekt 1:1 inkl. Skip-Regeln
+  via `applyMirrorRecord` (`src/sql/executor.cpp:749-797`).
+- Restart-Zahlen (Duellbericht `docs/PHASE0-DUELL.md`, untrennbar
+  Replay+Neuaufbau+Scan, 1M, tmpfs, Batch=1): dbengine-Neustart
+  `~6,1–6,3 s` (Lauf A `6,120/6,098 s`, Lauf B `6,230/6,301 s`) vs.
+  SQLite-Reopen+COUNT+SUM `~0,05 s`; Größen `<db>=41 038 B` (leer,
+  nur Container) + `<db>.wal=53 666 726 B (~51,2 MiB)` vs. SQLite
+  `15 024 128 B (14,33 MiB)` — Details/Vergleich siehe 11.6, nichts
+  extrapoliert.
+
+### 11.5 Autotune-Formel + 100k-Recall (`vector/hnsw.h`, `vector/quant.h`)
+
+- HNSW-`auto_ef` (`include/dbengine/vector/hnsw.h:150-167`,
+  `src/vector/hnsw.cpp:241-265`): `ef_auto=ceil(k*sqrt(N)/10)`,
+  effektiv `min(max(max(ef_default,k),ef_auto),1024,N)`; `/10` auf
+  `N~=1k,k=10` kalibriert (`~=32`=alter Default, kein Klein-Overhead),
+  `ef_default`=Floor/Override, explizites `ef>0` gewinnt immer;
+  `ef<=0`→Autotune (`include/dbengine/vector/hnsw.h:215-216`).
+- Filter-`autotune_ef` (`include/dbengine/vector/quant.h:260-273`,
+  `src/vector/quant.cpp:753-779`): `ef=ceil(k/sel*2.0)`,
+  `sel` auf `[1e-4,1.0]` geclampt, `[max(k,ef_min=32),ef_max=1024]`,
+  Cap `n`; Komfort `autotune_ef_for_filter(k,matched,total)`
+  (`src/vector/quant.cpp:772-779`); N-unabhängig (sel=1→2k), daher für
+  UNGEFILTERT zusätzlich `auto_ef`-sqrt-Pfad nutzen.
+- IVF-`autotune` (`include/dbengine/vector/quant.h:157-168`,
+  `src/vector/quant.cpp:410-436`): `nlist~=4*sqrt(N)` (`[1,4096]`, `<=N`),
+  `nprobe~=nlist/8` (aufgerundet, `[1,nlist]`); Groß-Pfad ab
+  `N>=kHnswToIvfThreshold=50k` IVF statt HNSW
+  (`include/dbengine/vector/quant.h:244-258`).
+- 100k-Recall (uniform, k=10, fixer ef): `0,94@2k → 0,78@8k → 0,34@100k`
+  (`include/dbengine/vector/quant.h:244-249`,
+  `src/vector/hnsw.cpp:241-245`); Erwartung Autotune (k=10):
+  `2k→ef~45 Recall~0,94+`, `8k→ef~90 Recall~0,9`,
+  `100k→ef~317 Recall>=0,8` bei ~10x Beam-Latenz
+  (`include/dbengine/vector/hnsw.h:162-166`); Latenz/Speicher groß
+  trotzdem IVF (`include/dbengine/vector/quant.h:250-254`).
+
+### 11.6 Duell-Ergebnisse 1M — Insert/Restart vs. SQLite (`docs/PHASE0-DUELL.md`, Zahlen übernommen)
+
+- Setup (nichts erfunden): `CREATE TABLE t (id INT, val INT)` +
+  `1..1M INSERT (i,i)`, `COUNT=1000000`, `SUM=500000500000`
+  (dbengine-Anzeige `5e+11` = Display-Format, dokumentiert);
+  Batch=1 (Einzel-INSERT/Statement, dbengine 1M `flush()`=1M fdatasyncs
+  ohne Group-Commit über Grenzen, SQLite Autocommit 1 Commit/INSERT,
+  `synchronous=FULL`, `journal_mode=delete`, `page_size=4096`);
+  dbengine-Scan `SELECT SUM(val)`, SQLite COUNT+SUM in einer Messung
+  (2 Voll-Scans, Asymmetrie zugunsten dbengine, urteilsneutral);
+  alles `/tmp` = tmpfs (fsync fast gratis, NICHT auf Platte übertragbar).
+- 10k-Probe (Hochrechnungs-Basis): dbengine `0,056/0,057 s` Insert,
+  `0,054 s` Restart+Scan; SQLite `0,753 s` Insert, `0,001 s` Reopen+Scan;
+  Hochrechnung `~6 s` vs. `~75 s` (<8 min → 1M ehrlich gemessen, je 2 Läufe).
+- 1M Insert: dbengine A `6,681 s`, B `6,705 s` (fresh DB, 1M Einzel-INSERTs,
+  38 777 826-B-SQL); SQLite `75,086 s` / `75,460 s` → dbengine `~11×`
+  schneller (`~6,7 s` vs. `~75,3 s`).
+- 1M Restart+Scan: dbengine A `6,120/6,098 s`, B `6,230/6,301 s`
+  (neuer Prozess: WAL-Replay 1M + In-Memory-Neuaufbau + Scan untrennbar);
+  SQLite `0,048/0,045 s` + `0,048/0,044 s` → SQLite `~130×` schneller
+  (`~6,2 s` vs. `~0,05 s`).
+- Bytes persistent: dbengine `41 KB` Container + `53,7 MB` WAL
+  (Rows nur im WAL, ohne WAL leer/Totalverlust) vs. SQLite `14,3 MB`
+  echte DB (B-Tree/Pager). Urteil Duellbericht: kein Gesamtsieger
+  (Schreibdurchsatz vs. Restart-/Lesekosten); Engpass dbengine=Replay,
+  Engpass SQLite=Insert (FULL+Autocommit ~13k vs. ~150k Rows/s nur dank
+  tmpfs `~7 µs`/fdatasync); nicht gemessen: echte Disk, Batch>1,
+  Transaktions-Batching, Index-Scans.
+
+### 11.7 Stale-Korrekturen zu Kap. 1/2/5/6/9 (mit Code-Beleg Datei:Zeile)
+
+- Kap. 6 „Pager Single-File, Rows im Image" unvollständig → korrekt:
+  Phase-0-CLI-`<db>` ist Db-Container (`41038 B`, Regionen genullt,
+  keine Rows), SQL-Rows leben in `<db>.wal` (+`<db>.btree`-Spiegel);
+  ohne WAL startet DB leer (Beleg: `src/main.cpp:39-55`,
+  `include/dbengine/db.h:46-48`, `src/main.cpp:337-349`).
+- Kap. 6 „Index Secondary B-Tree via multimap (Stub)" ≠ BTreeKV →
+  korrekt: Abgrenzung — Secondary-Index bleibt `multimap`/TTL
+  (Beleg: `include/dbengine/index/btree.h:11-15`), Phase-0-Herzstück
+  `kv::BTreeKV` ist persistenter B-Baum (Fanout 64, Shadow-Paging)
+  (Beleg: `include/dbengine/kv/btree.h:21-44`).
+- Kap. 2/9.7 „Replay = Voll-Replay" unvollständig → korrekt: mit
+  Spiegel nur Tail `lsn>mirror_lsn`, sonst Voll-Replay; WAL bleibt
+  Wahrheit (Beleg: `src/sql/executor.cpp:1689-1703`,
+  `include/dbengine/sql/executor.h:15-21`).
+- Kap. 5/9.8 „fixer `ef_default=32`" historisch → korrekt: `search`
+  `ef<=0` = `auto_ef(N)` (`ceil(k*sqrt(N)/10)`, Cap 1024), Filter-ef
+  via `autotune_ef(_for_filter)` (Beleg:
+  `src/vector/hnsw.cpp:249-265`,
+  `include/dbengine/vector/hnsw.h:150-167,215-219`,
+  `src/vector/quant.cpp:754-779`).
+
+### 11.8 Runbook-Ops (Phase 0)
+
+- CLI: `dbengine foo.db --sql init.sql --exec "SELECT COUNT(*) FROM t;"`,
+  `dbengine foo.db --exec "SELECT SUM(val) FROM t;"` (Restart misst
+  Replay+Scan, `src/main.cpp:27-35`); REPL `dbengine foo.db` + `.quit`.
+- Dateien nebeneinander: `foo.db` (Container), `foo.db.wal` (Wahrheit),
+  `foo.db.btree` (Spiegel, tolerant, heilt via Voll-Replay,
+  `src/main.cpp:350-380`); WAL-Verlust=Totalverlust, Spiegel-Verlust
+  nur Tail-Replay (11.4).
+- Vektor-Groß: `N>=50k` `prefer_ivf_over_hnsw` + `IvfPqIndex::autotune(N)`
+  (`include/dbengine/vector/quant.h:255-258,166-168`); HNSW klein mit
+  Default-`ef` (Autotune, keine Flags nötig).

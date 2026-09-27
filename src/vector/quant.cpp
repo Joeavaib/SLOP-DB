@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -405,6 +406,28 @@ float PqNQuantizer::adc_l2_squared(
     const Vector& query, const std::vector<uint8_t>& code) const {
   AdcTable t = build_adc_table(query);
   return adc_with_table(t, code);
+}
+
+const std::vector<std::vector<Vector>>& PqNQuantizer::codebooks() const {
+  return codebooks_;
+}
+
+void PqNQuantizer::set_codebooks(
+    const std::vector<std::vector<Vector>>& cb) {
+  if (m_ <= 0) throw std::logic_error("PqNQuantizer::set_codebooks: no init");
+  if (static_cast<int>(cb.size()) != m_)
+    throw std::invalid_argument("PqNQuantizer::set_codebooks: M mismatch");
+  for (int m = 0; m < m_; ++m) {
+    if (static_cast<int>(cb[m].size()) != kCentroids)
+      throw std::invalid_argument(
+          "PqNQuantizer::set_codebooks: centroid count mismatch");
+    for (int c = 0; c < kCentroids; ++c)
+      if (static_cast<int>(cb[m][c].size()) != subdims_[m])
+        throw std::invalid_argument(
+            "PqNQuantizer::set_codebooks: subdim mismatch");
+  }
+  codebooks_ = cb;
+  fitted_ = true;
 }
 
 // --- IvfPqIndex ---------------------------------------------------------------
@@ -812,6 +835,398 @@ std::vector<SearchHit> quantized_search_rerank(
                        return a.id < b.id;
                      });
     cand.resize(k);
+  }
+  std::sort(cand.begin(), cand.end(),
+            [](const SearchHit& a, const SearchHit& b) {
+              if (a.dist != b.dist) return a.dist < b.dist;
+              return a.id < b.id;
+            });
+  return cand;
+}
+
+// --- DiskAnnIndex (DiskANN-Lite) -------------------------------------------
+namespace {
+constexpr char kAnnMagic[8] = {'D', 'B', 'E', 'A', 'N', 'N', '1', '\0'};
+struct AnnHeader {
+  char magic[8];
+  uint64_t dim;
+  uint64_t mpq;
+  uint64_t mgraph;
+  uint64_t count;
+};
+inline std::string ann_sibling(const std::string& prefix, const char* ext) {
+  return prefix + ext;
+}
+}  // namespace
+
+void DiskAnnIndex::init(int dim, int num_subspaces, int m_graph) {
+  if (dim <= 0) throw std::invalid_argument("DiskAnnIndex::init: dim<=0");
+  if (num_subspaces <= 0 || num_subspaces > 32)
+    throw std::invalid_argument("DiskAnnIndex::init: M in 1..32");
+  if (dim < num_subspaces)
+    throw std::invalid_argument("DiskAnnIndex::init: dim < M");
+  if (m_graph <= 0 || m_graph > 512)
+    throw std::invalid_argument("DiskAnnIndex::init: m_graph in 1..512");
+  close();
+  dim_ = dim;
+  m_pq_ = num_subspaces;
+  m_graph_ = m_graph;
+  count_ = 0;
+  entry_ = 0;
+  prefix_.clear();
+  pq_.init(dim, num_subspaces);
+}
+
+void DiskAnnIndex::build(const std::vector<Vector>& data,
+                         const std::string& prefix, int pq_iters,
+                         unsigned seed) {
+  if (dim_ <= 0 || m_pq_ <= 0 || m_graph_ <= 0)
+    throw std::logic_error("DiskAnnIndex::build: init missing");
+  if (data.empty()) throw std::invalid_argument("DiskAnnIndex::build: empty");
+  if (prefix.empty())
+    throw std::invalid_argument("DiskAnnIndex::build: empty prefix");
+  for (const auto& v : data)
+    if (static_cast<int>(v.size()) != dim_)
+      throw std::invalid_argument("DiskAnnIndex::build: dim mismatch");
+  if (pq_iters <= 0) throw std::invalid_argument("DiskAnnIndex: pq_iters<=0");
+
+  pq_.fit(data, pq_iters, seed);
+  const size_t n = data.size();
+
+  // Codes in RAM vorbereiten.
+  std::vector<std::vector<uint8_t>> codes;
+  codes.reserve(n);
+  for (const auto& v : data) codes.push_back(pq_.encode(v));
+
+  // Graph: exakte M-NN (eigene Beam-Links, deterministisch, (dist,id)-Ties).
+  // O(N^2), fuer Lite-N ok; Alternative waere HnswIndex::search pro Knoten
+  // (public API, kein hnsw.h-Eingriff), hier bewusst exakt fuer maximalen
+  // Recall der Beam-Suche.
+  std::vector<std::vector<int>> adj(n);
+  std::vector<std::pair<float, int>> dists;
+  for (size_t i = 0; i < n; ++i) {
+    dists.clear();
+    dists.reserve(n > 0 ? n - 1 : 0);
+    for (size_t j = 0; j < n; ++j) {
+      if (j == i) continue;
+      const float d2 = sub_l2_squared(data[i].data(), data[j].data(), dim_);
+      dists.emplace_back(d2, static_cast<int>(j));
+    }
+    const int want = std::min<int>(m_graph_, static_cast<int>(dists.size()));
+    if (want > 0) {
+      std::nth_element(dists.begin(), dists.begin() + want, dists.end(),
+                       [](const auto& a, const auto& b) {
+                         if (a.first != b.first) return a.first < b.first;
+                         return a.second < b.second;
+                       });
+      dists.resize(static_cast<size_t>(want));
+      std::sort(dists.begin(), dists.end(), [](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first < b.first;
+        return a.second < b.second;
+      });
+      adj[i].reserve(static_cast<size_t>(m_graph_));
+      for (const auto& pr : dists) adj[i].push_back(pr.second);
+    }
+  }
+
+  // Persistenz: 3 DiskSpills (fixe Records dim_/m_pq_/m_graph_).
+  close();
+  const std::string vec_path = ann_sibling(prefix, ".vec");
+  const std::string pq_path = ann_sibling(prefix, ".pq");
+  const std::string graph_path = ann_sibling(prefix, ".graph");
+  const std::string hdr_path = ann_sibling(prefix, ".hdr");
+  vec_.create(vec_path, dim_, n);
+  for (size_t i = 0; i < n; ++i) vec_.set(i, data[i]);
+  codes_.create(pq_path, m_pq_, n);
+  Vector coderow(static_cast<size_t>(m_pq_));
+  for (size_t i = 0; i < n; ++i) {
+    for (int m = 0; m < m_pq_; ++m)
+      coderow[static_cast<size_t>(m)] =
+          static_cast<float>(codes[i][static_cast<size_t>(m)]);
+    codes_.set(i, coderow);
+  }
+  graph_.create(graph_path, m_graph_, n);
+  Vector grow(static_cast<size_t>(m_graph_), -1.0f);
+  for (size_t i = 0; i < n; ++i) {
+    std::fill(grow.begin(), grow.end(), -1.0f);
+    for (size_t kk = 0; kk < adj[i].size(); ++kk)
+      grow[kk] = static_cast<float>(adj[i][kk]);
+    graph_.set(i, grow);
+  }
+  vec_.sync();
+  codes_.sync();
+  graph_.sync();
+
+  // Header + Codebooks (float32).
+  std::ofstream out(hdr_path, std::ios::binary | std::ios::trunc);
+  if (!out) throw std::runtime_error("DiskAnnIndex::build: hdr write open");
+  AnnHeader hh{};
+  std::memcpy(hh.magic, kAnnMagic, 8);
+  hh.dim = static_cast<uint64_t>(dim_);
+  hh.mpq = static_cast<uint64_t>(m_pq_);
+  hh.mgraph = static_cast<uint64_t>(m_graph_);
+  hh.count = static_cast<uint64_t>(n);
+  out.write(reinterpret_cast<const char*>(&hh), sizeof(hh));
+  const auto& cb = pq_.codebooks();
+  for (int m = 0; m < m_pq_; ++m)
+    for (int c = 0; c < PqNQuantizer::kCentroids; ++c) {
+      const Vector& cent = cb[static_cast<size_t>(m)][static_cast<size_t>(c)];
+      out.write(reinterpret_cast<const char*>(cent.data()),
+                static_cast<std::streamsize>(cent.size() * sizeof(float)));
+    }
+  out.flush();
+  if (!out) throw std::runtime_error("DiskAnnIndex::build: hdr write failed");
+  out.close();
+
+  count_ = n;
+  entry_ = 0;
+  prefix_ = prefix;
+  open_ = true;
+}
+
+void DiskAnnIndex::open(const std::string& prefix) {
+  if (prefix.empty())
+    throw std::invalid_argument("DiskAnnIndex::open: empty prefix");
+  close();
+  const std::string hdr_path = ann_sibling(prefix, ".hdr");
+  std::ifstream in(hdr_path, std::ios::binary);
+  if (!in) throw std::runtime_error("DiskAnnIndex::open: hdr missing");
+  AnnHeader hh{};
+  in.read(reinterpret_cast<char*>(&hh), sizeof(hh));
+  if (!in || std::memcmp(hh.magic, kAnnMagic, 8) != 0)
+    throw std::runtime_error("DiskAnnIndex::open: bad header");
+  const int dim = static_cast<int>(hh.dim);
+  const int mpq = static_cast<int>(hh.mpq);
+  const int mgraph = static_cast<int>(hh.mgraph);
+  const size_t count = static_cast<size_t>(hh.count);
+  if (dim <= 0 || mpq <= 0 || mpq > 32 || dim < mpq || mgraph <= 0 ||
+      mgraph > 512 || count == 0)
+    throw std::runtime_error("DiskAnnIndex::open: bad dims");
+  std::vector<int> subdims(static_cast<size_t>(mpq), 0);
+  {
+    const int base = dim / mpq;
+    const int rem = dim % mpq;
+    for (int i = 0; i < mpq; ++i)
+      subdims[static_cast<size_t>(i)] = base + (i < rem ? 1 : 0);
+  }
+  std::vector<std::vector<Vector>> cb(static_cast<size_t>(mpq));
+  for (int m = 0; m < mpq; ++m) {
+    cb[static_cast<size_t>(m)].assign(
+        PqNQuantizer::kCentroids,
+        Vector(static_cast<size_t>(subdims[static_cast<size_t>(m)]), 0.0f));
+    for (int c = 0; c < PqNQuantizer::kCentroids; ++c) {
+      Vector& cent = cb[static_cast<size_t>(m)][static_cast<size_t>(c)];
+      in.read(reinterpret_cast<char*>(cent.data()),
+              static_cast<std::streamsize>(cent.size() * sizeof(float)));
+      if (!in) throw std::runtime_error("DiskAnnIndex::open: codebook short");
+    }
+  }
+  {
+    char extra = 0;
+    in.read(&extra, 1);
+    if (in.gcount() != 0)
+      throw std::runtime_error("DiskAnnIndex::open: hdr trailing bytes");
+  }
+  in.close();
+
+  PqNQuantizer pq;
+  pq.init(dim, mpq);
+  pq.set_codebooks(cb);
+
+  DiskSpill vec;
+  DiskSpill code;
+  DiskSpill gr;
+  vec.open(ann_sibling(prefix, ".vec"));
+  code.open(ann_sibling(prefix, ".pq"));
+  gr.open(ann_sibling(prefix, ".graph"));
+  if (vec.dim() != dim || vec.size() != count)
+    throw std::runtime_error("DiskAnnIndex::open: vec mismatch");
+  if (code.dim() != mpq || code.size() != count)
+    throw std::runtime_error("DiskAnnIndex::open: pq mismatch");
+  if (gr.dim() != mgraph || gr.size() != count)
+    throw std::runtime_error("DiskAnnIndex::open: graph mismatch");
+
+  dim_ = dim;
+  m_pq_ = mpq;
+  m_graph_ = mgraph;
+  count_ = count;
+  entry_ = 0;
+  prefix_ = prefix;
+  pq_ = std::move(pq);
+  vec_ = std::move(vec);
+  codes_ = std::move(code);
+  graph_ = std::move(gr);
+  open_ = true;
+}
+
+void DiskAnnIndex::close() {
+  vec_.close();
+  codes_.close();
+  graph_.close();
+  open_ = false;
+}
+
+std::vector<int> DiskAnnIndex::read_adj_row(int id) const {
+  Vector row = graph_.get(static_cast<size_t>(id));
+  std::vector<int> out;
+  out.reserve(static_cast<size_t>(m_graph_));
+  for (float f : row) {
+    if (f < -0.5f) continue;
+    const long v = std::lround(f);
+    if (v < 0 || v >= static_cast<long>(count_)) continue;
+    out.push_back(static_cast<int>(v));
+  }
+  return out;
+}
+
+std::vector<uint8_t> DiskAnnIndex::read_code_row(int id) const {
+  Vector row = codes_.get(static_cast<size_t>(id));
+  std::vector<uint8_t> code(static_cast<size_t>(m_pq_));
+  for (int m = 0; m < m_pq_; ++m) {
+    long v = std::lround(row[static_cast<size_t>(m)]);
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    code[static_cast<size_t>(m)] = static_cast<uint8_t>(v);
+  }
+  return code;
+}
+
+float DiskAnnIndex::adc_of(int id,
+                            const PqNQuantizer::AdcTable& table) const {
+  std::vector<uint8_t> code = read_code_row(id);
+  return pq_.adc_with_table(table, code);
+}
+
+std::vector<int> DiskAnnIndex::neighbors(int id) const {
+  if (!open_) throw std::logic_error("DiskAnnIndex::neighbors: closed");
+  if (id < 0 || id >= static_cast<int>(count_))
+    throw std::out_of_range("DiskAnnIndex::neighbors: bad id");
+  return read_adj_row(id);
+}
+
+Vector DiskAnnIndex::get_vector(int id) const {
+  if (!open_) throw std::logic_error("DiskAnnIndex::get_vector: closed");
+  if (id < 0 || id >= static_cast<int>(count_))
+    throw std::out_of_range("DiskAnnIndex::get_vector: bad id");
+  return vec_.get(static_cast<size_t>(id));
+}
+
+std::vector<uint8_t> DiskAnnIndex::get_code(int id) const {
+  if (!open_) throw std::logic_error("DiskAnnIndex::get_code: closed");
+  if (id < 0 || id >= static_cast<int>(count_))
+    throw std::out_of_range("DiskAnnIndex::get_code: bad id");
+  return read_code_row(id);
+}
+
+std::vector<SearchHit> DiskAnnIndex::search(const Vector& query, int k,
+                                            int beam,
+                                            int ef_rerank) const {
+  if (!open_) throw std::logic_error("DiskAnnIndex::search: closed");
+  if (static_cast<int>(query.size()) != dim_)
+    throw std::invalid_argument("DiskAnnIndex::search: dim mismatch");
+  if (k <= 0) return {};
+  const int n = static_cast<int>(count_);
+  if (n == 0) return {};
+  int ef_beam = beam;
+  if (ef_beam < k) ef_beam = k;
+  if (ef_beam > n) ef_beam = n;
+  if (ef_beam < 1) ef_beam = 1;
+  int ef_rr = ef_rerank;
+  if (ef_rr < k) ef_rr = k;
+  if (ef_rr > n) ef_rr = n;
+  if (ef_rr < 1) ef_rr = 1;
+
+  // Eine ADC-Tabelle pro Query (RAM-Codebooks, kein decode).
+  PqNQuantizer::AdcTable table = pq_.build_adc_table(query);
+
+  using Cand = std::pair<float, int>;
+  auto cmp_min = [](const Cand& a, const Cand& b) {
+    if (a.first != b.first) return a.first > b.first;
+    return a.second > b.second;
+  };
+  auto cmp_max = [](const Cand& a, const Cand& b) {
+    if (a.first != b.first) return a.first < b.first;
+    return a.second < b.second;
+  };
+  std::vector<char> seen(static_cast<size_t>(n), 0);
+  std::vector<Cand> frontier;
+  frontier.reserve(static_cast<size_t>(2 * ef_beam + 8));
+  std::vector<Cand> top;
+  top.reserve(static_cast<size_t>(ef_beam + 1));
+  std::vector<Cand> scored;
+  scored.reserve(static_cast<size_t>(n));
+
+  const int entry = (entry_ >= 0 && entry_ < n) ? entry_ : 0;
+  const float d0 = adc_of(entry, table);
+  seen[static_cast<size_t>(entry)] = 1;
+  frontier.emplace_back(d0, entry);
+  std::push_heap(frontier.begin(), frontier.end(), cmp_min);
+  top.emplace_back(d0, entry);
+  std::push_heap(top.begin(), top.end(), cmp_max);
+  scored.emplace_back(d0, entry);
+
+  std::vector<int> nbrs;
+  while (!frontier.empty()) {
+    const float d_u = frontier.front().first;
+    if (static_cast<int>(top.size()) >= ef_beam && d_u > top.front().first)
+      break;
+    std::pop_heap(frontier.begin(), frontier.end(), cmp_min);
+    const Cand cur = frontier.back();
+    frontier.pop_back();
+    const int u = cur.second;
+    nbrs = read_adj_row(u);  // mmap-Read, fixe Record-Groesse
+    for (int v : nbrs) {
+      if (v < 0 || v >= n || seen[static_cast<size_t>(v)] != 0) continue;
+      seen[static_cast<size_t>(v)] = 1;
+      const float d_v = adc_of(v, table);  // kein decode
+      scored.emplace_back(d_v, v);
+      frontier.emplace_back(d_v, v);
+      std::push_heap(frontier.begin(), frontier.end(), cmp_min);
+      if (static_cast<int>(top.size()) < ef_beam) {
+        top.emplace_back(d_v, v);
+        std::push_heap(top.begin(), top.end(), cmp_max);
+      } else {
+        const Cand& worst = top.front();
+        if (d_v < worst.first || (d_v == worst.first && v < worst.second)) {
+          std::pop_heap(top.begin(), top.end(), cmp_max);
+          top.back() = Cand(d_v, v);
+          std::push_heap(top.begin(), top.end(), cmp_max);
+        }
+      }
+    }
+  }
+  // Refill-Garantie: falls Beam zu wenige Knoten erreichte (disconnect),
+  // mit ADC-Linearscan auf ef_rr auffuellen (weiterhin kein decode).
+  if (static_cast<int>(scored.size()) < ef_rr) {
+    for (int i = 0; i < n && static_cast<int>(scored.size()) < ef_rr; ++i) {
+      if (seen[static_cast<size_t>(i)] != 0) continue;
+      seen[static_cast<size_t>(i)] = 1;
+      scored.emplace_back(adc_of(i, table), i);
+    }
+  }
+  int ef = std::min<int>(static_cast<int>(scored.size()), ef_rr);
+  if (ef < k) ef = std::min<int>(static_cast<int>(scored.size()), k);
+  if (ef <= 0) return {};
+  std::nth_element(scored.begin(), scored.begin() + ef, scored.end(),
+                   [](const Cand& a, const Cand& b) {
+                     if (a.first != b.first) return a.first < b.first;
+                     return a.second < b.second;
+                   });
+  scored.resize(static_cast<size_t>(ef));
+  // Exaktes Re-Rank mit vollen Vektoren via DiskSpill.
+  std::vector<SearchHit> cand;
+  cand.reserve(static_cast<size_t>(ef));
+  for (const auto& pr : scored) {
+    Vector v = vec_.get(static_cast<size_t>(pr.second));
+    cand.push_back({pr.second, l2_distance(query, v)});
+  }
+  if (static_cast<int>(cand.size()) > k) {
+    std::nth_element(cand.begin(), cand.begin() + k, cand.end(),
+                     [](const SearchHit& a, const SearchHit& b) {
+                       if (a.dist != b.dist) return a.dist < b.dist;
+                       return a.id < b.id;
+                     });
+    cand.resize(static_cast<size_t>(k));
   }
   std::sort(cand.begin(), cand.end(),
             [](const SearchHit& a, const SearchHit& b) {

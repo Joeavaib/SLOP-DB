@@ -776,10 +776,16 @@ bool BTreeKV::LoadAll() {
 bool BTreeKV::Persist() {
   if (!open_) return false;
   if (dirty_.empty()) return true;
+  // Ein Batch = ein Image-Rewrite (statt einem pro Knoten).
+  std::vector<std::pair<std::uint64_t, std::string>> batch;
+  batch.reserve(dirty_.size());
   for (const auto& dirty : dirty_) {
     auto it = nodes_.find(dirty.first);
     if (it == nodes_.end()) continue;  // geloeschter Knoten (defensiv)
-    if (!pager_->insert(dirty.first, EncodeNode(it->second))) return false;
+    batch.emplace_back(dirty.first, EncodeNode(it->second));
+  }
+  if (!batch.empty()) {
+    if (!pager_->insert_batch(batch)) return false;
   }
   Super sb;
   sb.root = root_;

@@ -111,3 +111,135 @@ Dateigröße: **15 024 128 Bytes (14,33 MiB)** echte DB-Datei (B-Tree/Pager).
    (Multi-Row-INSERTs), Transaktions-Batching bei SQLite, Index-Scans.
    Jede dieser Änderungen würde das Bild verschieben; oben steht nur,
    was wirklich lief: 1M × Batch=1, fsync auf beiden Seiten, tmpfs.
+
+---
+
+# Re-Duell nach Mirror-Checkpoint (s76): 2026-09-27 (UTC)
+
+Anlass: Commit `c03f4f1` (s76-mirrorckpt): `<db>.btree`-Sidecar
+(BTreeKV, Latest-State je Key + Spiegel-LSN), pro WAL-Flush inkrementell
+nachgezogen; beim Start nur WAL-Tail (lsn > Spiegel-LSN) replayen.
+Ziel des Re-Duells: Prüfen, ob der Restart-Engpass (~6,2 s bei 1M)
+weg ist — und was der Spiegel beim Insert kostet.
+Binary: `./build/dbengine` wie es lag (NICHT neu gebaut;
+`--version`: `dbengine version 0.1.0`); `--help` beschreibt das
+Mirror-Protokoll wie oben. Repo sonst NICHT angefasst (nur diese Datei
+editiert, keine cmake/ctest/build-Läufe).
+
+## Methodik (identisch zum Duell oben)
+
+- Gleiche Daten: `CREATE TABLE t (id INT, val INT);` + 1M ×
+  `INSERT INTO t VALUES (i, i);`. Die generierte Datei war
+  **38 777 826 Bytes** — bytegleich groß wie `/tmp/duell1m.sql` oben,
+  also dieselben Statements.
+- Batch=1, alles unter `/tmp` (weiterhin `tmpfs`), Wall-clock per
+  `date +%s.%N` um den Prozess, danach alle Artefakte gelöscht.
+- SQLite-Seite **übernommen** (ungeändert, s76 fasst SQLite nicht an):
+  Insert ~75,3 s, Reopen+COUNT+SUM ~0,05 s. Remeasure (2× ~75 s) war
+  nicht billig und hätte nichts geändert.
+- Caveat: parallel liefen fremde Benchmarks auf der Maschine
+  (24 Kerne, Load ~9,7). Das erklärt KEINE 100×-Effekte (s. Zahlen),
+  sei aber genannt.
+
+## Was lief (ehrlich, inkl. Abbrüche)
+
+- **1M-Versuch: ABGEBROCHEN.** Nach 300 s erst 74 844 von 1 000 001
+  Statements (~250 Rows/s, fallend). Hochrechnung linear ≥ 65 min,
+  real superlinear (s. 100k) → Stunden. Über dem 8-min-Budget der
+  Methodik oben → kein 1M-Messwert, kein Extrapolat.
+- **100k-Versuch: ABGEBROCHEN.** Nach 540 s erst 98 676 von 100 001
+  Statements (~183 Rows/s im Schnitt) → ~550 s projiziert. Ebenfalls
+  über Budget. DB-Rest (98 681 Rows) für Restart-Messung genutzt (s. u.).
+- **10k mit Spiegel: vollständig, je 2 Läufe** (gleiche 10k-Daten wie
+  in der Probe oben).
+
+## Ergebnisse mit Spiegel
+
+### Insert 10k (fresh DB, Batch=1)
+
+| Lauf | Insert 10k Spiegel | vorher (ohne Spiegel) |
+| --- | --- | --- |
+| A | 6,542 s | 0,056 s |
+| B | 6,509 s | 0,057 s |
+
+Faktor: **~117× langsamer** (~1 530 Rows/s statt ~178 000 Rows/s).
+
+Dateien (10k, Lauf A): `<db>` = 41 038 Bytes (unverändert),
+`<db>.wal` = 476 720 Bytes, `<db>.btree` = 344 064 Bytes.
+
+### Restart + SUM 10k (sauberer Shutdown, Spiegel aktiv, keine Warnung)
+
+| Lauf | Restart+SUM 10k Spiegel | vorher (Voll-Replay) |
+| --- | --- | --- |
+| 1 | 0,058 s | 0,054 s |
+| 2 | 0,057 s | (1 Messung oben) |
+
+SUM-Anzeige weiter `5.0005e+07`, COUNT = 10000 — korrekt.
+**Kein sichtbarer Gewinn:** bei 10k war Replay auch vorher gratis.
+
+### Restart ~99k auf abgebrochener 100k-DB (der interessante Fall)
+
+- `./build/dbengine /tmp/probe100k.db --exec "SELECT SUM(val) FROM t;"`:
+  **0,590 s / 0,590 s** (2 Läufe), COUNT = 98681,
+  SUM-Anzeige `4.86902e+09` (= 4 869 019 221, korrekt).
+- Aber: **mit Warnung** `Spiegel '...btree' nicht aktiv:
+  ... nicht oeffbar; Voll-Replay aus WAL` — der Kill hatte
+  `probe100k.db.btree.tmp` hinterlassen, der Spiegel wurde verworfen
+  und es gab **trotzdem Voll-Replay**. Genau der Crash-Fall, für den
+  der Spiegel gebaut wurde, nutzte ihn nicht.
+
+### Vorher/nachher (1M-Skala, ehrlich beschriftet)
+
+| Kennzahl (Batch=1) | vorher (2026-09-26) | nachher (Spiegel, 2026-09-27) |
+| --- | --- | --- |
+| Insert 10k | 0,056 s | 6,5 s (~117× langsamer) |
+| Insert 100k | ~0,7 s (linear aus 1M=6,7 s) | ~550 s (abgebrochen, gemessen 98 676 Stmts/540 s) |
+| Insert 1M | ~6,7 s | ABBRUCH (74 844 Stmts/300 s; 1M nicht erreichbar) |
+| Restart+SUM 10k | 0,054 s | 0,058 s (kein Gewinn) |
+| Restart+SUM ~99k | ~0,6 s (linear aus 1M=6,2 s) | 0,59 s — aber Voll-Replay (Spiegel nach Kill verworfen) |
+| Restart+SUM 1M | ~6,2 s | nicht messbar (keine 1M-DB erzeugbar) |
+| SQLite 1M (unverändert) | Insert ~75,3 s / Reopen ~0,05 s | übernommen |
+
+## Urteil (ungeschönt)
+
+1. **Restart-Ziel de facto NICHT erreicht.** Wo der Spiegel helfen
+   müsste (großes N), kommt man nicht mehr hin, weil der Insert
+   ~100–1000× langsamer wurde. Bei kleinem N (10k) war Restart vorher
+   schon ~0,05 s — kein Gewinn messbar. Und nach Kill (dem eigentlichen
+   Crash-Szenario) wurde der Spiegel wegen des `.btree.tmp`-Restes
+   verworfen → Voll-Replay. Drei Ebenen, auf denen der Nutzen fehlt.
+2. **Ursache steht im Code** (`src/sql/executor.cpp`,
+   `syncMirrorBatch`: pro Statement `mirror_->Put(...)` +
+   `mirror_->Flush()` — also pro Einzel-INSERT ein WAL-fdatasync UND
+   ein B-Tree-Flush). Die Kosten pro Row wachsen mit der Baumgröße:
+   10× Rows (10k→100k) → ~85× Zeit (6,5 s → ~550 s). Das ist der
+   Trade, den s76 gekauft hat: Insert-Throughput für Restart-Hoffnung.
+3. **Gesamtbild gegen SQLite gekippt:** vorher Insert ~11× schneller
+   als SQLite bei Restart ~130× langsamer; jetzt ist dbengine beim
+   Insert auf großer Skala *langsamer* als SQLite (~550 s vs. ~75 s
+   bei 100k/1M-Maßstab) und der Restart-Vorteil bleibt unbewiesen.
+   Der Spiegel macht beide Achsen schlechter bzw. unbelegt.
+4. **Nicht gemessen (bewusst):** sauberer Shutdown bei 100k/1M
+   (außerhalb Budget), echte Disk statt tmpfs, Batch > 1.
+   Empfehlung: Spiegel-Flush entkoppeln (Group-Commit/Checkpoint-
+   Intervall statt Flush-pro-Statement) und Crash-Rest (`.tmp`)
+   beim Öffnen tolerieren statt Spiegel verwerfen — dann Re-Duell.
+
+## Nachtrag s76b/s76c (2026-09-27): Mirror-Batching + Pager-Batch
+
+Empfehlung aus obiger Sektion umgesetzt:
+- Mirror-Flush nur alle 1000 Statements + `mirrorCheckpoint()` bei sauberem
+  Exit (`src/sql/executor.cpp`, `src/main.cpp`); Watermark-Protokoll exakt.
+- `Pager::insert_batch`: ein Image-Rewrite pro Flush statt einem pro Knoten;
+  `BTreeKV::Persist` nutzt ihn (`src/storage/pager.cpp`, `src/kv/btree.cpp`).
+
+Neue Messung 10k (tmpfs, Batch=1): Insert **0,14 s** (vorher 86 s mit
+Flush-pro-Statement, 0,056 s ganz ohne Spiegel), Restart+SUM **0,06 s**,
+SUM korrekt.
+
+Neue Messung 1M: Insert **60 s** (SQLite 75 s — gleichauf), Restart+SUM
+**6,5 s** (SQLite 0,05 s — weiter ~130×). Der Spiegel spart WAL-Parsing,
+aber NICHT den RAM-Rebuild (1M KV-Puts + MVCC-Commits beim Laden):
+Restart bleibt O(n) statt O(1) wie bei SQLite (mmap-B-Tree, On-Demand-Reads).
+Echte Heilung = Lese-Pfad direkt auf persistentem B-Tree (kein RAM-Rebuild),
+steht aus.

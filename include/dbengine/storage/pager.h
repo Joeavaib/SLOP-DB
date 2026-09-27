@@ -96,6 +96,10 @@ class Pager {
   // --- Clustered B+Tree hull (sorted map backed by pages) -------------
   [[nodiscard]] bool insert(std::uint64_t key, std::string_view value);
   [[nodiscard]] bool insert(std::uint64_t key, std::span<const std::uint8_t> value);
+  // Batch-Insert: wendet alle Paare an, dann GENAU EIN Image-Rewrite +
+  // fsync (statt einem pro Key). Atomar wie store_image (tmp+rename).
+  [[nodiscard]] bool insert_batch(
+      const std::vector<std::pair<std::uint64_t, std::string>>& kvs);
   // Returns false when key is missing.
   [[nodiscard]] bool find(std::uint64_t key, std::string& out) const;
   [[nodiscard]] bool find(std::uint64_t key, std::vector<std::uint8_t>& out) const;

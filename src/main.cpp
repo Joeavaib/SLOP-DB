@@ -259,6 +259,7 @@ int runRepl(dbengine::sql::Executor& ex, const std::string& db_path,
   // Rest ohne abschliessendes ';' bei EOF noch ausfuehren (wenn nicht leer).
   const std::string rest = trim(buf);
   if (!rest.empty()) runOne(ex, rest);
+  ex.mirrorCheckpoint();  // sauberer Exit: Spiegel aktuell -> schneller Restart
   return 0;
 }
 
@@ -387,6 +388,7 @@ int main(int argc, char** argv) {
         if (!runOne(ex, stmt)) all_ok = false;
       }
     }
+    ex.mirrorCheckpoint();  // sauberer Exit: Spiegel aktuell
     return all_ok ? 0 : 1;
   }
   return runRepl(ex, db_path, wal_path);
