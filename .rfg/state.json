@@ -86,7 +86,12 @@
     "s82-pgstat",
     "s83-diskannbuild",
     "s84-tpcrematch",
-    "s85-scram"
+    "s85-scram",
+    "s86-resp",
+    "s87-rls",
+    "s88-atrest",
+    "s89-tpchsf",
+    "s90-docs1417"
   ],
   "verified": [
     "s07-index",
@@ -175,16 +180,21 @@
     "s82-pgstat",
     "s83-diskannbuild",
     "s84-tpcrematch",
-    "s85-scram"
+    "s85-scram",
+    "s86-resp",
+    "s87-rls",
+    "s88-atrest",
+    "s89-tpchsf",
+    "s90-docs1417"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s85-scram-1790472305",
-    "step_id": "s85-scram",
-    "commit": "d8ae4b0bbc34cfc2ee277c6b557537400dbcb29b",
+    "id": "cp-s90-docs1417-1790518135",
+    "step_id": "s90-docs1417",
+    "commit": "63a89b18953596fbdc53c7bfd55d4ec6a466da17",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-27T01:25:05.181462+00:00"
+    "created_at": "2026-09-27T14:08:55.833577+00:00"
   },
   "checkpoints": [
     {
@@ -753,6 +763,41 @@
       "commit": "d8ae4b0bbc34cfc2ee277c6b557537400dbcb29b",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-27T01:25:05.181462+00:00"
+    },
+    {
+      "id": "cp-s86-resp-1790517826",
+      "step_id": "s86-resp",
+      "commit": "2012a44bea931569404a493e3c878569c2679a5d",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T14:03:46.864722+00:00"
+    },
+    {
+      "id": "cp-s87-rls-1790517897",
+      "step_id": "s87-rls",
+      "commit": "1cf598ffcc614085a68932afc76a0a3cdf688a6a",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T14:04:57.517613+00:00"
+    },
+    {
+      "id": "cp-s88-atrest-1790518102",
+      "step_id": "s88-atrest",
+      "commit": "1d3beda672b1bfafb8ea872454f2d55e1f3a83e8",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T14:08:22.790251+00:00"
+    },
+    {
+      "id": "cp-s89-tpchsf-1790518122",
+      "step_id": "s89-tpchsf",
+      "commit": "d0abf7120b15aa5abe258fa87bf863944082d002",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T14:08:42.616882+00:00"
+    },
+    {
+      "id": "cp-s90-docs1417-1790518135",
+      "step_id": "s90-docs1417",
+      "commit": "63a89b18953596fbdc53c7bfd55d4ec6a466da17",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-27T14:08:55.833577+00:00"
     }
   ],
   "claim_step": "",

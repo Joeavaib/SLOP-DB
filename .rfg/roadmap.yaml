@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 17: Partition-Simulator sauber mit Tests, pg_stat_statements, DiskANN-ANN-Build, TPC-H-Rematch-Doku, SCRAM-Auth. Alles verifiziert."
+  statement: "C++ DB Engine Welle 18: RESP-Layer (Redis-Migration), Row-Level-Security, At-Rest-Verschluesselung optional, TPC-H-SF-Rematch, Doku. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -728,3 +728,43 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
     engine: implement
     want: "SCRAM-SHA-256-Auth: R(10)-Flow mit Nonce/Proof-Verifikation (OpenSSL wenn da, sonst explizit deaktiviert), Default Trust-All, alte Tests gruene"
+  - id: s86-resp
+    title: s86-resp
+    paths:
+      - src/server/resp.cpp
+      - include/dbengine/server/resp.h
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ./build/dbresp --selfcheck
+    engine: implement
+    want: "RESP-Layer: TCP-Server mit GET/SET/DEL/EXISTS/SCAN auf KVStore (+TTL optional), dbresp-Binary mit --selfcheck, STL/POSIX-only"
+  - id: s87-rls
+    title: s87-rls
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+      - src/sql/executor.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "Row-Level-Security: CREATE POLICY / ENABLE RLS pro Tabelle, USING-Pruefung pro Row im Executor, Default aus (Tests gruene)"
+  - id: s88-atrest
+    title: s88-atrest
+    paths:
+      - src/storage/wal.cpp
+      - include/dbengine/storage/wal.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"wal|chaos\" --output-on-failure"
+    engine: implement
+    want: "At-Rest-Verschluesselung optional: AES-256-GCM Payload-Verschluesselung (OpenSSL wenn da, sonst explizit aus), Schluessel via Env, alte Tests gruene"
+  - id: s89-tpchsf
+    title: s89-tpchsf
+    paths:
+      - docs/TPC-H-REMATCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R bench --output-on-failure && test -f docs/TPC-H-REMATCH.md
+    engine: implement
+    want: "TPC-H-SF-Rematch: groessere SF-Stufe nach Replika (Zeitbudget beachten), Zahlen + Urteil angehaengt"
+  - id: s90-docs1417
+    title: s90-docs1417
+    paths:
+      - docs/ARCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "ARCH-Update Welle 14-17: Replika, Autotune, Prodsim, pg_stat, DiskANN, TPC-H, SCRAM, Subqueries, TLS, Timer, Parallel-Scan; stale korrigiert"
