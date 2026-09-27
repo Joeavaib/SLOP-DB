@@ -136,6 +136,19 @@ target_compile_options(test_raft PRIVATE -Wall -Wextra -Wpedantic)
 
 add_test(NAME raft COMMAND test_raft)
 
+# Prodsim: in-process Partition/Drop-Matrix + HLC; TCP-Loopback-Hosts (kein 2. Raft)
+add_executable(test_prodsim tests/test_prodsim.cpp)
+target_link_libraries(test_prodsim PRIVATE dbengine_raft dbengine_clock)
+target_include_directories(test_prodsim PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(test_prodsim PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME prodsim COMMAND test_prodsim)
+
+add_executable(prodsim_cluster tools/prodsim_cluster.cpp)
+target_link_libraries(prodsim_cluster PRIVATE dbengine_raft)
+target_include_directories(prodsim_cluster PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(prodsim_cluster PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME prodsim_cluster COMMAND prodsim_cluster)
+
 # s12-pgserver: TCPServer (POSIX, 127.0.0.1 ephemeral) + pgwire codec
 add_library(pgserver STATIC src/server/pgserver.cpp)
 target_include_directories(pgserver PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

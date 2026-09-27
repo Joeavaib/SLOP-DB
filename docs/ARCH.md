@@ -102,20 +102,26 @@ InnoDB-nah (Undo-Log), **bewusst nicht PG-Heap** (kein Bloat, kein Vacuum):
 - Jede Shard trägt eine `RaftGroup` (RF=3, in-process-Sim, **kein Netzwerk**):
   - `Node{id, role, current_term, voted_for, log[], commit_index, last_applied, alive, applied(KV-State-Machine)}`.
   - `Entry{term, index (1-basiert), command ("put k v" / "del k")}`.
-  - `electLeader()`: erster lebender Knoten, Term+1, Votes aller Lebenden,
-    Mehrheit nötig, sonst `-1` (kein Quorum bei ≤1 lebend).
+  - `electLeader()`: lebende Kandidaten in Id-Reihenfolge; Vote von V nur wenn
+    `alive` und `can_send` symmetrisch. Default-Mesh = erster Lebender, alle
+    Lebenden voten (Bestand `test_raft`). Mehrheit ≥2, sonst `-1`.
   - `append(cmd)`: nur Leader, `replicateToFollowers` synchron, Commit bei
-    Mehrheit, `apply()` parst Command in KV-Map. Rückgabe Log-Index, `0` bei
-    Fehler (kein Leader / tot / kein Quorum).
+    Mehrheit **erreichbarer** Lebender, `apply()` parst Command in KV-Map.
+    Rückgabe Log-Index, `0` bei Fehler (kein Leader / tot / kein Quorum /
+    Partition). Isolierter Leader schiebt `commit_index` nicht vor.
   - `killLeader()` + `failover()`: deterministische Neuwahl unter Lebenden
     (in-process µs, Sim-Ziel <100ms). `killNode/reviveNode` mit Catch-up + apply.
+  - Partition-API (Prodsim): `isolate`/`heal`/`isolate_from_all`/`heal_all`/
+    `set_drop_rate`/`can_send` — 3×3-Matrix, Default fully meshed, Drop-PRNG
+    Seed 42. `alive` (Crash) ≠ Partition (Netz-Cut). Tests: `test_prodsim`;
+    TCP-Loopback-Hosts: `tools/prodsim_cluster.cpp`. Siehe `docs/PRODSIM.md`.
 - V1-Grenzen (s25 geschlossen, Sim bleibt): persistentes Raft-Log via
   `SaveLog/LoadLog` (`RAFT1`), Snapshots via `SaveSnapshot/LoadSnapshot`
   (`RSNP1` + `log_base_`-Compaction), TCP-Framing via Wire-Codec
   (`Send/RecvWire`, `TcpLoopbackPair`), Follower-Reads (`follower_get`,
   `is_caught_up`), Split/Merge-Range-Ops. Weiter Sim: keine Membership-Change,
-  keine echten Follower-Reads über Netzwerk.
-  Failover-Pfad ist testabgedeckt (`test_raft`).
+  keine echten Follower-Reads über Netzwerk, kein Raft-over-TCP.
+  Failover-Pfad ist testabgedeckt (`test_raft` + `prodsim`).
 
 ## 5. Vektor / Hybrid (`include/dbengine/vector/hnsw.h`, `include/dbengine/search/hybrid.h`)
 

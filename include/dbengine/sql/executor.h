@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,23 @@ struct TableSchema {
   std::uint64_t next_rowid = 0;
 };
 
+// ---- pg_stat_statements-light (session-lokal, keine Persistenz) --------------
+// Pro normalisiertem Query-Text (Literale -> '?') werden gezaehlt: calls,
+// total_ms, rows_out, errors. Normalisierung s. normalizeQuery (Zahlen,
+// Single-/Double-quoted Strings -> '?', Whitespace kollabiert, kein
+// Lowercasing der Keywords). Overhead minimal (eine Map + chrono pro
+// execute(), s. executor.cpp). Session-lokal: recover()/Restart setzt NICHT
+// zurueck, aber es gibt keine WAL-/Disk-Persistenz (Restart = leer).
+// Top-N via queryStats(n) (sortiert total_ms absteigend); Metrics-Render
+// (Top-5) s. src/server/metrics.cpp (SetPgStats/RenderPgStats).
+struct QueryStat {
+  std::string query;  // normalisierter Query-Text
+  std::uint64_t calls = 0;
+  double total_ms = 0.0;
+  std::uint64_t rows_out = 0;  // SELECT: rows.size(), DML: affected (Summe)
+  std::uint64_t errors = 0;    // geworfene SqlError/sonstige Exceptions
+};
+
 class Executor {
  public:
   Executor(kv::KVStore& kv, txn::MvccStore& mvcc, storage::Wal* wal = nullptr);
@@ -50,6 +68,13 @@ class Executor {
   Executor& operator=(const Executor&) = delete;
 
   Result execute(const std::string& sql);
+
+  // pg_stat_statements-light: Einstiegspunkt ist execute() (alle Statements).
+  static std::string normalizeQuery(const std::string& sql);
+  // Top-N nach total_ms (Default 5, passend zum Metrics-Top-5-Render).
+  // limit == 0 -> alle Eintraege.
+  std::vector<QueryStat> queryStats(std::size_t top_n = 5) const;
+  void clearQueryStats();
 
   // ---- Mirror-Checkpoint (BTreeKV-Sidecar, Default: aus) --------------------
   // enableMirror(path) oeffnet (ggf. erzeugt) das Sidecar und laedt dessen
@@ -88,6 +113,7 @@ class Executor {
   static std::vector<Value> decodeRow(const std::string& s, std::size_t ncols);
 
  private:
+  Result executeInner(const std::string& sql);
   Result execCreate(const CreateTableStmt& s);
   Result execInsert(const InsertStmt& s);
   Result execSelect(const SelectStmt& s);
@@ -136,6 +162,9 @@ class Executor {
   std::map<std::string, columnar::ColumnarStore> replica_;  // norm-name -> Scan-Replika
   std::size_t recover_skipped_ = 0;  // Skips des letzten recover()-Laufs
   std::size_t recover_applied_ = 0;  // erfolgreich angewendete Records
+  // ---- pg_stat_statements-light-State (session-lokal, keine Persistenz) ----
+  mutable std::mutex pgstat_mu_;
+  std::map<std::string, QueryStat> pgstat_;  // normalisierter Text -> Stat
   // ---- Mirror-Checkpoint-State -------------------------------------------
   std::unique_ptr<kv::BTreeKV> mirror_;
   std::string mirror_path_;

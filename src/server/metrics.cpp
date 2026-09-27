@@ -12,11 +12,21 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
+
+// pg_stat-Quelle (QueryStat-Struct, session-lokal im Executor). metrics.h ist
+// fixiert (kein Snapshot-Umbau): Top-5 leben in einem mutex-geschuetzten
+// Prozess-Register hier (SetPgStats) und werden von render() angehaengt.
+#include "dbengine/sql/executor.h"
 
 // Echte Mini-Stores fuer Demo-Snapshot (nur im main-Teil).
 #include "dbengine/columnar/store.h"
@@ -91,6 +101,84 @@ Snapshot MetricsServer::get() const {
   return snapshot_;
 }
 
+// ---- pg_stat_statements-light: Top-5-Render ---------------------------------
+// Session-lokal, keine Persistenz (Register lebt nur im Prozess; Restart =
+// leer). Wiring (Aufrufer, z.B. Server-Loop):
+//   // Forward-Deklaration (metrics.h ist fixiert, keine neuen Deklarationen):
+//   namespace dbengine::metrics {
+//     void SetPgStats(std::vector<dbengine::sql::QueryStat> top);
+//   }
+//   ex.execute(sql); ...
+//   dbengine::metrics::SetPgStats(ex.queryStats(5));
+// Danach enthaelt jeder render()/scrape zusaetzlich (max. 5 Queries):
+//   dbengine_pgstat_calls_total{query="<norm>"} <calls>
+//   dbengine_pgstat_time_ms{query="<norm>"} <total_ms, 3 Nachkommastellen>
+//   dbengine_pgstat_rows{query="<norm>"} <rows_out>
+//   dbengine_pgstat_errors_total{query="<norm>"} <errors>
+// Overhead: SetPgStats = eine Vektor-Kopie; render() = O(Top-5) String-Append,
+// kein Einfluss auf den Execute-Pfad (der zahlt nur Map + chrono, s.
+// executor.cpp). Leeres Register -> Byte-identische Ausgabe wie bisher.
+namespace {
+std::mutex g_pgstat_mu;
+std::vector<dbengine::sql::QueryStat> g_pgstat_top;
+
+std::string pgEscapeLabel(const std::string& s) {
+  std::string o;
+  o.reserve(s.size());
+  for (char c : s) {
+    if (c == '\\')
+      o += "\\\\";
+    else if (c == '"')
+      o += "\\\"";
+    else if (c == '\n')
+      o += "\\n";
+    else if (c == '\r')
+      o += "\\r";
+    else
+      o += c;
+  }
+  return o;
+}
+}  // namespace
+
+void SetPgStats(std::vector<dbengine::sql::QueryStat> top) {
+  std::lock_guard<std::mutex> lk(g_pgstat_mu);
+  if (top.size() > 5) top.resize(5);
+  g_pgstat_top = std::move(top);
+}
+
+std::vector<dbengine::sql::QueryStat> GetPgStats() {
+  std::lock_guard<std::mutex> lk(g_pgstat_mu);
+  return g_pgstat_top;
+}
+
+std::string RenderPgStats(const std::vector<dbengine::sql::QueryStat>& top) {
+  std::string out;
+  std::size_t n = top.size();
+  if (n > 5) n = 5;
+  for (std::size_t i = 0; i < n; ++i) {
+    const auto& e = top[i];
+    const std::string q = pgEscapeLabel(e.query);
+    out += "dbengine_pgstat_calls_total{query=\"" + q + "\"} ";
+    out += std::to_string(e.calls);
+    out += '\n';
+    out += "dbengine_pgstat_time_ms{query=\"" + q + "\"} ";
+    {
+      std::ostringstream oss;
+      oss << std::fixed << std::setprecision(3) << e.total_ms;
+      out += oss.str();
+    }
+    out += '\n';
+    out += "dbengine_pgstat_rows{query=\"" + q + "\"} ";
+    out += std::to_string(e.rows_out);
+    out += '\n';
+    out += "dbengine_pgstat_errors_total{query=\"" + q + "\"} ";
+    out += std::to_string(e.errors);
+    out += '\n';
+  }
+  return out;
+}
+
 std::string MetricsServer::render(const Snapshot& s) {
   std::string out;
   out.reserve(1024);
@@ -122,6 +210,7 @@ std::string MetricsServer::render(const Snapshot& s) {
   line("dbengine_hnsw_max_level", s.hnsw_max_level);
   uline("dbengine_kv_keys", s.kv_keys);
   uline("dbengine_kv_sequence", s.kv_sequence);
+  out += RenderPgStats(GetPgStats());  // leer -> Byte-identisch wie bisher
   return out;
 }
 

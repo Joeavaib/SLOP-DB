@@ -4,15 +4,18 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace dbengine::sql {
 namespace {
@@ -1070,7 +1073,192 @@ std::vector<Value> Executor::decodeRow(const std::string& s, std::size_t ncols) 
   return out;
 }
 
+// ---- pg_stat_statements-light ------------------------------------------------
+// Session-lokal, keine Persistenz: eine Map (normalisierter Text -> QueryStat)
+// + ein steady_clock-Zeitstempel pro execute(). Overhead pro Statement: eine
+// Normalisierung (O(n) ueber den SQL-String), ein chrono-Paar und genau ein
+// Map-Lookup im Erfolgs-/Fehlerpfad; keine Alloks ausser dem normalisierten
+// Key (einmalig je distinktem Query) und keine Locks ausser einem kurzen
+// lock_guard beim Aktualisieren.
+std::string Executor::normalizeQuery(const std::string& sql) {
+  // Einfache Normalisierung: Single-quoted Strings ('...' mit ''-Escape) und
+  // Double-quoted Stuecke ("..." mit ""-Escape) -> '?', Zahlen -> '?',
+  // Linien-/Blockkommentare -> Space, Whitespace kollabiert + getrimmt,
+  // trailing ';' entfernt. Keywords/Bezeichner bleiben unveraendert
+  // (kein Lowercasing). Nie werfend (reine String-Ops).
+  try {
+    std::string out;
+    out.reserve(sql.size());
+    const std::size_t n = sql.size();
+    std::size_t i = 0;
+    auto prevOut = [&]() -> char { return out.empty() ? '\0' : out.back(); };
+    while (i < n) {
+      const char c = sql[i];
+      // Linienkommentar -- bis EOL.
+      if (c == '-' && i + 1 < n && sql[i + 1] == '-') {
+        i += 2;
+        while (i < n && sql[i] != '\n') ++i;
+        if (!out.empty() && out.back() != ' ') out += ' ';
+        continue;
+      }
+      // Blockkommentar /* ... */ (unabgeschlossen -> Rest ist Kommentar).
+      if (c == '/' && i + 1 < n && sql[i + 1] == '*') {
+        i += 2;
+        while (i + 1 < n && !(sql[i] == '*' && sql[i + 1] == '/')) ++i;
+        if (i + 1 < n) i += 2;
+        else i = n;
+        if (!out.empty() && out.back() != ' ') out += ' ';
+        continue;
+      }
+      // Single-quoted String -> '?'.
+      if (c == '\'') {
+        out += '?';
+        ++i;
+        while (i < n) {
+          if (sql[i] == '\'') {
+            if (i + 1 < n && sql[i + 1] == '\'') {
+              i += 2;
+              continue;
+            }
+            ++i;
+            break;
+          }
+          ++i;
+        }
+        continue;
+      }
+      // Double-quoted Stueck (Identifier/Literal) -> '?'.
+      if (c == '"') {
+        out += '?';
+        ++i;
+        while (i < n) {
+          if (sql[i] == '"') {
+            if (i + 1 < n && sql[i + 1] == '"') {
+              i += 2;
+              continue;
+            }
+            ++i;
+            break;
+          }
+          ++i;
+        }
+        continue;
+      }
+      // Zahl ab Ziffer (nicht Teil eines Identifiers): int/float/exp -> '?'.
+      // Zusaetzlich .<digit> (fuehrender Punkt) -> '?'.
+      const bool prevIsIdent =
+          !out.empty() && (std::isalnum(static_cast<unsigned char>(prevOut())) ||
+                           prevOut() == '_' || prevOut() == '.');
+      const bool atNum =
+          std::isdigit(static_cast<unsigned char>(c)) != 0 && !prevIsIdent;
+      const bool atDotNum = c == '.' && i + 1 < n &&
+                            std::isdigit(static_cast<unsigned char>(sql[i + 1])) != 0 &&
+                            !prevIsIdent;
+      if (atNum || atDotNum) {
+        std::size_t j = i;
+        bool dot = false;
+        while (j < n && (std::isdigit(static_cast<unsigned char>(sql[j])) != 0 ||
+                         (!dot && sql[j] == '.'))) {
+          if (sql[j] == '.') dot = true;
+          ++j;
+        }
+        if (j < n && (sql[j] == 'e' || sql[j] == 'E')) {
+          std::size_t k = j + 1;
+          if (k < n && (sql[k] == '+' || sql[k] == '-')) ++k;
+          const std::size_t k0 = k;
+          while (k < n && std::isdigit(static_cast<unsigned char>(sql[k])) != 0)
+            ++k;
+          if (k > k0) j = k;
+        }
+        out += '?';
+        i = j;
+        continue;
+      }
+      if (std::isspace(static_cast<unsigned char>(c)) != 0) {
+        if (!out.empty() && out.back() != ' ') out += ' ';
+        ++i;
+        continue;
+      }
+      out += c;
+      ++i;
+    }
+    // Trim + trailing ';' entfernen.
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    while (!out.empty() && out.back() == ';') {
+      out.pop_back();
+      while (!out.empty() && out.back() == ' ') out.pop_back();
+    }
+    std::size_t b = 0;
+    while (b < out.size() && out[b] == ' ') ++b;
+    if (b > 0) out.erase(0, b);
+    return out;
+  } catch (...) {
+    return sql;
+  }
+}
+
+std::vector<QueryStat> Executor::queryStats(std::size_t top_n) const {
+  std::lock_guard<std::mutex> lk(pgstat_mu_);
+  std::vector<QueryStat> v;
+  v.reserve(pgstat_.size());
+  for (const auto& [k, st] : pgstat_) {
+    (void)k;
+    v.push_back(st);
+  }
+  std::sort(v.begin(), v.end(), [](const QueryStat& a, const QueryStat& b) {
+    if (a.total_ms != b.total_ms) return a.total_ms > b.total_ms;
+    if (a.calls != b.calls) return a.calls > b.calls;
+    return a.query < b.query;
+  });
+  if (top_n != 0 && v.size() > top_n) v.resize(top_n);
+  return v;
+}
+
+void Executor::clearQueryStats() {
+  std::lock_guard<std::mutex> lk(pgstat_mu_);
+  pgstat_.clear();
+}
+
 Result Executor::execute(const std::string& sql) {
+  // Einstiegspunkt aller Statements: genau ein chrono-Paar + genau ein
+  // Map-Lookup pro Aufruf (Erfolg oder Fehler). Fehler (parse/RBAC/exec)
+  // zaehlen calls + errors, Erfolge calls + rows_out (rows.size()+affected).
+  std::string key = normalizeQuery(sql);
+  const auto t0 = std::chrono::steady_clock::now();
+  try {
+    Result r = executeInner(sql);
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    const std::uint64_t n =
+        static_cast<std::uint64_t>(r.rows.size()) +
+        static_cast<std::uint64_t>(r.affected);
+    {
+      std::lock_guard<std::mutex> lk(pgstat_mu_);
+      QueryStat& e = pgstat_[key];  // genau ein Lookup
+      e.query = key;
+      ++e.calls;
+      e.total_ms += ms;
+      e.rows_out += n;
+    }
+    return r;
+  } catch (...) {
+    const auto t1 = std::chrono::steady_clock::now();
+    const double ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+    {
+      std::lock_guard<std::mutex> lk(pgstat_mu_);
+      QueryStat& e = pgstat_[key];  // genau ein Lookup
+      e.query = key;
+      ++e.calls;
+      e.total_ms += ms;
+      ++e.errors;
+    }
+    throw;
+  }
+}
+
+Result Executor::executeInner(const std::string& sql) {
   Statement st = parseStatement(sql);
   // ---- RBAC: GRANT/REVOKE/SET-Handling + Enforcement vor jeder
   // KV/MVCC/WAL-Seiteneffekt (fail fast, keine Halb-Writes bei 42501).

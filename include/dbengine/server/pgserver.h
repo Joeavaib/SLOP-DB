@@ -59,8 +59,35 @@ class PgServer {
   //   SICHERHEIT: Cleartext-Passwort ohne TLS ist mitlesbar (PG-Protokoll).
   //     Nur mit Sidecar-TLS (z.B. stunnel gegen 127.0.0.1-Bind) nutzen,
   //     nie direkt auf untrusted Netz binden. Kein Hashing/SASL in V1.
+  //   SCRAM-SHA-256 (RFC 5802 Server-Seite, opt-in via setScram(true),
+  //     Default false = exakt heutiges R3-Verhalten, byte-identisch):
+  //     Wenn required + scramEnabled + User-Eintrag im SCRAM-Format, dann
+  //     statt R(3): R(10 AuthenticationSASL mit 'SCRAM-SHA-256') ->
+  //     SASLInitialResponse ('p' mit Mechanismus + Client-First
+  //     "n,,n=user,r=nonce") -> R(11 SASLContinue mit Server-First
+  //     "r=combined,s=salt-b64,i=iter") -> SASLResponse ('p' mit
+  //     Client-Final "c=...,r=...,p=proof") -> bei OK R(12 SASLFinal
+  //     "v=serverSig") + R(0) + Z, bei Fail E FATAL 28P01 + close.
+  //     Salt-Format pro User in authUsers_: "scram:<salt-b64>:<iter>:
+  //     <storedkey-b64>[:<serverkey-b64>]". salt-b64 = roher Salt (base64),
+  //     iter = PBKDF2-Iterationen (Standard 4096), storedkey-b64 =
+  //     base64(SHA256(ClientKey)) (32 Byte), optional 4. Feld serverkey-b64
+  //     = base64(ServerKey) (32 Byte) fuer RFC-korrekte Server-Signatur.
+  //     Ohne 4. Feld wird die Server-Signatur mit StoredKey als HMAC-Key
+  //     berechnet (dokumentierte Abweichung; strikte Clients sollten die
+  //     4-Feld-Form nutzen). Klartext-Eintrag (ohne "scram:"-Prefix) bei
+  //     aktivem SCRAM = Legacy-R3-Pfad (R(3)-Cleartext wie bisher).
+  //     Unbekannter User = Legacy-R3-Pfad (danach 28P01, keine
+  //     User-Enumeration ueber R10/R3 hinaus wird nicht garantiert).
+  //   KRYPTO: SHA256/HMAC-SHA256 ausschliesslich via OpenSSL (EVP/HMAC),
+  //     nur wenn mit DBENGINE_WITH_TLS gebaut. Ohne das Define ist SCRAM
+  //     explizit deaktiviert: setScram(true) wird gespeichert, aber eine
+  //     SCRAM-Auth wird mit E FATAL 28P01 verweigert (kein R10, kein
+  //     Fallback auf R3). Es gibt KEINE eigene Crypto-Implementierung.
+  //     Base64 (Salt/Proof-Codec, kein Krypto) ist STL-only und immer aktiv.
   void setAuth(const std::map<std::string, std::string>& users);
   void setAuthRequired(bool required = false);
+  void setScram(bool enabled = true);
 
   // TLS opt-in (PG-konform). setTlsCert(keyPath, certPath) aktiviert TLS:
   //   SSLRequest -> 'S' + Server-Handshake, danach Startup/Auth ueber TLS.
@@ -88,9 +115,12 @@ class PgServer {
   std::mutex execMu_;
   // Auth-Config (V1: Cleartext-Map + Flag, Default Trust-All).
   // Wird pro Connection unter authMu_ kopiert (handleConn-Threads).
+  // scramEnabled_ (Default false): mit setScram(true) aktiviert; ohne
+  // DBENGINE_WITH_TLS wird SCRAM zur Laufzeit verweigert (28P01).
   std::mutex authMu_;
   std::map<std::string, std::string> authUsers_;
   bool authRequired_ = false;
+  bool scramEnabled_ = false;
   // TLS-Config (Pfade + Flag, Default aus). Wird pro SSLRequest unter
   // tlsMu_ kopiert (handleConn-Threads). Handshake-Kontext wird pro
   // Connection aufgebaut (kein geteilter SSL_CTX).

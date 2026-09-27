@@ -2,9 +2,11 @@
 // Framework-los (assert-light + cout), CTest-Name: raft (ctest -R raft).
 
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "dbengine/raft/shard.h"
 
@@ -121,6 +123,142 @@ void TestMajorityAndCatchup() {
   Check(g.aliveCount() == 1, "quorum/single-left");
   Check(g.electLeader() == -1, "quorum/no-leader-without-majority");
   Check(g.append("put y 1") == 0, "quorum/no-append-without-leader");
+}
+
+// Partition/Drop-Fault-Injector (deterministisch, Seed 42).
+// Minderheit isoliert -> Quorum bleibt, Commit ok. Vollsplit -> kein
+// Leader/Commit/Failover. Heal stellt Replikation wieder her.
+// Drop 100% verhaelt sich wie Cut, Self-Send immer true.
+
+void TestPartitionMinorityQuorum() {
+  RaftGroup g(10, "", "");
+  int leader = g.leaderId();
+  Check(leader >= 0, "part-minority/has-leader");
+  int iso = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (i != leader) iso = i;
+  }
+  Check(iso >= 0 && iso != leader, "part-minority/follower-picked");
+  int other = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (i != leader && i != iso) other = i;
+  }
+  Check(other >= 0, "part-minority/other-picked");
+  g.isolate_from_all(iso);
+  Check(!g.can_send(leader, iso), "part-minority/cut");
+  Check(!g.can_send(iso, leader), "part-minority/cut-sym");
+  Check(g.can_send(leader, other), "part-minority/majority-up");
+  Check(g.can_send(leader, leader), "part-minority/self-true");
+  int l2 = g.electLeader();
+  Check(l2 >= 0, "part-minority/quorum-kept");
+  std::uint64_t idx = g.append("put pm1 v1");
+  Check(idx == 1, "part-minority/commit-ok");
+  Check(g.commitIndex() == 1, "part-minority/commit-index");
+  Check(g.follower_get(other, "pm1") == std::optional<std::string>("v1"),
+        "part-minority/majority-has-it");
+  Check(!g.follower_get(iso, "pm1").has_value(),
+        "part-minority/minority-stale");
+}
+
+void TestPartitionNoQuorum() {
+  RaftGroup g(11, "", "");
+  Check(g.append("put pre 1") == 1, "part-noquorum/pre-idx1");
+  g.isolate(0, 1);
+  g.isolate(0, 2);
+  g.isolate(1, 2);
+  Check(!g.can_send(0, 1) && !g.can_send(1, 0) && !g.can_send(0, 2) &&
+            !g.can_send(2, 0) && !g.can_send(1, 2) && !g.can_send(2, 1),
+        "part-noquorum/all-cut");
+  Check(g.can_send(0, 0) && g.can_send(1, 1) && g.can_send(2, 2),
+        "part-noquorum/self-true");
+  // Leader noch gesetzt, aber ohne erreichbare Mehrheit kein Commit.
+  Check(g.append("put nop x") == 0, "part-noquorum/no-commit");
+  Check(g.electLeader() == -1, "part-noquorum/no-leader");
+  Check(g.failover() == -1, "part-noquorum/no-failover");
+  Check(g.append("put nop2 y") == 0, "part-noquorum/no-commit-no-leader");
+}
+
+void TestPartitionHeal() {
+  RaftGroup g(12, "", "");
+  Check(g.append("put h1 v1") == 1, "part-heal/idx1");
+  int leader = g.leaderId();
+  Check(leader >= 0, "part-heal/has-leader");
+  int iso = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (i != leader) iso = i;
+  }
+  int other = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (i != leader && i != iso) other = i;
+  }
+  g.isolate_from_all(iso);
+  std::uint64_t idx2 = g.append("put h2 v2");
+  Check(idx2 == 2, "part-heal/append-during-partition");
+  Check(!g.follower_get(iso, "h2").has_value(),
+        "part-heal/stale-during-partition");
+  // Paarweises Heilen (symmetrisch) stellt Replikation wieder her.
+  g.heal(leader, iso);
+  g.heal(other, iso);
+  Check(g.can_send(leader, iso) && g.can_send(iso, leader),
+        "part-heal/link-up");
+  Check(g.is_caught_up(iso), "part-heal/caught-up-after-heal");
+  Check(g.follower_get(iso, "h2") == std::optional<std::string>("v2"),
+        "part-heal/replicated-after-heal");
+  std::uint64_t idx3 = g.append("put h3 v3");
+  Check(idx3 == 3, "part-heal/append-after-heal");
+  Check(g.follower_get(iso, "h3") == std::optional<std::string>("v3"),
+        "part-heal/follower-after-heal");
+}
+
+void TestDropEqualsCut() {
+  RaftGroup g(13, "", "");
+  int leader = g.leaderId();
+  Check(leader >= 0, "drop/has-leader");
+  int f1 = -1, f2 = -1;
+  for (int i = 0; i < 3; ++i) {
+    if (i == leader) continue;
+    if (f1 < 0) {
+      f1 = i;
+    } else {
+      f2 = i;
+    }
+  }
+  Check(f1 >= 0 && f2 >= 0, "drop/followers-picked");
+  // Self-Send immer true, selbst bei 100% Self-Drop.
+  g.set_drop_rate(leader, leader, 100);
+  Check(g.can_send(leader, leader), "drop/self-true");
+  g.set_drop_rate(leader, leader, 0);
+  // Beidseitiger 100%-Drop == symmetrischer Cut dieser Kante.
+  g.set_drop_rate(leader, f1, 100);
+  g.set_drop_rate(f1, leader, 100);
+  Check(!g.can_send(leader, f1), "drop/cut-like");
+  Check(!g.can_send(f1, leader), "drop/cut-like-sym");
+  Check(g.can_send(leader, f2), "drop/other-up");
+  // Quorum ueber Leader+f2 bleibt, Commit ok.
+  Check(g.append("put d1 v1") != 0, "drop/quorum-kept");
+  // Zweite Kante per Drop kappen -> keine erreichbare Mehrheit mehr.
+  g.set_drop_rate(leader, f2, 100);
+  Check(!g.can_send(leader, f2), "drop/second-cut");
+  Check(g.append("put d2 v2") == 0, "drop/no-quorum-like-cut");
+  // heal_all raeumt auch Drop-Raten weg und holt auf.
+  g.heal_all();
+  Check(g.can_send(leader, f1) && g.can_send(leader, f2), "drop/healed");
+  Check(g.append("put d3 v3") != 0, "drop/append-after-heal");
+  // Determinismus: gleicher Seed -> gleiche Drop-Sequenz (50% Verlust).
+  g.set_drop_rate(leader, f1, 50);
+  g.set_net_seed(123);
+  std::vector<bool> seq;
+  for (int i = 0; i < 20; ++i) seq.push_back(g.can_send(leader, f1));
+  g.set_net_seed(123);
+  bool same = true;
+  for (int i = 0; i < 20; ++i) {
+    if (g.can_send(leader, f1) != seq[static_cast<std::size_t>(i)]) {
+      same = false;
+      break;
+    }
+  }
+  Check(same, "drop/seed-deterministic");
+  g.set_drop_rate(leader, f1, 0);
 }
 
 // Chaos-Sequenzen (deterministisch, eigener RNG Seed 7, feste Op-Folgen).
@@ -339,6 +477,10 @@ int main() {
   TestReplication();
   TestFailover100ms();
   TestMajorityAndCatchup();
+  TestPartitionMinorityQuorum();
+  TestPartitionNoQuorum();
+  TestPartitionHeal();
+  TestDropEqualsCut();
   TestChaosStaleLoadMonoPhantom();
   TestChaosSnapshotTailReplay();
   TestChaosReviveAfterSnapshotAutosave();

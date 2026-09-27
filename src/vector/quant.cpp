@@ -898,34 +898,116 @@ void DiskAnnIndex::build(const std::vector<Vector>& data,
   codes.reserve(n);
   for (const auto& v : data) codes.push_back(pq_.encode(v));
 
-  // Graph: exakte M-NN (eigene Beam-Links, deterministisch, (dist,id)-Ties).
-  // O(N^2), fuer Lite-N ok; Alternative waere HnswIndex::search pro Knoten
-  // (public API, kein hnsw.h-Eingriff), hier bewusst exakt fuer maximalen
-  // Recall der Beam-Suche.
+  // Graph-Hybrid (deterministisch, (dist,id)-Tie-Break):
+  //   N <= DiskAnnIndex::kExactThreshold: exakte M-NN wie bisher (O(N^2)).
+  //   N darueber: HnswIndex-ANN (HNSW ueber denselben Daten, Seed+2, dann
+  //   Top-(M+1)-Query pro Knoten mit ef-Tuning, Self filtern, Top-M als
+  //   Adjazenz; exaktes Auffuellen bei Luecken). Build ~O(N log N).
   std::vector<std::vector<int>> adj(n);
-  std::vector<std::pair<float, int>> dists;
-  for (size_t i = 0; i < n; ++i) {
-    dists.clear();
-    dists.reserve(n > 0 ? n - 1 : 0);
-    for (size_t j = 0; j < n; ++j) {
-      if (j == i) continue;
-      const float d2 = sub_l2_squared(data[i].data(), data[j].data(), dim_);
-      dists.emplace_back(d2, static_cast<int>(j));
+  if (n <= DiskAnnIndex::kExactThreshold) {
+    std::vector<std::pair<float, int>> dists;
+    for (size_t i = 0; i < n; ++i) {
+      dists.clear();
+      dists.reserve(n > 0 ? n - 1 : 0);
+      for (size_t j = 0; j < n; ++j) {
+        if (j == i) continue;
+        const float d2 = sub_l2_squared(data[i].data(), data[j].data(), dim_);
+        dists.emplace_back(d2, static_cast<int>(j));
+      }
+      const int want = std::min<int>(m_graph_, static_cast<int>(dists.size()));
+      if (want > 0) {
+        if (want < static_cast<int>(dists.size())) {
+          std::nth_element(dists.begin(), dists.begin() + want, dists.end(),
+                           [](const auto& a, const auto& b) {
+                             if (a.first != b.first) return a.first < b.first;
+                             return a.second < b.second;
+                           });
+          dists.resize(static_cast<size_t>(want));
+        }
+        std::sort(dists.begin(), dists.end(),
+                  [](const auto& a, const auto& b) {
+                    if (a.first != b.first) return a.first < b.first;
+                    return a.second < b.second;
+                  });
+        adj[i].reserve(static_cast<size_t>(m_graph_));
+        for (const auto& pr : dists) adj[i].push_back(pr.second);
+      }
     }
-    const int want = std::min<int>(m_graph_, static_cast<int>(dists.size()));
-    if (want > 0) {
-      std::nth_element(dists.begin(), dists.begin() + want, dists.end(),
-                       [](const auto& a, const auto& b) {
-                         if (a.first != b.first) return a.first < b.first;
-                         return a.second < b.second;
-                       });
-      dists.resize(static_cast<size_t>(want));
-      std::sort(dists.begin(), dists.end(), [](const auto& a, const auto& b) {
-        if (a.first != b.first) return a.first < b.first;
-        return a.second < b.second;
-      });
+  } else {
+    dbengine::vector::HnswIndex hnsw(
+        dim_, 16, 32, dbengine::vector::DistanceMetric::L2);
+    hnsw.set_rng_seed(seed + 2);
+    int efc = 2 * m_graph_;
+    if (efc < 64) efc = 64;
+    if (efc > 512) efc = 512;
+    hnsw.set_ef_construction(efc);
+    for (const auto& v : data) hnsw.add(v);
+    hnsw.build();
+    const int want0 =
+        std::min<int>(m_graph_, static_cast<int>(n > 0 ? n - 1 : 0));
+    const int kq = want0 + 1;
+    const long autoe = static_cast<long>(
+        dbengine::vector::HnswIndex::auto_ef(n, kq, 32));
+    long ef_ann = 8L * static_cast<long>(kq);
+    if (ef_ann < 256) ef_ann = 256;
+    if (ef_ann < autoe) ef_ann = autoe;
+    if (ef_ann < kq) ef_ann = kq;
+    if (ef_ann > static_cast<long>(n)) ef_ann = static_cast<long>(n);
+    if (ef_ann > 2048) ef_ann = 2048;
+    if (ef_ann < 1) ef_ann = 1;
+    const int ef_ann_i = static_cast<int>(ef_ann);
+    std::vector<std::pair<float, int>> dists;
+    dists.reserve(n > 0 ? n - 1 : 0);
+    for (size_t i = 0; i < n; ++i) {
       adj[i].reserve(static_cast<size_t>(m_graph_));
-      for (const auto& pr : dists) adj[i].push_back(pr.second);
+      if (want0 <= 0) continue;
+      std::vector<dbengine::vector::SearchHit> hits =
+          hnsw.search(data[i], kq, ef_ann_i);
+      std::sort(hits.begin(), hits.end(),
+                [](const dbengine::vector::SearchHit& a,
+                   const dbengine::vector::SearchHit& b) {
+                  if (a.dist != b.dist) return a.dist < b.dist;
+                  return a.id < b.id;
+                });
+      for (const auto& h : hits) {
+        if (h.id == static_cast<int>(i)) continue;
+        if (static_cast<int>(adj[i].size()) >= want0) break;
+        if (h.id < 0 || static_cast<size_t>(h.id) >= n) continue;
+        adj[i].push_back(h.id);
+      }
+      // Luecken-Garantie: exakt auffuellen (tritt bei grossem ef praktisch
+      // nie auf; deterministisch, (dist,id)-geordnet).
+      if (static_cast<int>(adj[i].size()) < want0) {
+        std::vector<char> taken(n, 0);
+        taken[i] = 1;
+        for (int id : adj[i]) taken[static_cast<size_t>(id)] = 1;
+        dists.clear();
+        for (size_t j = 0; j < n; ++j) {
+          if (taken[j] != 0) continue;
+          const float d2 =
+              sub_l2_squared(data[i].data(), data[j].data(), dim_);
+          dists.emplace_back(d2, static_cast<int>(j));
+        }
+        const int need = want0 - static_cast<int>(adj[i].size());
+        const int take = std::min<int>(need, static_cast<int>(dists.size()));
+        if (take > 0) {
+          if (take < static_cast<int>(dists.size())) {
+            std::nth_element(
+                dists.begin(), dists.begin() + take, dists.end(),
+                [](const auto& a, const auto& b) {
+                  if (a.first != b.first) return a.first < b.first;
+                  return a.second < b.second;
+                });
+            dists.resize(static_cast<size_t>(take));
+          }
+          std::sort(dists.begin(), dists.end(),
+                    [](const auto& a, const auto& b) {
+                      if (a.first != b.first) return a.first < b.first;
+                      return a.second < b.second;
+                    });
+          for (const auto& pr : dists) adj[i].push_back(pr.second);
+        }
+      }
     }
   }
 

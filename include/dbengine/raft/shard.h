@@ -10,11 +10,19 @@
 // Auto-Modus das manuelle killLeader/failover — Baustein Richtung Netz-Raft
 // (Heartbeat-Timeout -> Candidate -> electLeader, kein Thread/keine Echtzeit
 // im Core, Zeit kommt als Parameter).
+//
+// Partition/Drop-Matrix (Prodsim, in-process): 3x3 Konnektivitaet, Default
+// fully meshed, damit Bestandstest test_raft unveraendert grueng bleibt.
+// isolate/heal sind permanente Cuts; set_drop_rate ist Verlust pro Aufruf
+// (deterministischer PRNG, Seed 42). FoundationDB/Jepsen-Simulator-Stil,
+// kein netem/tc und keine echten NICs — TCP-Loopback siehe TcpLoopbackPair
+// und tools/prodsim_cluster.cpp.
 
 #include <cstdint>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,9 +71,10 @@ class RaftGroup {
   RaftGroup& operator=(RaftGroup&& other) noexcept;
 
   // ---- Election (term/vote, Mehrheit) ----------------------------------
-  // Waehlt den ersten lebenden Knoten als Leader (deterministisch).
-  // Erhoeht term, sammelt Votes aller lebenden Knoten, braucht Mehrheit.
-  // Gibt Leader-Id zurueck, -1 wenn kein Quorum (<=1 lebend).
+  // Probiert lebende Kandidaten in Id-Reihenfolge. Ein Vote von V zaehlt
+  // nur wenn V alive und can_send(V,c) && can_send(c,V) (symmetrische
+  // Partition). Default-Mesh: erster Lebender, alle Lebenden voten — wie
+  // vor der Partition-API. Gibt Leader-Id zurueck, -1 ohne Mehrheit (>=2).
   int electLeader();
   [[nodiscard]] int leaderId() const;
   [[nodiscard]] std::uint64_t term() const;
@@ -85,7 +94,23 @@ class RaftGroup {
   void killLeader();
   int failover();
   void killNode(int node_id);
-  void reviveNode(int node_id);  // holt Log auf (Catch-up) + apply
+  void reviveNode(int node_id);  // Catch-up nur wenn Leader den Knoten erreicht
+
+  // ---- Partition / Drop (in-process Fault-Injector) -----------------------
+  // isolate(a,b): symmetrischer Cut, beide Richtungen. Node bleibt alive
+  // (im Gegensatz zu killNode = Prozess-Crash). a==b wird ignoriert.
+  // heal(a,b): symmetrisches Heilen + Catch-up erreichbarer Knoten; a==b
+  // wird ignoriert. heal_all(): volle Mesh + Drop-Raten zuruecksetzen
+  // (raeumt auch drops) + Catch-up.
+  // set_drop_rate: 0..100, Verlust nur fuer diesen Call, kein Dauer-Cut.
+  // can_send: Topology + Drop; Self-Send (from==to) immer true.
+  void isolate(int a, int b);
+  void heal(int a, int b);
+  void isolate_from_all(int node_id);
+  void heal_all();
+  void set_drop_rate(int from, int to, int pct_0_100);
+  void set_net_seed(std::uint32_t seed);
+  [[nodiscard]] bool can_send(int from, int to) const;
 
   // ---- sXX: Timer-Election (Fake-Clock, Opt-in Auto-Modus) ------------------
   // Baustein Richtung Netz-Raft: ersetzt im Auto-Modus das manuelle
@@ -131,6 +156,9 @@ class RaftGroup {
   // fsync (File + Directory), analog storage/wal.cpp. Laesst bestehende
   // Zieldatei bei Fehler unversehrt. Load: stellt Log auf allen Knoten
   // wieder her (commit/apply). Gibt false bei IO-/Formatfehler.
+  // Volatil: Save/Load beruehren die Partition/Drop-Matrix (partitioned_,
+  // drop_pct_, net_rng_) NICHT — Netz-Faults ueberleben keinen Restart,
+  // Default nach Konstrukt/Move-Quelle ist fully meshed (alle true, drops 0).
   bool SaveLog(const std::string& path) const;
   bool LoadLog(const std::string& path);
 
@@ -160,7 +188,13 @@ class RaftGroup {
   void apply(Node& node);
   static bool parseCommand(const std::string& cmd, std::string& op,
                            std::string& key, std::string& value);
-  void electLocked(int candidate);  // Setzt Rollen/Votes, braucht Mehrheit
+  void electLocked(int candidate);  // Votes nur von erreichbaren Lebenden
+  int electLeaderLocked();
+  bool replicateLocked(const Entry& entry);
+  [[nodiscard]] bool can_send_locked(int from, int to) const;
+  [[nodiscard]] bool link_up_locked(int from, int to) const;
+  void catchupNodeLocked(int node_id);
+  void catchupReachableLocked();
 
   mutable std::mutex mutex_;
   int shard_id_ = 0;
@@ -174,6 +208,10 @@ class RaftGroup {
   std::string autosave_path_;
   // sXX: Timer-Election Auto-Modus (default false = manuell, Bestand grueng).
   bool auto_election_ = false;
+  // Prodsim-Netz: Default fully meshed, Drop-PRNG Seed 42 (reproduzierbar).
+  mutable std::mt19937 net_rng_{42};
+  bool partitioned_[kGroupSize][kGroupSize]{};
+  int drop_pct_[kGroupSize][kGroupSize]{};
 };
 
 // Shard/Tablet: id + Key-Range [range_start, range_end), traegt eine RaftGroup.

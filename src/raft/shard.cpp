@@ -126,6 +126,13 @@ RaftGroup::RaftGroup(RaftGroup&& other) noexcept {
   log_base_ = other.log_base_;
   autosave_path_ = std::move(other.autosave_path_);
   auto_election_ = other.auto_election_;
+  net_rng_ = other.net_rng_;
+  for (int i = 0; i < kGroupSize; ++i) {
+    for (int j = 0; j < kGroupSize; ++j) {
+      partitioned_[i][j] = other.partitioned_[i][j];
+      drop_pct_[i][j] = other.drop_pct_[i][j];
+    }
+  }
 }
 
 RaftGroup& RaftGroup::operator=(RaftGroup&& other) noexcept {
@@ -138,6 +145,13 @@ RaftGroup& RaftGroup::operator=(RaftGroup&& other) noexcept {
     log_base_ = other.log_base_;
     autosave_path_ = std::move(other.autosave_path_);
     auto_election_ = other.auto_election_;
+    net_rng_ = other.net_rng_;
+    for (int i = 0; i < kGroupSize; ++i) {
+      for (int j = 0; j < kGroupSize; ++j) {
+        partitioned_[i][j] = other.partitioned_[i][j];
+        drop_pct_[i][j] = other.drop_pct_[i][j];
+      }
+    }
   }
   return *this;
 }
@@ -183,40 +197,144 @@ void RaftGroup::apply(Node& node) {
   }
 }
 
+bool RaftGroup::link_up_locked(int from, int to) const {
+  if (from == to) return true;
+  if (from < 0 || to < 0 || from >= kGroupSize || to >= kGroupSize) return false;
+  return !partitioned_[from][to];
+}
+
+bool RaftGroup::can_send_locked(int from, int to) const {
+  if (!link_up_locked(from, to)) return false;
+  if (from == to) return true;
+  const int pct = drop_pct_[from][to];
+  if (pct <= 0) return true;
+  if (pct >= 100) return false;
+  std::uniform_int_distribution<int> dist(0, 99);
+  return dist(net_rng_) >= pct;
+}
+
+bool RaftGroup::can_send(int from, int to) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return can_send_locked(from, to);
+}
+
+void RaftGroup::isolate(int a, int b) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (a < 0 || b < 0 || a >= kGroupSize || b >= kGroupSize || a == b) return;
+  partitioned_[a][b] = true;
+  partitioned_[b][a] = true;
+}
+
+void RaftGroup::heal(int a, int b) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (a < 0 || b < 0 || a >= kGroupSize || b >= kGroupSize || a == b) return;
+  partitioned_[a][b] = false;
+  partitioned_[b][a] = false;
+  catchupReachableLocked();
+}
+
+void RaftGroup::isolate_from_all(int node_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (node_id < 0 || node_id >= kGroupSize) return;
+  for (int i = 0; i < kGroupSize; ++i) {
+    if (i == node_id) continue;
+    partitioned_[node_id][i] = true;
+    partitioned_[i][node_id] = true;
+  }
+}
+
+void RaftGroup::heal_all() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  for (int i = 0; i < kGroupSize; ++i) {
+    for (int j = 0; j < kGroupSize; ++j) {
+      partitioned_[i][j] = false;
+      drop_pct_[i][j] = 0;
+    }
+  }
+  catchupReachableLocked();
+}
+
+void RaftGroup::set_drop_rate(int from, int to, int pct_0_100) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (from < 0 || to < 0 || from >= kGroupSize || to >= kGroupSize) return;
+  if (pct_0_100 < 0) pct_0_100 = 0;
+  if (pct_0_100 > 100) pct_0_100 = 100;
+  drop_pct_[from][to] = pct_0_100;
+}
+
+void RaftGroup::set_net_seed(std::uint32_t seed) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  net_rng_.seed(seed);
+}
+
+void RaftGroup::catchupNodeLocked(int node_id) {
+  if (leader_id_ < 0 || node_id == leader_id_) return;
+  if (node_id < 0 || node_id >= static_cast<int>(nodes_.size())) return;
+  Node& n = nodes_[static_cast<std::size_t>(node_id)];
+  if (!n.alive) return;
+  const Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
+  n.log = leader.log;
+  n.current_term = term_;
+  n.voted_for = leader_id_;
+  n.role = Role::Follower;
+  n.commit_index = leader.commit_index;
+  apply(n);
+}
+
+void RaftGroup::catchupReachableLocked() {
+  if (leader_id_ < 0) return;
+  for (auto& n : nodes_) {
+    if (n.id == leader_id_ || !n.alive) continue;
+    // Heal-Catch-up = Leader-Retry (AppendEntries bis durch), ohne Drop.
+    if (!link_up_locked(leader_id_, n.id)) continue;
+    catchupNodeLocked(n.id);
+  }
+}
+
 void RaftGroup::electLocked(int candidate) {
-  // Alle lebenden Knoten stimmen fuer den Kandidaten (Sim-Vereinfachung:
-  // kein Split-Vote, kein Timeout — deterministisch, ein Round-Trip).
+  // Votes nur von Knoten, die den Kandidaten symmetrisch erreichen.
+  // Isolierte Minderheit behält lokalen Zustand (kann Role::Leader sein),
+  // committet aber ohne Mehrheit nicht — Split-Brain-Prevention.
   for (auto& n : nodes_) {
     if (!n.alive) continue;
+    if (!can_send_locked(n.id, candidate) || !can_send_locked(candidate, n.id)) {
+      continue;
+    }
     n.current_term = term_;
     n.voted_for = candidate;
     n.role = Role::Follower;
   }
   nodes_[static_cast<std::size_t>(candidate)].role = Role::Leader;
   nodes_[static_cast<std::size_t>(candidate)].voted_for = candidate;
+  nodes_[static_cast<std::size_t>(candidate)].current_term = term_;
   leader_id_ = candidate;
+}
+
+int RaftGroup::electLeaderLocked() {
+  for (int c = 0; c < kGroupSize; ++c) {
+    if (!nodes_[static_cast<std::size_t>(c)].alive) continue;
+    int votes = 0;
+    for (const auto& v : nodes_) {
+      if (!v.alive) continue;
+      if (!can_send_locked(v.id, c) || !can_send_locked(c, v.id)) continue;
+      ++votes;
+    }
+    if (votes >= 2) {
+      ++term_;
+      electLocked(c);
+      return leader_id_;
+    }
+  }
+  leader_id_ = -1;
+  for (auto& n : nodes_) {
+    if (n.alive) n.role = Role::Follower;
+  }
+  return -1;
 }
 
 int RaftGroup::electLeader() {
   std::lock_guard<std::mutex> lock(mutex_);
-  int alive = 0;
-  int candidate = -1;
-  for (const auto& n : nodes_) {
-    if (n.alive) {
-      ++alive;
-      if (candidate < 0) candidate = n.id;
-    }
-  }
-  if (alive < 2 || candidate < 0) {  // kein Quorum bei 3er-Gruppe
-    leader_id_ = -1;
-    for (auto& n : nodes_) {
-      if (n.alive) n.role = Role::Follower;
-    }
-    return -1;
-  }
-  ++term_;
-  electLocked(candidate);
-  return leader_id_;
+  return electLeaderLocked();
 }
 
 int RaftGroup::leaderId() const {
@@ -229,52 +347,56 @@ std::uint64_t RaftGroup::term() const {
   return term_;
 }
 
-bool RaftGroup::replicateToFollowers(const Entry& entry) {
-  // Hinweis: wird i.d.R. unter Lock aus append() aufgerufen; hier eigene
-  // Variante ohne Lock fuers externe Testen nicht noetig — append lockt.
-  // Diese Methode lockt selbst (nicht aus append heraus aufrufen).
-  std::lock_guard<std::mutex> lock(mutex_);
+bool RaftGroup::replicateLocked(const Entry& entry) {
   if (leader_id_ < 0) return false;
   int ack = 0;
+  Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
   for (auto& n : nodes_) {
     if (!n.alive) continue;
     if (n.id == leader_id_) {
       ++ack;  // Leader hat den Eintrag bereits
       continue;
     }
-    // Follower-Append: Luecken per Leader-Log auffuellen (Catch-up light),
-    // dann Eintrag anhaengen. Sim ersetzt die AppendEntries-RPC.
-    const Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
+    if (!can_send_locked(leader_id_, n.id)) continue;
+    // Follower-Append: Konflikt-Suffix kappen, Luecken fuellen.
+    // Sim ersetzt AppendEntries-RPC (kein echtes Netz).
     if (n.current_term != term_) {
       n.current_term = term_;
       n.voted_for = leader_id_;
       n.role = Role::Follower;
     }
-    // Log angleichen: fehlende Suffixe vom Leader kopieren (ohne entry selbst).
-    // Positionen sind base-relativ: Position p <-> Index log_base_ + p + 1.
-    while (n.log.size() + log_base_ + 1 < entry.index) {
-      std::size_t src = n.log.size();
-      if (src < leader.log.size()) {
-        n.log.push_back(leader.log[src]);
-      } else {
+    while (!n.log.empty() && n.log.size() > leader.log.size()) {
+      n.log.pop_back();
+    }
+    for (std::size_t i = 0; i < n.log.size(); ++i) {
+      if (i >= leader.log.size() || n.log[i].term != leader.log[i].term ||
+          n.log[i].index != leader.log[i].index) {
+        n.log.resize(i);
         break;
       }
     }
-    if (n.log.size() + log_base_ + 1 == entry.index) {
-      n.log.push_back(entry);
-      ++ack;
-    } else if (entry.index > log_base_ &&
-               n.log.size() >= entry.index - log_base_ && entry.index > 0 &&
-               n.log[static_cast<std::size_t>(entry.index - log_base_ - 1)]
-                       .index == entry.index) {
-      ++ack;  // bereits vorhanden (Retry/Idempotenz)
+    while (n.log.size() < leader.log.size()) {
+      n.log.push_back(leader.log[n.log.size()]);
+    }
+    if (entry.index > log_base_ &&
+        n.log.size() >= static_cast<std::size_t>(entry.index - log_base_) &&
+        entry.index > 0) {
+      const Entry& got =
+          n.log[static_cast<std::size_t>(entry.index - log_base_ - 1)];
+      if (got.index == entry.index && got.term == entry.term) ++ack;
     }
   }
-  return ack >= 2;  // Mehrheit bei 3 Knoten
+  return ack >= 2;  // Mehrheit bei 3 Knoten — nur erreichbare Acks
+}
+
+bool RaftGroup::replicateToFollowers(const Entry& entry) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return replicateLocked(entry);
 }
 
 std::uint64_t RaftGroup::append(std::string command) {
   Entry entry;
+  std::string autosave;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (leader_id_ < 0) return 0;
@@ -284,23 +406,22 @@ std::uint64_t RaftGroup::append(std::string command) {
     entry.index = log_base_ + leader.log.size() + 1;
     entry.command = std::move(command);
     leader.log.push_back(entry);
-  }
-  // Replikation ausserhalb des append-Locks? replicateToFollowers lockt selbst.
-  // Zwischen den Locks kann kein konkurrierender append interleaven, da Tests
-  // single-threaded sind; C++-seitig bleibt es via Mutex korrekt, nur die
-  // Commit-Zuweisung braucht nochmals den Lock.
-  if (!replicateToFollowers(entry)) {
-    return 0;  // kein Quorum — Eintrag bleibt uncommitted
-  }
-  std::string autosave;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
+    if (!replicateLocked(entry)) {
+      return 0;  // kein Quorum — Eintrag bleibt uncommitted Tail
+    }
     for (auto& n : nodes_) {
       if (!n.alive) continue;
-      if (!n.log.empty() && n.log.back().index >= entry.index) {
-        if (n.commit_index < entry.index) n.commit_index = entry.index;
-        apply(n);
+      if (n.id != leader_id_ && !link_up_locked(leader_id_, n.id)) continue;
+      bool has = false;
+      if (entry.index > log_base_ &&
+          n.log.size() >= static_cast<std::size_t>(entry.index - log_base_)) {
+        const Entry& got =
+            n.log[static_cast<std::size_t>(entry.index - log_base_ - 1)];
+        has = (got.index == entry.index && got.term == entry.term);
       }
+      if (!has) continue;
+      if (n.commit_index < entry.index) n.commit_index = entry.index;
+      apply(n);
     }
     autosave = autosave_path_;
   }
@@ -365,14 +486,11 @@ void RaftGroup::reviveNode(int node_id) {
   if (n.election_timeout_ms < 150 || n.election_timeout_ms > 300) {
     n.election_timeout_ms = election_timeout_for(node_id);
   }
-  // Catch-up: volles Leader-Log kopieren, commit angleichen, apply.
-  if (leader_id_ >= 0 && leader_id_ != node_id) {
-    const Node& leader = nodes_[static_cast<std::size_t>(leader_id_)];
-    n.log = leader.log;
-    n.current_term = term_;
-    n.voted_for = leader_id_;
-    n.commit_index = leader.commit_index;
-    apply(n);
+  // Catch-up nur wenn der Leader den Knoten netzseitig erreicht (Partition
+  // bleibt Partition; Crash-Revive auf voller Mesh wie bisher).
+  if (leader_id_ >= 0 && leader_id_ != node_id &&
+      link_up_locked(leader_id_, node_id)) {
+    catchupNodeLocked(node_id);
   }
 }
 
@@ -428,16 +546,11 @@ void RaftGroup::heartbeat(int node_id, std::uint64_t now_ms) {
 int RaftGroup::tick(std::uint64_t now_ms) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!auto_election_) return leader_id_;
-  int alive = 0;
-  for (const auto& n : nodes_) {
-    if (n.alive) ++alive;
-  }
   const bool leader_alive =
       leader_id_ >= 0 &&
       leader_id_ < static_cast<int>(nodes_.size()) &&
       nodes_[static_cast<std::size_t>(leader_id_)].alive;
-  // Timeout pruefen (saturierend gegen rueckwaertige Clock): nur lebende
-  // Nicht-Leader zaehlen; bei fehlendem Leader alle Lebenden.
+  // Timeout: Follower ohne erreichbaren Leader-Heartbeat.
   bool expired = false;
   for (const auto& n : nodes_) {
     if (!n.alive) continue;
@@ -450,26 +563,25 @@ int RaftGroup::tick(std::uint64_t now_ms) {
     }
   }
   if (expired) {
-    if (alive < 2) return leader_id_;  // kein Quorum: kein Commit, keine Wahl
-    int candidate = -1;
-    for (const auto& n : nodes_) {
-      if (n.alive) {
-        candidate = n.id;
-        break;
+    // Isolierte Minderheit darf die Wahl nicht stehlen (kein Majority-Vote).
+    const int elected = electLeaderLocked();
+    if (elected >= 0) {
+      for (auto& n : nodes_) {
+        if (!n.alive) continue;
+        if (n.id == elected || can_send_locked(elected, n.id)) {
+          n.last_heartbeat_ms = now_ms;
+        }
       }
-    }
-    if (candidate < 0) return leader_id_;
-    ++term_;
-    electLocked(candidate);
-    for (auto& n : nodes_) {
-      if (n.alive) n.last_heartbeat_ms = now_ms;
     }
     return leader_id_;
   }
   if (leader_alive) {
-    // Leader-Heartbeat: nur Timer resyncen, KEIN Log-Eintrag/Commit-Touch.
+    // Heartbeat nur auf erreichbare Lebende (Partition = kein Tick).
     for (auto& n : nodes_) {
-      if (n.alive) n.last_heartbeat_ms = now_ms;
+      if (!n.alive) continue;
+      if (n.id == leader_id_ || can_send_locked(leader_id_, n.id)) {
+        n.last_heartbeat_ms = now_ms;
+      }
     }
   }
   return leader_id_;

@@ -17,6 +17,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <variant>
@@ -26,7 +27,11 @@
 #include "dbengine/sql/parser.h"
 
 #ifdef DBENGINE_WITH_TLS
+#include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/rand.h>
 #include <openssl/ssl.h>
 #endif
 
@@ -216,6 +221,353 @@ std::optional<std::string> parsePasswordMessage(
   while (n < payLen && begin[n] != '\0') ++n;
   if (n + 1 != payLen) return std::nullopt;
   return std::string(begin, n);
+}
+
+// ---- SCRAM-SHA-256 (RFC 5802 Server-Seite) --------------------------------
+// Base64 (STL-only, kein Krypto) ist immer verfuegbar; SHA256/HMAC nur mit
+// DBENGINE_WITH_TLS via OpenSSL (EVP/HMAC). Ohne das Define wird SCRAM zur
+// Laufzeit verweigert (keine eigene Crypto-Implementierung).
+
+[[maybe_unused]] constexpr const char* kScramMech = "SCRAM-SHA-256";
+
+bool isScramEntry(const std::string& v) {
+  return v.size() >= 6 && v.compare(0, 6, "scram:") == 0;
+}
+
+[[maybe_unused]] std::string scramB64Encode(const uint8_t* data,
+                                            std::size_t len) {
+  static const char* kTab =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((len + 2) / 3) * 4);
+  for (std::size_t i = 0; i < len; i += 3) {
+    uint32_t b0 = data[i];
+    uint32_t b1 = (i + 1 < len) ? data[i + 1] : 0;
+    uint32_t b2 = (i + 2 < len) ? data[i + 2] : 0;
+    uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+    out.push_back(kTab[(triple >> 18) & 63]);
+    out.push_back(kTab[(triple >> 12) & 63]);
+    out.push_back(i + 1 < len ? kTab[(triple >> 6) & 63] : '=');
+    out.push_back(i + 2 < len ? kTab[triple & 63] : '=');
+  }
+  return out;
+}
+
+[[maybe_unused]] std::optional<std::vector<uint8_t>> scramB64Decode(
+    const std::string& s) {
+  if (s.empty() || s.size() % 4 != 0) return std::nullopt;
+  auto val = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    if (c == '=') return -2;  // padding
+    return -1;
+  };
+  std::size_t pad = 0;
+  if (s.back() == '=') ++pad;
+  if (s.size() >= 2 && s[s.size() - 2] == '=') ++pad;
+  if (pad > 2) return std::nullopt;
+  for (std::size_t i = 0; i < s.size() - pad; ++i) {
+    if (val(s[i]) < 0) return std::nullopt;
+  }
+  for (std::size_t i = s.size() - pad; i < s.size(); ++i) {
+    if (s[i] != '=') return std::nullopt;
+  }
+  std::vector<uint8_t> out;
+  out.reserve((s.size() / 4) * 3);
+  for (std::size_t i = 0; i < s.size(); i += 4) {
+    int v0 = val(s[i]);
+    int v1 = val(s[i + 1]);
+    int v2 = (s[i + 2] == '=') ? 0 : val(s[i + 2]);
+    int v3 = (s[i + 3] == '=') ? 0 : val(s[i + 3]);
+    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) return std::nullopt;
+    uint32_t triple = (static_cast<uint32_t>(v0) << 18) |
+                      (static_cast<uint32_t>(v1) << 12) |
+                      (static_cast<uint32_t>(v2) << 6) |
+                      static_cast<uint32_t>(v3);
+    out.push_back(static_cast<uint8_t>((triple >> 16) & 0xFF));
+    if (s[i + 2] != '=') out.push_back(static_cast<uint8_t>((triple >> 8) & 0xFF));
+    if (s[i + 3] != '=') out.push_back(static_cast<uint8_t>(triple & 0xFF));
+  }
+  return out;
+}
+
+struct ScramVerifier {
+  std::string saltB64;  // Original-String fuer Server-First (s=...)
+  std::vector<uint8_t> salt;
+  int iter = 4096;
+  std::vector<uint8_t> storedKey;  // 32 Byte (SHA256(ClientKey))
+  std::vector<uint8_t> serverKey;  // 32 Byte, optional
+  bool hasServerKey = false;
+};
+
+// Format: "scram:<salt-b64>:<iter>:<storedkey-b64>[:<serverkey-b64>]".
+// Rueckgabe nullopt bei Fehlformat (Caller -> 28P01, kein Leak).
+[[maybe_unused]] std::optional<ScramVerifier> parseScramEntry(
+    const std::string& v) {
+  if (!isScramEntry(v)) return std::nullopt;
+  std::vector<std::string> parts;
+  std::string cur;
+  for (char c : v) {
+    if (c == ':') {
+      parts.push_back(cur);
+      cur.clear();
+    } else {
+      cur.push_back(c);
+    }
+  }
+  parts.push_back(cur);
+  if (parts.size() != 4 && parts.size() != 5) return std::nullopt;
+  if (parts[0] != "scram") return std::nullopt;
+  if (parts[1].empty() || parts[2].empty() || parts[3].empty()) return std::nullopt;
+  long iter = 0;
+  try {
+    std::size_t pos = 0;
+    iter = std::stol(parts[2], &pos, 10);
+    if (pos != parts[2].size()) return std::nullopt;
+  } catch (...) {
+    return std::nullopt;
+  }
+  if (iter <= 0 || iter > 10000000) return std::nullopt;
+  auto salt = scramB64Decode(parts[1]);
+  auto stored = scramB64Decode(parts[3]);
+  if (!salt.has_value() || salt->empty()) return std::nullopt;
+  if (!stored.has_value() || stored->size() != 32) return std::nullopt;
+  ScramVerifier sv;
+  sv.saltB64 = parts[1];
+  sv.salt = std::move(*salt);
+  sv.iter = static_cast<int>(iter);
+  sv.storedKey = std::move(*stored);
+  if (parts.size() == 5) {
+    if (parts[4].empty()) return std::nullopt;
+    auto sk = scramB64Decode(parts[4]);
+    if (!sk.has_value() || sk->size() != 32) return std::nullopt;
+    sv.serverKey = std::move(*sk);
+    sv.hasServerKey = true;
+  }
+  return sv;
+}
+
+// R(10 AuthenticationSASL): 'R' | len | int32(10) | "SCRAM-SHA-256\0" | "\0".
+// (Mechanismus-String + Pflicht-Terminator nach letzter Mechanism-Angabe.)
+[[maybe_unused]] std::vector<uint8_t> encodeAuthSasl() {
+  std::vector<uint8_t> out;
+  out.push_back('R');
+  const std::string mech = kScramMech;
+  int32_t len = 4 + 4 + static_cast<int32_t>(mech.size()) + 1 + 1;
+  putInt32BE(out, len);
+  putInt32BE(out, 10);
+  out.insert(out.end(), mech.begin(), mech.end());
+  out.push_back(0);
+  out.push_back(0);
+  return out;
+}
+
+// R(11 SASLContinue) / R(12 SASLFinal): 'R' | len | int32(kind) | raw bytes.
+[[maybe_unused]] std::vector<uint8_t> encodeAuthSaslCont(
+    int32_t kind, const std::string& data) {
+  std::vector<uint8_t> out;
+  out.push_back('R');
+  putInt32BE(out, 4 + 4 + static_cast<int32_t>(data.size()));
+  putInt32BE(out, kind);
+  out.insert(out.end(), data.begin(), data.end());
+  return out;
+}
+
+struct SaslInitial {
+  std::string mech;
+  std::string initial;  // Client-First-Message (kann leer sein -> Fail)
+  bool hasInitial = false;
+};
+
+// SASLInitialResponse: 'p' | len | mech\0 | int32(n) | n bytes (n=-1: keine).
+[[maybe_unused]] std::optional<SaslInitial> parseSaslInitial(
+    const std::vector<uint8_t>& msg) {
+  if (msg.empty() || msg[0] != 'p' || msg.size() < 5) return std::nullopt;
+  std::size_t pos = 5;
+  std::size_t start = pos;
+  while (pos < msg.size() && msg[pos] != 0) ++pos;
+  if (pos >= msg.size()) return std::nullopt;
+  SaslInitial out;
+  out.mech.assign(reinterpret_cast<const char*>(msg.data() + start), pos - start);
+  ++pos;  // NUL
+  if (pos + 4 > msg.size()) return std::nullopt;
+  int32_t n = getInt32BE(msg.data() + pos);
+  pos += 4;
+  if (n == -1) {
+    if (pos != msg.size()) return std::nullopt;
+    out.hasInitial = false;
+    return out;
+  }
+  if (n < 0 || pos + static_cast<std::size_t>(n) != msg.size()) return std::nullopt;
+  out.initial.assign(reinterpret_cast<const char*>(msg.data() + pos),
+                     static_cast<std::size_t>(n));
+  out.hasInitial = true;
+  return out;
+}
+
+// SASLResponse: 'p' | len | raw bytes (0..n).
+[[maybe_unused]] std::optional<std::string> parseSaslResponse(
+    const std::vector<uint8_t>& msg) {
+  if (msg.empty() || msg[0] != 'p' || msg.size() < 5) return std::nullopt;
+  return std::string(reinterpret_cast<const char*>(msg.data() + 5), msg.size() - 5);
+}
+
+// Client-First "n,,n=user,r=nonce" (gs2 "n,,"/"y,,"; PLUS "p=..,, " abgelehnt).
+// Gibt (bare, user, clientNonce, gs2Header) zurueck.
+struct ClientFirst {
+  std::string bare;
+  std::string user;
+  std::string nonce;
+  std::string gs2;
+};
+
+[[maybe_unused]] std::optional<ClientFirst> parseClientFirst(
+    const std::string& cf) {
+  if (cf.size() < 4) return std::nullopt;
+  std::string gs2;
+  if (cf.compare(0, 3, "n,,") == 0 || cf.compare(0, 3, "y,,") == 0) {
+    gs2 = cf.substr(0, 3);
+  } else {
+    return std::nullopt;  // inkl. "p=...,," (PLUS nicht angeboten)
+  }
+  std::string bare = cf.substr(3);
+  if (bare.empty()) return std::nullopt;
+  // Attribute splitten, "m=" (reserved ext) tolerieren, n=/r= Pflicht.
+  std::string user;
+  std::string nonce;
+  bool hasUser = false;
+  bool hasNonce = false;
+  std::size_t i = 0;
+  while (i <= bare.size()) {
+    std::size_t j = bare.find(',', i);
+    std::string attr = (j == std::string::npos) ? bare.substr(i)
+                                                : bare.substr(i, j - i);
+    if (attr.size() >= 2 && attr[1] == '=') {
+      char k = attr[0];
+      std::string val = attr.substr(2);
+      if (k == 'n' && !hasUser) {
+        if (val.empty()) return std::nullopt;
+        user = val;
+        hasUser = true;
+      } else if (k == 'r' && !hasNonce) {
+        if (val.empty()) return std::nullopt;
+        nonce = val;
+        hasNonce = true;
+      }
+    }
+    if (j == std::string::npos) break;
+    i = j + 1;
+  }
+  if (!hasUser || !hasNonce) return std::nullopt;
+  // Nonce darf kein ',' enthalten (waere sonst Attr-Bruch); hier implizit ok.
+  if (nonce.find(',') != std::string::npos) return std::nullopt;
+  ClientFirst out;
+  out.bare = bare;
+  out.user = user;
+  out.nonce = nonce;
+  out.gs2 = gs2;
+  return out;
+}
+
+struct ClientFinal {
+  std::string cbind;     // c=... (b64)
+  std::string nonce;     // r=... (muss combined sein)
+  std::string proofB64;  // p=... (b64)
+  std::string withoutProof;  // "c=...,r=..." fuer AuthMessage
+};
+
+[[maybe_unused]] std::optional<ClientFinal> parseClientFinal(
+    const std::string& cf) {
+  std::size_t ppos = cf.rfind(",p=");
+  if (ppos == std::string::npos) return std::nullopt;
+  std::string without = cf.substr(0, ppos);
+  std::string proof = cf.substr(ppos + 3);
+  if (proof.empty()) return std::nullopt;
+  // without muss "c=...,r=..." enthalten (Reihenfolge c vor r per RFC).
+  std::string cbind;
+  std::string nonce;
+  std::size_t i = 0;
+  while (i <= without.size()) {
+    std::size_t j = without.find(',', i);
+    std::string attr = (j == std::string::npos) ? without.substr(i)
+                                                : without.substr(i, j - i);
+    if (attr.size() >= 2 && attr[1] == '=') {
+      if (attr[0] == 'c' && cbind.empty()) cbind = attr.substr(2);
+      if (attr[0] == 'r' && nonce.empty()) nonce = attr.substr(2);
+    }
+    if (j == std::string::npos) break;
+    i = j + 1;
+  }
+  if (cbind.empty() || nonce.empty()) return std::nullopt;
+  ClientFinal out;
+  out.cbind = cbind;
+  out.nonce = nonce;
+  out.proofB64 = proof;
+  out.withoutProof = without;
+  return out;
+}
+
+#ifdef DBENGINE_WITH_TLS
+bool scramSha256(const uint8_t* data, std::size_t len, uint8_t out32[32]) {
+  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+  if (ctx == nullptr) return false;
+  bool ok = false;
+  unsigned int olen = 0;
+  if (EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr) == 1 &&
+      EVP_DigestUpdate(ctx, data, len) == 1 &&
+      EVP_DigestFinal_ex(ctx, out32, &olen) == 1 && olen == 32) {
+    ok = true;
+  }
+  EVP_MD_CTX_free(ctx);
+  return ok;
+}
+
+bool scramHmac(const uint8_t* key, std::size_t keyLen, const uint8_t* data,
+               std::size_t dataLen, uint8_t out32[32]) {
+  unsigned int olen = 0;
+  uint8_t tmp[32];
+  if (::HMAC(EVP_sha256(), key, static_cast<int>(keyLen), data, dataLen, tmp,
+             &olen) == nullptr ||
+      olen != 32) {
+    return false;
+  }
+  std::memcpy(out32, tmp, 32);
+  OPENSSL_cleanse(tmp, sizeof(tmp));
+  return true;
+}
+
+bool scramHmacStr(const std::vector<uint8_t>& key, const std::string& data,
+                  uint8_t out32[32]) {
+  if (key.empty()) return false;
+  return scramHmac(key.data(), key.size(),
+                   reinterpret_cast<const uint8_t*>(data.data()), data.size(),
+                   out32);
+}
+#endif
+
+[[maybe_unused]] bool scramConstEq(const std::vector<uint8_t>& a,
+                                    const std::vector<uint8_t>& b) {
+  if (a.size() != b.size()) return false;
+  uint8_t d = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) d |= (a[i] ^ b[i]);
+  return d == 0;
+}
+
+[[maybe_unused]] std::string scramServerNonce() {
+  uint8_t buf[18] = {0};
+#ifdef DBENGINE_WITH_TLS
+  if (RAND_bytes(buf, sizeof(buf)) != 1) {
+    std::random_device rd;
+    for (auto& b : buf) b = static_cast<uint8_t>(rd());
+  }
+#else
+  std::random_device rd;
+  for (auto& b : buf) b = static_cast<uint8_t>(rd());
+#endif
+  return scramB64Encode(buf, sizeof(buf));
 }
 
 std::string trimUpper(const std::string& s) {
@@ -785,6 +1137,11 @@ void PgServer::setAuthRequired(bool required) {
   authRequired_ = required;
 }
 
+void PgServer::setScram(bool enabled) {
+  std::lock_guard<std::mutex> lk(authMu_);
+  scramEnabled_ = enabled;
+}
+
 void PgServer::setTlsCert(const std::string& keyPath,
                           const std::string& certPath) {
   std::lock_guard<std::mutex> lk(tlsMu_);
@@ -937,44 +1294,193 @@ void PgServer::handleConn(int fd) {
   }
 
   // 1b) Auth-Hook (opt-in). Default Trust-All: direkt zu 2).
-  // Wenn required: R(3 Cleartext) statt R(0), PasswordMessage ('p') lesen,
-  // gegen authUsers_ vergleichen; Fail -> E FATAL 28P01 + close, OK -> 2).
+  // Wenn required und SCRAM aus (Default): R(3 Cleartext) statt R(0),
+  // PasswordMessage ('p') lesen, gegen authUsers_ vergleichen;
+  // Fail -> E FATAL 28P01 + close, OK -> 2). Byte-identisch zu bisher.
+  // Wenn required + setScram(true) + User-Eintrag "scram:...": SCRAM-SHA-256
+  // (RFC 5802 Server-Seite): R(10,'SCRAM-SHA-256') -> Client-First ->
+  // R(11,Server-First r=combined,i=iter,s=salt) -> Client-Final-Proof
+  // (HMAC-SHA256/XOR gegen StoredKey) -> bei OK R(12,"v=...") und weiter
+  // zu 2) (R(0)+Z), bei Fail E FATAL 28P01 + close. Klartext-Eintrag oder
+  // unbekannter User bei aktivem SCRAM = Legacy-R3-Pfad. Ohne
+  // DBENGINE_WITH_TLS wird SCRAM mit 28P01 verweigert (kein eigenes Krypto).
   {
     bool required = false;
+    bool scramOn = false;
     std::map<std::string, std::string> users;
     {
       std::lock_guard<std::mutex> lk(authMu_);
       required = authRequired_;
+      scramOn = scramEnabled_;
       users = authUsers_;
     }
     if (required) {
-      if (!connSend(conn, encodeAuthCleartext())) {
-        closeConn();
-        return;
-      }
-      char ptype = 0;
-      std::vector<uint8_t> pmsg;
-      if (!readTypedMessage(conn, ptype, pmsg)) {
-        closeConn();
-        return;
-      }
-      std::optional<std::string> pw;
-      if (ptype == 'p') pw = parsePasswordMessage(pmsg);
-      bool ok = false;
-      if (pw.has_value()) {
+      bool wantScram = false;
+      {
         auto it = users.find(startupParams.user);
-        if (it != users.end() && pw.value() == it->second) ok = true;
+        if (scramOn && it != users.end() && isScramEntry(it->second))
+          wantScram = true;
       }
-      if (!ok) {
-        auto err = dbengine::pgwire::encodeError(
-            "FATAL", "28P01",
-            std::string("password authentication failed for user \"") +
-                startupParams.user + "\"");
-        connSend(conn, err);
-        closeConn();
+      if (!wantScram) {
+        if (!connSend(conn, encodeAuthCleartext())) {
+          closeConn();
+          return;
+        }
+        char ptype = 0;
+        std::vector<uint8_t> pmsg;
+        if (!readTypedMessage(conn, ptype, pmsg)) {
+          closeConn();
+          return;
+        }
+        std::optional<std::string> pw;
+        if (ptype == 'p') pw = parsePasswordMessage(pmsg);
+        bool ok = false;
+        if (pw.has_value()) {
+          auto it = users.find(startupParams.user);
+          if (it != users.end() && pw.value() == it->second) ok = true;
+        }
+        if (!ok) {
+          auto err = dbengine::pgwire::encodeError(
+              "FATAL", "28P01",
+              std::string("password authentication failed for user \"") +
+                  startupParams.user + "\"");
+          connSend(conn, err);
+          closeConn();
+          return;
+        }
+        // OK: weiter zu 2) (R(0) + Z wie bisher).
+      } else {
+        auto failScram = [&](const std::string& detail) {
+          auto err = dbengine::pgwire::encodeError(
+              "FATAL", "28P01",
+              std::string("password authentication failed for user \"") +
+                  startupParams.user + "\"" +
+                  (detail.empty() ? "" : ": " + detail));
+          connSend(conn, err);
+          closeConn();
+        };
+#ifdef DBENGINE_WITH_TLS
+        std::optional<ScramVerifier> verifier;
+        {
+          auto it = users.find(startupParams.user);
+          if (it != users.end()) verifier = parseScramEntry(it->second);
+        }
+        if (!verifier.has_value()) {
+          failScram("invalid SCRAM verifier");
+          return;
+        }
+        if (!connSend(conn, encodeAuthSasl())) {
+          closeConn();
+          return;
+        }
+        char itype = 0;
+        std::vector<uint8_t> imsg;
+        if (!readTypedMessage(conn, itype, imsg)) {
+          closeConn();
+          return;
+        }
+        std::optional<SaslInitial> init;
+        if (itype == 'p') init = parseSaslInitial(imsg);
+        if (!init.has_value() || !init->hasInitial ||
+            init->mech != kScramMech) {
+          failScram("invalid SASLInitialResponse");
+          return;
+        }
+        std::optional<ClientFirst> cfirst = parseClientFirst(init->initial);
+        if (!cfirst.has_value() || cfirst->user != startupParams.user) {
+          failScram("invalid client-first-message");
+          return;
+        }
+        const std::string combined = cfirst->nonce + scramServerNonce();
+        if (combined.empty() || combined.find(',') != std::string::npos) {
+          failScram("invalid nonce");
+          return;
+        }
+        const std::string serverFirst = "r=" + combined + ",s=" +
+                                        verifier->saltB64 + ",i=" +
+                                        std::to_string(verifier->iter);
+        if (!connSend(conn, encodeAuthSaslCont(11, serverFirst))) {
+          closeConn();
+          return;
+        }
+        char ftype = 0;
+        std::vector<uint8_t> fmsg;
+        if (!readTypedMessage(conn, ftype, fmsg)) {
+          closeConn();
+          return;
+        }
+        std::optional<std::string> cfinalRaw;
+        if (ftype == 'p') cfinalRaw = parseSaslResponse(fmsg);
+        if (!cfinalRaw.has_value()) {
+          failScram("invalid SASLResponse");
+          return;
+        }
+        std::optional<ClientFinal> cfinal = parseClientFinal(*cfinalRaw);
+        if (!cfinal.has_value() || cfinal->nonce != combined) {
+          failScram("invalid client-final-message");
+          return;
+        }
+        // Channel-Binding: c= muss base64(gs2-Header) sein ("n,, "->"biws").
+        {
+          auto cdec = scramB64Decode(cfinal->cbind);
+          std::string expectGs2 = cfirst->gs2;
+          std::string got;
+          if (cdec.has_value())
+            got.assign(reinterpret_cast<const char*>(cdec->data()),
+                       cdec->size());
+          if (!cdec.has_value() || got != expectGs2) {
+            failScram("channel-binding mismatch");
+            return;
+          }
+        }
+        auto proofBytes = scramB64Decode(cfinal->proofB64);
+        if (!proofBytes.has_value() || proofBytes->size() != 32) {
+          failScram("invalid proof");
+          return;
+        }
+        const std::string authMsg =
+            cfirst->bare + "," + serverFirst + "," + cfinal->withoutProof;
+        uint8_t clientSig[32] = {0};
+        uint8_t serverSig[32] = {0};
+        bool cryptoOk = false;
+        if (scramHmacStr(verifier->storedKey, authMsg, clientSig)) {
+          std::vector<uint8_t> clientKey(32);
+          for (std::size_t k = 0; k < 32; ++k)
+            clientKey[k] = static_cast<uint8_t>((*proofBytes)[k] ^ clientSig[k]);
+          uint8_t check[32] = {0};
+          if (scramSha256(clientKey.data(), clientKey.size(), check)) {
+            std::vector<uint8_t> checkV(check, check + 32);
+            if (scramConstEq(checkV, verifier->storedKey)) {
+              // Server-Signatur: mit ServerKey (RFC) bzw. StoredKey-Fallback.
+              const std::vector<uint8_t>& skey = verifier->hasServerKey
+                                                     ? verifier->serverKey
+                                                     : verifier->storedKey;
+              if (scramHmacStr(skey, authMsg, serverSig)) cryptoOk = true;
+            }
+          }
+          OPENSSL_cleanse(clientSig, sizeof(clientSig));
+          OPENSSL_cleanse(clientKey.data(), clientKey.size());
+        }
+        if (!cryptoOk) {
+          OPENSSL_cleanse(serverSig, sizeof(serverSig));
+          failScram("SCRAM proof mismatch");
+          return;
+        }
+        const std::string serverFinal =
+            "v=" + scramB64Encode(serverSig, sizeof(serverSig));
+        OPENSSL_cleanse(serverSig, sizeof(serverSig));
+        if (!connSend(conn, encodeAuthSaslCont(12, serverFinal))) {
+          closeConn();
+          return;
+        }
+        // OK: weiter zu 2) (R(0) + Z wie bisher; Reihenfolge R12,R0,Z).
+#else
+        // Ohne OpenSSL: SCRAM explizit verweigert (kein R10, kein R3).
+        (void)users;
+        failScram("SCRAM-SHA-256 requires DBENGINE_WITH_TLS build");
         return;
+#endif
       }
-      // OK: weiter zu 2) (R(0) + Z wie bisher).
     }
   }
 

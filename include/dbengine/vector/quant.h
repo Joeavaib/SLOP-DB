@@ -259,9 +259,13 @@ class DiskSpill {
 //                  (Byte 0..255 -> float, exakt <2^24, Record=fix m_pq).
 //   prefix.graph : DiskSpill(m_graph, count) Adjazenz als float-Cast
 //                  (Nachbar-ID -> float, -1.0f = Padding, Record=fix m_graph).
-// Graph: eigene Beam-Links = exakte M-NN (brute-force L2, (dist,id)-Tie-Break,
-//   deterministisch, kein RNG; HnswIndex nur als Alternative dokumentiert,
-//   nicht noetig -> kein Eingriff in hnsw.h). M (=m_graph) konfigurierbar.
+// Graph: eigene Beam-Links = M-NN-Hybrid (deterministisch, (dist,id)-Tie-Break,
+//   kein Eingriff in hnsw.h): N <= kExactThreshold exakt via brute-force
+//   L2 (O(N^2), maximaler Recall); darueber ANN via HnswIndex (ueber denselben
+//   Daten gebaut, public API add/build/search, Seed-deterministisch) mit
+//   ef-Tuning (Top-M+1 Query pro Knoten, Self gefiltert, Top-M als Adjazenz).
+//   M (=m_graph) konfigurierbar. Schwelle kExactThreshold=16000, gemessen:
+//   exakt 5k=0.6s vs ANN 2.3s, 10k exakt~2.4s vs ANN 5.7s (Crossover ~15-20k).
 // Suche: Beam ueber Graph mit PQ-ADC (mmap-Reads via DiskSpill::get, kein
 //   decode, eine ADC-Tabelle pro Query), Top-ef_rerank exakt re-ranken
 //   (volle Vektoren via DiskSpill). Deterministisch (Seed nur im PQ-fit).
@@ -276,8 +280,13 @@ class DiskAnnIndex {
 
   // Baut Index aus data und persistiert unter prefix (+.hdr/.vec/.pq/.graph).
   // PQ-Training: pq_iters Lloyd-Iterationen, Sample-Regel aus PqNQuantizer,
-  // deterministisch via seed. Graph: exakte M-NN (O(N^2), deterministisch).
+  // deterministisch via seed. Graph-Hybrid: N<=kExactThreshold exakt O(N^2),
+  // sonst HnswIndex-ANN (Seed+2, M=16, efConstruction=max(64,2*m_graph),
+  // ef_search=max(8*(M+1),256,auto_ef),auffuellen exakt bei Luecken).
   // Bleibt danach geoeffnet (mmap) fuer sofortige search().
+  // Schwelle kExactThreshold=16000: darunter exakt wie bisher (Recall-Maximum,
+  // O(N^2) tragbar bis ~10s); darueber ANN (Build ~O(N log N)).
+  static constexpr size_t kExactThreshold = 16000;
   void build(const std::vector<Vector>& data, const std::string& prefix,
              int pq_iters = 8, unsigned seed = 42u);
   // Oeffnet bestehenden Index (Header + 3 DiskSpills, Codebooks aus Header).
