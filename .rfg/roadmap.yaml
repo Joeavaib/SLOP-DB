@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 18: RESP-Layer (Redis-Migration), Row-Level-Security, At-Rest-Verschluesselung optional, TPC-H-SF-Rematch, Doku. Alles verifiziert."
+  statement: "C++ DB Engine Welle 19: Multi-Prozess-Raft (3 Prozesse, TCP, Wahl+Replikation), OTLP-HTTP-Export, Slow-Query-Log, S3-Sidecar-Doku, README-Overhaul. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -768,3 +768,42 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
     engine: implement
     want: "ARCH-Update Welle 14-17: Replika, Autotune, Prodsim, pg_stat, DiskANN, TPC-H, SCRAM, Subqueries, TLS, Timer, Parallel-Scan; stale korrigiert"
+  - id: s91-raftmp
+    title: s91-raftmp
+    paths:
+      - tools/raft_cluster.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ./build/raft_cluster --selfcheck
+    engine: implement
+    want: "Multi-Prozess-Raft: 3 Prozesse via fork, TCP-AppendEntries/RequestVote mit Wire-Codec, Wahl-Timeout, Replikation + Selfcheck"
+  - id: s92-otlp
+    title: s92-otlp
+    paths:
+      - src/server/metrics.cpp
+      - include/dbengine/server/metrics.h
+    verify: cmake --build build -j4 && ./build/dbmetrics --selfcheck
+    engine: implement
+    want: "OTLP-HTTP-Export: Spans/Traces als OTLP-JSON ueber HTTP-POST (handgerollt, STL/POSIX), konfigurierbarer Endpoint, Selfcheck mit lokalem Fake-Kollektor"
+  - id: s93-slowlog
+    title: s93-slowlog
+    paths:
+      - src/sql/executor.cpp
+      - include/dbengine/sql/executor.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor\" --output-on-failure"
+    engine: implement
+    want: "Slow-Query-Log: Schwellwert-konfigurierbar, langsame Queries mit Plan-Hinweis loggen, pg_stat-Integration, alte Tests gruene"
+  - id: s94-s3sidecar
+    title: s94-s3sidecar
+    paths:
+      - docs/RUNBOOK.md
+      - k8s/statefulset.yaml
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "S3-Sidecar-Doku: rclone/minio-Tiering-Anleitung, Manifest-Format, K8s-Skizze, Guard-Keywords erhalten"
+  - id: s95-readme
+    title: s95-readme
+    paths:
+      - README.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "README-Overhaul: Produkt-Quickstart (foo.db, Benchmarks ehrlich, Architektur-Links), keine erfundenen Zahlen"
