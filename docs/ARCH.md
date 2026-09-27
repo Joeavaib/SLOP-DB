@@ -10,6 +10,9 @@
 > Pager-Atomaritaet, HNSW/IVF-Skala, Auth/TLS — siehe Kapitel 9.
 > Welle 11–12: JOIN/DDL/COL2/SoA/Audit/TPC-H/Parallel-Build/Extended — siehe Kapitel 10.
 > Phase 0 (s72–s77): Single-File-Container/BTreeKV/CLI/Mirror/Autotune/Duell — siehe Kapitel 11.
+> Welle 14–17 (s63–s71, s76b/c, s78–s85): Subqueries/TLS/Raft-Timer/Par-Scan,
+> Executor-Streaming/Pushdown, MVCC-Fast-Path, Scan-Replika, ANN-Autotune,
+> Mirror-Batching, Prodsim/pg_stat/DiskANN-Build/TPC-H-Rematch/SCRAM — siehe Kapitel 12.
 
 ## 1. Schichtenmodell
 
@@ -720,3 +723,262 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
 - Vektor-Groß: `N>=50k` `prefer_ivf_over_hnsw` + `IvfPqIndex::autotune(N)`
   (`include/dbengine/vector/quant.h:255-258,166-168`); HNSW klein mit
   Default-`ef` (Autotune, keine Flags nötig).
+
+## 12. Welle 14–17 (s63–s71, s76b/c, s78–s85, alle STL/POSIX-only ausser TLS/SCRAM-Opt-in)
+
+### 12.1 Subqueries — IN + skalar, unkorreliert (`sql/parser.h`, `src/sql/parser.cpp`)
+
+- `IN (SELECT ...)` + skalare Vergleiche `=/<>/</<=/>/>= (SELECT ...)`
+  (`include/dbengine/sql/parser.h:106-121`: `Condition::subquery`,
+  genau 1 Spalte; skalar genau 1 Spalte + 0/1 Zeilen, sonst `SqlError`).
+- Nur unkorreliert: äussere Refs in Subquery → `SqlError (Korrelierte
+  Subquery wird nicht unterstuetzt)` (`src/sql/parser.cpp:2295`);
+  Tiefe max 8 (`kMaxSubqueryDepth`, `src/sql/parser.cpp:1113-1114,1168-1169,3129-3130`).
+- Ausführung: Subquery EINMAL im aufrufenden Snapshot (`src/sql/parser.cpp:2194`,
+  `src/sql/executor.cpp:1992,1409`), danach `evalCondition/evalJoinCondition`
+  via Memo-Map (`src/sql/parser.cpp:2344-2397`); ohne Kontext →
+  `SqlError (Subquery ohne Ausfuehrungskontext)` (`src/sql/parser.cpp:1282-1283,2023-2024`).
+
+### 12.2 TLS nativ — Default N, optional S (`server/pgserver.h`, `src/server/pgserver.cpp`)
+
+- Default ohne `DBENGINE_WITH_TLS` oder ohne `setTlsCert`: `SSLRequest →
+  'N'` (Klartext-Fallback, danach normaler Startup-Flow auf gleichem fd)
+  (`include/dbengine/server/pgserver.h:17-20`).
+- Opt-in mit `-DDBENGINE_WITH_TLS=ON` + gefundenem OpenSSL +
+  `setTlsCert(key,cert)`: `SSLRequest → 'S'` + `SSL_accept` auf gleichem fd,
+  danach Startup/Auth über TLS (`include/dbengine/server/pgserver.h:21-23,92-99`).
+- Ohne Define ist `setTlsCert` No-Op (nur Pfade gespeichert), immer `N`-Pfad,
+  STL-only, keine OpenSSL-Abhängigkeit. Sidecar-Modell Kap. 9.10 bleibt gültig.
+
+### 12.3 SCRAM-SHA-256 — opt-in, Default Trust-All (`server/pgserver.h`, `src/server/pgserver.cpp`)
+
+- Opt-in via `setScram(true)`, Default `false` = exakt heutiges R3-Verhalten
+  (`include/dbengine/server/pgserver.h:62-64,118-123`).
+- Pfad nur wenn `required + scramEnabled + User-Eintrag "scram:..."`:
+  `R(10 AuthenticationSASL 'SCRAM-SHA-256') → Client-First → R(11 Server-First
+  r=combined,s=salt-b64,i=iter) → Client-Final (proof) → OK: R(12 v=serverSig)+R(0)+Z`,
+  sonst `E FATAL 28P01` + close (`include/dbengine/server/pgserver.h:64-81`,
+  `src/server/pgserver.cpp:1300-1480`).
+- Format `scram:<salt-b64>:<iter>:<storedkey-b64>[:<serverkey-b64>]`
+  (`src/server/pgserver.cpp:306-345`); ohne 4. Feld Server-Signatur mit
+  StoredKey (dokumentierte Abweichung); Klartext-Eintrag/unbekannter User =
+  Legacy-R3-Pfad. Krypto nur via OpenSSL (EVP/HMAC) hinter
+  `DBENGINE_WITH_TLS`; ohne Define SCRAM-Verweigerung `28P01` ohne R10/R3,
+  keine eigene Crypto-Implementierung, Base64 STL-only
+  (`include/dbengine/server/pgserver.h:82-87`, `src/server/pgserver.cpp:514-570,1478-1480`).
+
+### 12.4 Raft-Timer — Fake-Clock, Opt-in Auto (`raft/shard.h`, `src/raft/shard.cpp`)
+
+- `tick(now_ms)` ersetzt im Auto-Modus manuelles `killLeader/failover`
+  (`include/dbengine/raft/shard.h:9-12,115-134`): Leader lebend → Heartbeats
+  (`last_heartbeat` aller Lebenden = now, kein Log-Eintrag); Follower ohne
+  Heartbeat nach Timeout → Candidate (`term++`, Mehrheit), Heartbeats resync.
+- Zustand volatil, keine Persistenz: `last_heartbeat_ms`,
+  `election_timeout_ms` je Knoten deterministisch 150–300 ms aus
+  Node-Id-Hash, kein RNG (`include/dbengine/raft/shard.h:53-57`,
+  `src/raft/shard.cpp:498-514`).
+- Default `auto_election_ = false` (Bestand manuell grün);
+  `enable_auto_election(now_ms)` setzt alle `last_heartbeat = now`
+  (`include/dbengine/raft/shard.h:209`, `src/raft/shard.cpp:507-525`);
+  `tick` ohne Auto → `leader_id_` unverändert (`src/raft/shard.cpp:546-583`).
+
+### 12.5 Paralleler Columnar-Scan (`columnar/store.h`, `src/columnar/store.cpp`)
+
+- `ScanSumLessThanParallel(threshold, n_threads=0)`; `0 → hardware_concurrency`
+  (0→4-Fallback), `1 → Single-Pfad` (`include/dbengine/columnar/store.h:184-191`,
+  `src/columnar/store.cpp:602-621`).
+- Ein Thread pro sealed Part (immutable, kein Lock) + aktiver Part im
+  Caller-Thread, Teilsummen via Futures, deterministisch in Part-Reihenfolge
+  kombiniert (sealed 0..N-1, dann aktiv); Fallback `n_threads<=1` oder
+  `Scan-Units<=1 → ScanSumLessThan` byte-identisch.
+
+### 12.6 Executor-Streaming + Projektions-Pushdown (s68, `src/sql/executor.cpp`)
+
+- Streaming ohne Temp-Database: jede Tabelle genau einmal dekodiert, per Move
+  in Snapshot-Tabellen, danach Filter/Projektion/JOIN/GROUP BY/ORDER BY/
+  Aggregation/Subqueries in genau einem Durchlauf (`src/sql/executor.cpp:1924-1930`).
+- Pushdown-Bedarfsanalyse `computeNeeded` (`src/sql/executor.cpp:266-274`):
+  `need[tnorm][i]` aus Projektion/WHERE/GROUP BY/ORDER BY/JOIN-ON/
+  Aggregat-Args inkl. genesteter Subqueries; nur benötigte Spalten via
+  `decodeRowSelected`; unbekannt/ambiguous → konservativ alles (kostet nur
+  Performance, nie Korrektheit); Fallback `need.clear()` = voll dekodieren
+  (`src/sql/executor.cpp:1944-1949`).
+
+### 12.7 MVCC-Fast-Path, semantikerhaltend (s69, `txn/mvcc.h`, `src/txn/mvcc.cpp`)
+
+- (a) Single-Version-Shortcut (`src/txn/mvcc.cpp:121-139`,
+  `include/dbengine/txn/mvcc.h:91-97,102-113`): `chain.size()==1 &&
+  trx_end==kInfTs && kein fremder Writer` → direkter `IsVisible(v,snap)`-Check
+  (derselbe Funktionsaufruf wie Schleife), Tombstone-Map; Guards wählen nur
+  Pfad, Fallback = Alt-Schleife; Purge fasst Länge-1-Ketten nie an.
+- (b) Allokationsfreiheit (`include/dbengine/txn/mvcc.h:65-70,98-101`,
+  `src/txn/mvcc.cpp:103-118`): transparenter `less<>`-Komparator
+  (`write_set` + `chains_`), heterogener `find(string_view)` ohne
+  temporären `string`, Skip des `write_set`-Lookups bei leerem Puffer
+  (Normalfall Read-Only); einzige Allokation = owning Resultat-Kopie.
+
+### 12.8 HTAP Scan-Replika (s70, `columnar/store.h`, `sql/executor.h`)
+
+- Row-TS-Vektor statt Part-pro-Commit (`include/dbengine/columnar/store.h:214-227`):
+  `ReplicaRow{key, enc, begin_ts, end_ts=INF}`, Sichtbarkeit
+  `begin_ts <= S && S < end_ts` (identisch `txn::IsVisible`);
+  `ReplicaAppend` (Upsert: live schliessen + neu anhängen),
+  `ReplicaErase` (Tombstone), `ReplicaClear` (DROP);
+  Store-Prune via `replica_min/max_begin` (`include/dbengine/columnar/store.h:228-251`).
+- Executor: genau EIN MVCC-Snapshot (`rtxn` → `snapTs`), sichtbare Rows aus
+  Replika statt KV-Prefix-Scan + MVCC-Read je Zeile; KV/MVCC bleibt
+  Write-Truth (`src/sql/executor.cpp:1919-1922`,
+  `include/dbengine/sql/executor.h:127-135`); in-memory only, Wiederaufbau via
+  WAL-Replay, Legacy-Parts/Zonemaps/COL1/COL2 unberührt.
+
+### 12.9 ANN-Autotune + 100k-Recall + DiskANN (s71/s79/s83, `vector/hnsw.h`, `vector/quant.h`)
+
+- HNSW-`auto_ef` Default (`include/dbengine/vector/hnsw.h:150-167`,
+  `src/vector/hnsw.cpp:249-265`): `ef_auto=ceil(k*sqrt(N)/10)`,
+  effektiv `min(max(max(ef_default,k),ef_auto),1024,N)`; `ef<=0` → Autotune
+  (`include/dbengine/vector/hnsw.h:215-219`); explizites `ef>0` gewinnt immer.
+- Filter-`autotune_ef(_for_filter)` (`include/dbengine/vector/quant.h:348-360`,
+  `src/vector/quant.cpp:777-801`): `ceil(k/sel*2.0)`, sel `[1e-4,1.0]`,
+  `[max(k,32),1024]`, Cap `n`.
+- IVF-Gross-Pfad (`include/dbengine/vector/quant.h:332-346`):
+  `prefer_ivf_over_hnsw(n) = n>=50k` (`kHnswToIvfThreshold`),
+  `IvfPqIndex::autotune(N)`: `nlist~=4*sqrt(N)`, `nprobe~=nlist/8`.
+- 100k-Kollaps als Begründung fix dokumentiert
+  (`include/dbengine/vector/quant.h:333-337`,
+  `include/dbengine/vector/hnsw.h:153-163`): fixer ef uniform k=10
+  `0,94@2k → 0,78@8k → 0,34@100k`; Erwartung Autotune
+  `2k→ef~45 Recall~0,94+`, `8k→ef~90 Recall~0,9`, `100k→ef~317 Recall>=0,8`
+  bei ~10x Beam-Latenz.
+- DiskANN-Lite (`include/dbengine/vector/quant.h:250-289`): 4 Files
+  (`prefix.hdr/.vec/.pq/.graph`, `DBEANN1`), PQ-RAM + ADC-Beam + exakter
+  Re-Rank via `DiskSpill`; Graph-Hybrid `N<=kExactThreshold=16000` exakt
+  O(N²) (Recall-Maximum), darüber HNSW-ANN
+  (`M=16`, `efConstruction=max(64,2*m_graph)`,
+  `ef_search=max(8*(M+1),256,auto_ef)`); gemessen exakt `5k=0,6s` vs. ANN
+  `2,3s`, `10k exakt~2,4s` vs. ANN `5,7s` (Crossover ~15–20k)
+  (`include/dbengine/vector/quant.h:267-268`).
+
+### 12.10 Mirror-Batching + Pager-Batch (s76b/c, `sql/executor.h`, `src/sql/executor.cpp`)
+
+- Batch-Protokoll (`include/dbengine/sql/executor.h:173-184`,
+  `src/sql/executor.cpp:936-938`): Mirror-Flush (B-Tree-Voll-Rewrite, teuer)
+  nur alle `mirror_interval_` Statements (Default 1000, `setMirrorInterval`,
+  `0→1`); Watermark `mirror_lsn` rückt nur mit Flush vor; dazwischen
+  `syncMirrorBatch` O(Batch) ohne WAL-Re-Read
+  (`include/dbengine/sql/executor.h:154-156`).
+- `mirrorCheckpoint()` = Flush + Watermark=`durable`, nie werfend
+  (`src/sql/executor.cpp:808-831`); `main` ruft bei sauberem Exit
+  (`src/main.cpp:262,391`); Detail in `docs/PHASE0-DUELL.md:228-244`:
+  10k Insert `0,14 s` (statt ~86 s Flush-pro-Statement), 1M Insert `60 s`
+  (gleichauf SQLite 75 s), Restart+SUM 1M weiter `6,5 s` (RAM-Rebuild bleibt O(n)).
+- `Pager::insert_batch` (`src/storage/pager.cpp:312`): ein Image-Rewrite pro
+  Flush statt einem pro Knoten; `BTreeKV::Persist` nutzt ihn
+  (`src/kv/btree.cpp:788`).
+
+### 12.11 Prodsim A–H + Cluster-Tool (s81, `raft/shard.h`, `docs/PRODSIM.md`)
+
+- Matrix in-process RF=3: `isolate/heal/isolate_from_all/heal_all/
+  set_drop_rate/can_send`, Default fully meshed, Drop-PRNG Seed 42,
+  `alive` (Crash) ≠ Partition (Cut)
+  (`include/dbengine/raft/shard.h:14-19,100-113`, `docs/PRODSIM.md:11,15`).
+- Szenarien `tests/test_prodsim.cpp` A–H (`docs/PRODSIM.md:37`): A
+  Majority-Commit, B Split-Brain, C 1+1+1, D Log-Persistenz, E HLC-Skew,
+  F Drop, G Catch-up, H Linearisierbarkeitsskizze (nur `append()!=0`-Acks).
+- Cluster-Tool `tools/prodsim_cluster.cpp`: drei `TcpLoopbackPair` auf
+  127.0.0.1 + `fork()`-Roundtrip, Partition = `close(fd)`, Heal = reconnect,
+  Wire = `EncodeEntryWire/SendWire/RecvWire` (`docs/PRODSIM.md:12`);
+  kein Raft-over-TCP, keine zweite Consensus-Implementierung; Non-Goals
+  (kein k8s-HA, kein Jepsen, `replicas: 1`) in `docs/PRODSIM.md:39-44`.
+
+### 12.12 pg_stat_statements-light (s82, `sql/executor.h`, `src/server/metrics.cpp`)
+
+- Session-lokal, keine Persistenz: pro normalisiertem Query-Text
+  (Literale→`?`, Whitespace kollabiert) `calls/total_ms/rows_out/errors`
+  (`include/dbengine/sql/executor.h:45-60`); Einstieg `execute()`,
+  `normalizeQuery`, `queryStats(top_n=5)` nach `total_ms`,
+  `clearQueryStats` (`include/dbengine/sql/executor.h:72-77`).
+- Export Top-5 via `SetPgStats/GetPgStats/RenderPgStats`
+  (`src/server/metrics.cpp:104-120,144-178`):
+  `dbengine_pgstat_calls_total/time_ms/rows/errors_total{query="<norm>"}`;
+  leer → byte-identische Metrics-Ausgabe; Overhead nur Map+chrono im
+  Execute-Pfad, `render()` O(Top-5).
+
+### 12.13 TPC-H-Rematch 1M + Duell-Stand (s75/s77/s84, `docs/*.md`, `tools/bench.cpp`)
+
+- TPC-H-Harness `tools/bench.cpp:331-416` (Seed 42, batched INSERTs à 500):
+  Q6 `SUM(price*disc)` 5x AND/Range (`bench.cpp:419-461`), Q1-Kern Hash-Agg
+  `GROUP BY rf,ls` (`bench.cpp:463-466`).
+- Rematch `docs/TPC-H-REMATCH.md:45-56` (1M, je 2 Läufe à 5 Reps, p95/Scan,
+  tmpfs): Q6 dbengine `1094,39/1051,34 ms` vs. SQLite `~75/74 ms` vs. DuckDB
+  `~3,1/3,3 ms` (~14x/~340x); Q1 dbengine `1920,90/1974,27 ms` vs. SQLite
+  `~888/886 ms` vs. DuckDB `~4,0/4,2 ms` (~2,2x/~480x); Korrektheit
+  Q6-Summe `1783190,382600` überall, Q1 6 Gruppen/`counted=1000000`;
+  Urteil: kein belegbarer Replika-vorher/nachher (Pre-1M undokumentiert),
+  Q1-Nähe zu SQLite plausibel Replika-Effekt, Q6/DuckDB-Abstand bleibt.
+- Persistenz-Duell `docs/PHASE0-DUELL.md:63-91` (1M, Batch=1, tmpfs):
+  Insert dbengine `6,681/6,705 s` vs. SQLite `75,086/75,460 s` (~11x);
+  Restart+Scan dbengine `~6,1–6,3 s` vs. SQLite `~0,05 s` (~130x);
+  Bytes `41 KB` Container + `53,7 MB` WAL vs. `14,3 MB` SQLite-DB.
+- Re-Duell mit Spiegel `docs/PHASE0-DUELL.md:144-201,236-244`: 1M/100k mit
+  Flush-pro-Statement ABBRUCH (~250/~183 Rows/s, superlinear), 10k `6,5 s`
+  (~117x); nach s76b/c 10k `0,14 s`, 1M `60 s` / Restart `6,5 s` (WAL-Parsing
+  gespart, RAM-Rebuild O(n) bleibt; echte Heilung = Lese-Pfad auf B-Tree).
+
+### 12.14 B-Tree-KV + CLI (s73/s74, `kv/btree.*`, `src/main.cpp`)
+
+- BTreeKV Fanout 64 (`t=32`), Split-beim-Abstieg/Merge/Borrow/Shrink,
+  Shadow-Paging/CoW (Superblock unter Pager-Key 0, ein `insert`/`insert_batch`
+  → atomar), `WriteBatch` alles-oder-nichts
+  (`include/dbengine/kv/btree.h:21-50`, `src/kv/btree.cpp:500-663,776-793`).
+- LoadAll-Loch-Fix (`src/kv/btree.cpp:701-774`): fehlender Pager-Record =
+  freigegebene/nie persistierte ID → `continue`, bleibt frei
+  (`src/kv/btree.cpp:729-734`); danach Erreichbarkeit ab Wurzel +
+  `reachable_keys==count` (`src/kv/btree.cpp:745-761`), Waisen-GC
+  (`src/kv/btree.cpp:766-772`).
+- CLI `prog <db> [--exec][--sql]...`, sonst REPL (`src/main.cpp:24-35`);
+  `--help`-ehrlich: `<db>` nur Container, Rows in `<db>.wal`,
+  `<db>.btree`-Spiegel tolerant (`src/main.cpp:39-55,350-380`).
+
+### 12.15 Stale-Korrekturen zu Kap. 9/10/11 (mit Code-Beleg Datei:Zeile)
+
+- Kap. 9.10 „Kein eigenes TLS im Server" → korrekt: nativ opt-in,
+  Default `N`, mit Zert `S`
+  (Beleg: `include/dbengine/server/pgserver.h:17-23,92-99`).
+- Kap. 9.4 „Kein Hashing/SASL" → korrekt: SCRAM-SHA-256 opt-in
+  (R10/R11/R12), Default aus, Krypto nur mit `DBENGINE_WITH_TLS`
+  (Beleg: `include/dbengine/server/pgserver.h:62-87`,
+  `src/server/pgserver.cpp:1300-1480`).
+- Kap. 10.1 „nur JOIN, keine Subqueries" → korrekt: `IN`/skalare
+  unkorrelierte Subqueries (Tiefe ≤8) vorhanden
+  (Beleg: `include/dbengine/sql/parser.h:106-121`,
+  `src/sql/parser.cpp:1112-1182,2295`).
+- Kap. 4/9.7 „manuelles Failover, kein Timer" → korrekt: Fake-Clock
+  `tick` + Opt-in-Auto daneben, Default manuell
+  (Beleg: `include/dbengine/raft/shard.h:9-12,115-134`,
+  `src/raft/shard.cpp:546-583`).
+- Kap. 11.4 „Mirror-Flush pro Statement" → korrekt: Batch alle 1000 +
+  Exit-Checkpoint, Watermark nur mit Flush
+  (Beleg: `include/dbengine/sql/executor.h:173-184`,
+  `src/sql/executor.cpp:808-831,936-938`).
+- Kap. 11.5/9.8 „fixer ef / IVF unverdrahtet" → korrekt: `search ef<=0` =
+  `auto_ef`, Gross-Pfad `>=50k` IVF, DiskANN-Schwelle `16000`
+  (Beleg: `include/dbengine/vector/hnsw.h:150-167,215-219`,
+  `include/dbengine/vector/quant.h:289,343-346`).
+- Kap. 11.6 „Duell-Stand 6,7 s / 6,2 s" → ergänzt: Re-Duell-Abbruch +
+  s76b/c-Messung + TPC-H-Rematch-Zahlen (keine Extrapolation)
+  (Beleg: `docs/PHASE0-DUELL.md:228-244`,
+  `docs/TPC-H-REMATCH.md:45-56`).
+
+### 12.16 Runbook-Ops (Welle 14–17)
+
+- Prodsim: `./build/test_prodsim`, `./build/prodsim_cluster`
+  (`docs/PRODSIM.md:17-27`, sleep-frei via `tick`).
+- TPC-H: `./build/dbbench --tpch 1000000` (kReps=5, CSV `tpch_q1/tpch_q6`,
+  Summen/Hash nach stderr, `tools/bench.cpp:331-363`).
+- pg_stat: `ex.queryStats(5)` → `SetPgStats` → `/metrics`
+  (`src/server/metrics.cpp:104-120`); Restart = leer.
+- Mirror: Intervall via `setMirrorInterval(n)` (Default 1000),
+  sauberer Exit via `mirrorCheckpoint()` (`src/main.cpp:262,391`);
+  `.btree.tmp`-Rest nach Kill → Voll-Replay (Heilung ausstehend).
+- Vektor-Gross: `N>=50k` IVF (`prefer_ivf_over_hnsw`), DiskANN-Build
+  `<=16000` exakt / darüber ANN (`DiskAnnIndex::build`).

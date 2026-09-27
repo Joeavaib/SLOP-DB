@@ -106,7 +106,8 @@ struct SelectStmt;  // forward fuer Condition::subquery
 inline constexpr int kMaxSubqueryDepth = 8;
 
 struct Condition {
-  std::string column;  // "c" oder qualifiziert "t.c" (JOIN)
+  std::string column;  // "c" oder qualifiziert "t.c" (JOIN); "" = Konstante
+                       // (nur POLICY USING mit current_user auf LHS ohne Spalte)
   std::string op;  // "=", "<>", "<", "<=", ">", ">=", "LIKE", "ILIKE",
                    // "NOT LIKE", "NOT ILIKE", "IS NULL", "IS NOT NULL",
                    // "BETWEEN", "NOT BETWEEN", "IN", "NOT IN"
@@ -119,6 +120,18 @@ struct Condition {
   // - Vergleichs-Op (=,<>,<,<=,>,>=) + subquery = Skalar (genau 1 Spalte,
   //   0 Zeilen -> NULL, >1 Zeile -> SqlError).
   std::shared_ptr<SelectStmt> subquery;
+  // RLS (CREATE POLICY ... USING): current_user/current_role/session_user als
+  // dynamischer Vergleich gegen die aktuelle Rolle (s. CreatePolicyStmt).
+  // value_is_current/second_is_current: jeweiliger Vergleichswert ist die
+  // aktuelle Rolle (statt value/second). list_is_current[i] parallel zu list.
+  // lhs_is_current: USING der Form "current_user OP literal/[Liste]"
+  // (spaltenlose Konstante, column leer). Spaltentausch
+  // ("current_user OP col") wird beim Parsen normalisiert (column=col,
+  // value_is_current=true, ggf. op invertiert), daher kein Extra-Flag.
+  bool value_is_current = false;
+  bool second_is_current = false;
+  std::vector<char> list_is_current;  // parallel zu list (1 = current_user)
+  bool lhs_is_current = false;  // spaltenlose Konstante (column leer)
 };
 
 // UPDATE t SET c=v [, ...] [WHERE ...]: SET-Spalten sind unquoted
@@ -165,6 +178,27 @@ struct RevokeStmt {
 struct SetRoleStmt {
   std::string role;  // "" bei reset
   bool reset = false;
+};
+
+// RLS: CREATE POLICY name ON t [FOR SELECT|INSERT|UPDATE|DELETE|ALL] [TO r]
+// USING (cond). cond = WHERE-DNF ueber Zeilenwerte; statt Literal darf
+// current_user/current_role/session_user stehen (dynamisch = aktuelle Rolle).
+// command upper-kanonisch ("SELECT"/"INSERT"/"UPDATE"/"DELETE"/"ALL",
+// Default "ALL"). role wie GrantStmt::role ("*" = alle Rollen, wenn TO fehlt).
+// where/where_groups: USING-DNF (where bei AND, where_groups bei OR).
+struct CreatePolicyStmt {
+  std::string policy;
+  std::string table;
+  std::string command = "ALL";
+  std::string role = "*";
+  std::vector<Condition> where;
+  std::vector<std::vector<Condition>> where_groups;
+};
+
+// ALTER TABLE t ENABLE|DISABLE ROW LEVEL SECURITY (RLS-Schalter, Default aus).
+struct AlterTableRlsStmt {
+  std::string table;
+  bool enable = false;
 };
 
 // Arithmetischer Ausdruck als Aggregat-Argument (Q6): Spalte | Literal |
@@ -257,7 +291,8 @@ struct SelectStmt {
 
 using Statement = std::variant<CreateTableStmt, InsertStmt, SelectStmt,
                                    UpdateStmt, DeleteStmt, DropTableStmt,
-                                   GrantStmt, RevokeStmt, SetRoleStmt>;
+                                   GrantStmt, RevokeStmt, SetRoleStmt,
+                                   CreatePolicyStmt, AlterTableRlsStmt>;
 
 struct Result {
   std::vector<std::string> columns;
@@ -302,9 +337,11 @@ class Database {
   Result execUpdate(const UpdateStmt& s);
   Result execDelete(const DeleteStmt& s);
   Result execDrop(const DropTableStmt& s);
-  Result execGrant(const GrantStmt& s);
-  Result execRevoke(const RevokeStmt& s);
-  Result execSetRole(const SetRoleStmt& s);
+   Result execGrant(const GrantStmt& s);
+   Result execRevoke(const RevokeStmt& s);
+   Result execSetRole(const SetRoleStmt& s);
+   Result execCreatePolicy(const CreatePolicyStmt& s);
+   Result execAlterRls(const AlterTableRlsStmt& s);
 
   // RBAC: aktuelle Rolle ("" = Admin, Default: alles erlaubt wie bisher).
   // Input wird wie ein unquoted Identifier nach lowercase gefaltet.
@@ -314,15 +351,31 @@ class Database {
   bool hasTable(const std::string& name) const;
   const Table& getTable(const std::string& name) const;
 
+  // RLS: true wenn ENABLE ROW LEVEL SECURITY fuer norm-Tabelle aktiv.
+  // Oeffentlich, damit der KV/MVCC-Executor dieselbe USING-Semantik
+  // (inkl. LIKE/current_user) via Temp-Database wiederverwenden kann.
+  bool rlsEnabled(const std::string& normTable) const;
+  bool rowPassesRls(const Table& t, const std::vector<Value>& row,
+                    const std::string& normTable,
+                    const std::string& op) const;
+
  private:
   // true wenn Admin ("") oder priv auf (Tabelle, Rolle) gewaehrt.
   bool hasPriv(const std::string& table, const std::string& priv) const;
   void requirePriv(const std::string& table, const std::string& priv) const;
   void requireAdmin(const std::string& what) const;
+  // Eine USING-Bedingung gegen (row, aktuelle Rolle) auswerten
+  // (current_user-Dynamik aufgeloest, sonst WHERE-Semantik).
+  bool evalPolicyCond(const Table& t, const std::vector<Value>& row,
+                      const Condition& c) const;
   std::map<std::string, Table> tables_;
   std::string role_;  // lower-gefoldet, "" = Admin
   // norm-Tabelle -> norm-Rolle -> Privilegien (upper).
   std::map<std::string, std::map<std::string, std::set<std::string>>> grants_;
+  // RLS-Registry: norm-Tabelle -> Policies (Namen eindeutig je Tabelle);
+  // rls_on_: norm-Tabellen mit ENABLE ROW LEVEL SECURITY (Default: aus).
+  std::map<std::string, std::vector<CreatePolicyStmt>> policies_;
+  std::unordered_set<std::string> rls_on_;
 };
 
 Statement parseStatement(const std::string& sql);

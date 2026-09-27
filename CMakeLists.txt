@@ -77,10 +77,43 @@ target_include_directories(test_hybrid PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 
 add_test(NAME hybrid COMMAND test_hybrid)
 
+# TLS opt-in (Default AUS, ohne OpenSSL): -DDBENGINE_WITH_TLS=ON schaltet bei
+# gefundenem OpenSSL den 'S'-Pfad + SSL_accept in pgserver sowie AES-GCM in
+# dbengine_wal frei; sonst bleiben PG-konforme Fallbacks (STL-only, kein Link).
+# Muss VOR allen Targets mit TLS-Bedarf stehen (dbengine_wal, pgserver).
+find_package(OpenSSL QUIET)
+# TLS/at-rest-Crypto nur mit NUTZBAREM OpenSSL (Libs + Header + Link).
+# Manche Toolchains finden Libs, deren Header der Compiler nicht sieht —
+# dann entscheidet try_compile (kein halb-gebrochener Build).
+include(CheckCXXSourceCompiles)
+set(DBENGINE_TLS_OK OFF)
+if(DBENGINE_WITH_TLS)
+  if(OpenSSL_FOUND)
+    set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
+    set(CMAKE_REQUIRED_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+    check_cxx_source_compiles(
+      "#include <openssl/ssl.h>
+       #include <openssl/evp.h>
+       int main() { SSL_library_init(); return (int)EVP_MAX_KEY_LENGTH; }"
+      DBENGINE_OPENSSL_USABLE)
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+  endif()
+  if(DBENGINE_OPENSSL_USABLE)
+    set(DBENGINE_TLS_OK ON)
+  else()
+    message(WARNING "DBENGINE_WITH_TLS=ON aber OpenSSL unvollstaendig/nicht nutzbar; TLS bleibt inaktiv")
+  endif()
+endif()
+
 # s03-wal: REDO-Log + Checkpoint + Recovery (Crash-Safety via flush/fsync)
 add_library(dbengine_wal STATIC src/storage/wal.cpp)
 target_include_directories(dbengine_wal PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(dbengine_wal PRIVATE -Wall -Wextra -Wpedantic)
+if(DBENGINE_TLS_OK)
+  target_compile_definitions(dbengine_wal PUBLIC DBENGINE_WITH_TLS)
+  target_link_libraries(dbengine_wal PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 add_executable(test_wal tests/test_wal.cpp)
 target_link_libraries(test_wal PRIVATE dbengine_wal)
@@ -154,6 +187,10 @@ add_library(pgserver STATIC src/server/pgserver.cpp)
 target_include_directories(pgserver PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(pgserver PUBLIC sql executor dbengine_mvcc dbengine_kv dbengine_wal)
 target_compile_options(pgserver PRIVATE -Wall -Wextra -Wpedantic)
+if(DBENGINE_TLS_OK)
+  target_compile_definitions(pgserver PUBLIC DBENGINE_WITH_TLS)
+  target_link_libraries(pgserver PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()
 
 add_executable(test_pgserver tests/test_pgserver.cpp)
 target_link_libraries(test_pgserver PRIVATE pgserver)
@@ -161,21 +198,6 @@ target_include_directories(test_pgserver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inc
 target_compile_options(test_pgserver PRIVATE -Wall -Wextra -Wpedantic)
 
 add_test(NAME pgserver COMMAND test_pgserver)
-
-# TLS opt-in (Default AUS, ohne OpenSSL): -DDBENGINE_WITH_TLS=ON schaltet bei
-# gefundenem OpenSSL den 'S'-Pfad + SSL_accept in pgserver frei; sonst bleibt
-# der PG-konforme 'N'-Fallback (STL-only, kein Link).
-find_package(OpenSSL QUIET)
-# TLS nur mit VOLLSTAENDIGEM OpenSSL (Libs + Header; manche Toolchains liefern
-# nur Libs — dann bleibt TLS sauber inaktiv statt halb-gebrochenem Build).
-if(DBENGINE_WITH_TLS)
-  if(OpenSSL_FOUND AND EXISTS "${OPENSSL_INCLUDE_DIR}/openssl/ssl.h")
-    target_compile_definitions(pgserver PUBLIC DBENGINE_WITH_TLS)
-    target_link_libraries(pgserver PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-  else()
-    message(WARNING "DBENGINE_WITH_TLS=ON aber OpenSSL unvollstaendig/nicht gefunden; TLS bleibt inaktiv")
-  endif()
-endif()
 
 # s14-clock: TSO/HLC + Commit-Wait + monoton Snapshots
 add_library(dbengine_clock STATIC src/txn/clock.cpp)
@@ -305,3 +327,9 @@ target_include_directories(test_btree PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_compile_options(test_btree PRIVATE -Wall -Wextra -Wpedantic)
 
 add_test(NAME btreekv COMMAND test_btree)
+
+# resp: RESP2-Protokoll ueber TCP (127.0.0.1 ephemeral) + dbresp --selfcheck/--port
+add_executable(dbresp src/server/resp.cpp)
+target_include_directories(dbresp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(dbresp PRIVATE dbengine_kv)
+target_compile_options(dbresp PRIVATE -Wall -Wextra -Wpedantic)

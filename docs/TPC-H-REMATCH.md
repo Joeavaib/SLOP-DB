@@ -84,3 +84,106 @@ SQLite 0,83/0,82 s (47,7 MB DB), DuckDB ~357/359 s
    Empfehlung: Baseline mit abgeschalteter Replika (`replica_`-Pfad
    umgehen) auf 1M nachholen — dann ist vorher/nachher eine Zahl
    statt einer Lücke.
+
+---
+
+## Rematch 2026-09-27 (UTC) nach Scan-Replika — N=100000 + N=1000000, je 2 Läufe
+
+Datum: 2026-09-27 (UTC). Nur diese Datei angehängt, Bestand unverändert.
+Kein cmake/ctest/build; `./build/dbbench` wie es lag.
+
+Exakte Queries/Generator aus `tools/bench.cpp` `RunTpch` (keine Abwandlung):
+Q6 = `SELECT SUM(price*disc) ... WHERE disc BETWEEN 0.05 AND 0.07 AND qty < 24
+AND price >= 500.0 AND price < 5000.0 AND tax <= 0.05
+AND shipdate BETWEEN 19940101 AND 19951231` (bench.cpp:420-423);
+Q1-Kern = `SELECT rf, ls, SUM(qty), SUM(price), SUM(price*disc), AVG(disc),
+COUNT(*) ... GROUP BY rf, ls ORDER BY rf, ls` (bench.cpp:464-466).
+Generator bench.cpp:374-412: `std::mt19937 rng(42u)`, je Row
+`qty(1,50)`, `price_cents(1000,1000000)/100`, `disc_pct(0,10)/100`,
+`tax_pct(0,8)/100`, `rf(0,2)`, `ls(0,1)`, `yr(1992,1998)`, `mo(1,12)`,
+`da(1,28)`, libstdc++-Lemire-`uniform_int_distribution` (conda-GCC 16.2).
+
+Methodik: `./build/dbbench --tpch 100000` (2 Läufe, total ~2,08 s) →
+Hochrechnung ~21 s für 1M < 10 min → `./build/dbbench --tpch 1000000`
+ehrlich gemessen, 2 Läufe (total 22,225 s / 22,460 s; je Query kReps=5,
+p95/Scan). SQLite stdlib 3.51.2 + DuckDB 1.5.5: Python-Replikation
+MT19937(42)+Lemire, byte-identisch verifiziert über dbbench-Referenzsummen
+(100k: py 180650,160300 = dbbench ref; 1M: py 1783190,382600 = dbbench ref;
+1k: 782,775000 wie s84). Semantisch identische Queries oben, je 2 Läufe
+à 5 Reps (p95/Scan, throughput=rows*5/total wie dbbench). SQLite Datei-DB
+/tmp, 1 Transaktion, executemany, Default-Pragmas. DuckDB Datei-DB /tmp,
+executemany. Artefakte danach gelöscht.
+
+### dbengine (./build/dbbench --tpch N)
+
+- N=100000 Lauf1: Q6 sum=180650,160300 ref=gleich hash=c5703609095017c7
+  thr=979904,8 rows/s p95=102,9247 ms; Q1 groups=6 counted=100000
+  hash=4625bd4e25bdc907 thr=605825,1 p95=163,4316 ms.
+- N=100000 Lauf2: Q6 thr=983122,4 p95=104,4496 ms (sum/hash gleich);
+  Q1 thr=619903,9 p95=154,3886 ms (groups/counted/hash gleich).
+- N=1000000 Lauf A: Q6 sum=1783190,382600 ref=gleich hash=f0bd39a16c88de01
+  thr=975500,2 p95=1034,6679 ms; Q1 groups=6 counted=1000000
+  hash=f02f69cd1e273cb0 thr=544485,5 p95=1768,7437 ms.
+- N=1000000 Lauf B: Q6 thr=988745,0 p95=1015,3886 ms (sum/hash gleich);
+  Q1 thr=526077,3 p95=1847,5373 ms (groups/counted/hash gleich).
+
+### Konkurrenz, gleiche Daten/Queries
+
+- N=100000 SQLite: Q6 L1 thr=14438292,8 p95=6,91 ms / L2 thr=13636266,4
+  p95=7,63 ms, Summe 180650,16030000002; Q1 L1 thr=1475874,6 p95=69,27 ms
+  / L2 thr=1502157,7 p95=66,60 ms, 6 Gruppen, counted=100000.
+- N=100000 DuckDB (build 36,1 s executemany-Artefakt): Q6 L1
+  thr=37580543,5 p95=2,00 ms / L2 thr=66732465,0 p95=1,56 ms;
+  Q1 L1 thr=31115894,4 p95=3,38 ms / L2 thr=33726815,1 p95=3,20 ms.
+- N=1000000 SQLite (build 0,82 s): Q6 L1 thr=13835818,2 p95=72,50 ms /
+  L2 thr=13919251,7 p95=73,21 ms, Summe 1783190,3826000001;
+  Q1 L1 thr=1277629,7 p95=793,38 ms / L2 thr=1273011,8 p95=790,11 ms,
+  6 Gruppen, counted=1000000.
+- N=1000000 DuckDB (build 352,1 s executemany-Artefakt): Q6 L1
+  thr=339853836,6 p95=3,13 ms / L2 thr=355865224,5 p95=2,95 ms,
+  Summe 1783190,3826000006; Q1 L1 thr=304707282,4 p95=3,34 ms /
+  L2 thr=305632065,0 p95=3,48 ms. Q1-Gruppen SUM(qty)/COUNT exakt gleich,
+  SUM(price)-DOUBLEs bis ~1e-9 identisch.
+
+### Tabelle N=1000000 (rows/s + p95 ms/Scan)
+
+| Engine | Q6 Lauf A | Q6 Lauf B | Q1 Lauf A | Q1 Lauf B |
+| --- | --- | --- | --- | --- |
+| dbengine | 975500 rows/s / 1034,67 ms | 988745 / 1015,39 ms | 544486 / 1768,74 ms | 526077 / 1847,54 ms |
+| SQLite 3.51.2 | 13835818 / 72,50 ms | 13919252 / 73,21 ms | 1277630 / 793,38 ms | 1273012 / 790,11 ms |
+| DuckDB 1.5.5 | 339853837 / 3,13 ms | 355865225 / 2,95 ms | 304707282 / 3,34 ms | 305632065 / 3,48 ms |
+
+### Tabelle N=100000 (schnell-Probe)
+
+| Engine | Q6 L1 | Q6 L2 | Q1 L1 | Q1 L2 |
+| --- | --- | --- | --- | --- |
+| dbengine | 979905 / 102,92 ms | 983122 / 104,45 ms | 605825 / 163,43 ms | 619904 / 154,39 ms |
+| SQLite | 14438293 / 6,91 ms | 13636266 / 7,63 ms | 1475875 / 69,27 ms | 1502158 / 66,60 ms |
+| DuckDB | 37580544 / 2,00 ms | 66732465 / 1,56 ms | 31115894 / 3,38 ms | 33726815 / 3,20 ms |
+
+### Vorher/nachher s84 (1M)
+
+| Kennzahl 1M p95 | s84 (vorher, Scan-Replika) | jetzt (nachher) | Delta |
+| --- | --- | --- | --- |
+| dbengine Q6 | 1094,39 / 1051,34 ms | 1034,67 / 1015,39 ms | ~-3 bis -5% (Run-Rauschen) |
+| dbengine Q1 | 1920,90 / 1974,27 ms | 1768,74 / 1847,54 ms | ~-6 bis -8% (Run-Rauschen) |
+| SQLite Q6 | 75,34 / 73,59 ms | 72,50 / 73,21 ms | ~gleich |
+| SQLite Q1 | 887,87 / 885,63 ms | 793,38 / 790,11 ms | ~-11% (tmpfs/Version-Rauschen) |
+| DuckDB Q6 | 3,09 / 3,27 ms | 3,13 / 2,95 ms | gleich |
+| DuckDB Q1 | 4,00 / 4,19 ms | 3,34 / 3,48 ms | ~gleich |
+
+Korrektheit: Q6-Summe 1M auf allen drei Engines 1783190,382600
+(±1e-9 Summationsreihenfolge), Q1 6 Gruppen + counted=1000000 überall;
+dbengine-Hashes stabil: Q6 f0bd39a16c88de01, Q1 f02f69cd1e273cb0 (beide Läufe).
+
+### Urteil (Replika-Effekt messbar?)
+
+Nein. dbengine 1M liegt innerhalb weniger Prozent der s84-Zahlen
+(Q6 ~1015–1035 vs. 1051–1094 ms; Q1 ~1769–1848 vs. 1921–1974 ms) —
+das ist Lauf-zu-Lauf-Rauschen auf diesem Host, kein Durchbruch.
+Seitlicher Abstand unverändert: Q6 ~14× hinter SQLite, ~330× hinter
+DuckDB; Q1 ~2,3× hinter SQLite, ~530× hinter DuckDB. Skalierung 100k→1M
+nahezu linear (dbengine Q6 ×10, Q1 ×11). Der Scan-Replika-Pfad liefert
+in diesem Rematch keinen belegbaren Sprung; für einen isolierten
+vorher/nachher-Nachweis braucht es weiter die Baseline mit
+abgeschalteter Replika auf gleichem Stand.

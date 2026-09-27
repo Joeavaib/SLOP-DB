@@ -7,14 +7,20 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <random>
 #include <stdexcept>
 #include <utility>
 
 #include <sys/stat.h>
 #include <sys/uio.h>
+
+#ifdef DBENGINE_WITH_TLS
+#include <openssl/evp.h>
+#endif
 
 namespace dbengine::storage {
 namespace {
@@ -123,6 +129,143 @@ inline void write_record(int fd, const char hdr[20], const char* payload,
   writev_all(fd, iov, cnt);
 }
 
+// GCM-Record: Header(20) + Nonce(12) + Blob(Cipher+Tag). Ein writev()-Syscall,
+// selbe fsync-Policy wie plain (flush macht Dauerhaftigkeit).
+// [[maybe_unused]]: ohne DBENGINE_WITH_TLS ist der GCM-Pfad inaktiv.
+[[maybe_unused]] inline void write_record_enc(int fd, const char hdr[20],
+                             const unsigned char nonce[12], const char* blob,
+                             uint32_t blob_len) {
+  struct iovec iov[3];
+  iov[0].iov_base = const_cast<char*>(hdr);
+  iov[0].iov_len = 20;
+  iov[1].iov_base = const_cast<unsigned char*>(nonce);
+  iov[1].iov_len = 12;
+  int cnt = 2;
+  if (blob_len) {
+    iov[2].iov_base = const_cast<char*>(blob);
+    iov[2].iov_len = blob_len;
+    cnt = 3;
+  }
+  writev_all(fd, iov, cnt);
+}
+
+// Nonce pro Record: 8B LSN-LE + 4B frischer Zufalls-Salt (random_device,
+// kein OpenSSL noetig, damit Nonce-Erzeugung auch ohne TLS kompiliert;
+// Verschluesselung selbst bleibt TLS-gated).
+[[maybe_unused]] void make_nonce(uint64_t lsn, unsigned char nonce[12]) {
+  put_u64le(reinterpret_cast<char*>(nonce), lsn);
+  std::random_device rd;
+  for (int i = 8; i < 12; ++i) nonce[i] = static_cast<unsigned char>(rd() & 0xFF);
+}
+
+// AAD = magic + lsn + raw_len (16 Header-Bytes vor crc), bindet Position.
+[[maybe_unused]] void make_aad(uint32_t magic, uint64_t lsn, uint32_t raw_len,
+              unsigned char aad[16]) {
+  put_u32le(reinterpret_cast<char*>(aad), magic);
+  put_u64le(reinterpret_cast<char*>(aad) + 4, lsn);
+  put_u32le(reinterpret_cast<char*>(aad) + 12, raw_len);
+}
+
+#ifdef DBENGINE_WITH_TLS
+// AES-256-GCM via OpenSSL EVP. out = Cipher(in_len) + Tag(16).
+bool gcm_encrypt(const Wal::Key32& key, const unsigned char nonce[12],
+                 const unsigned char* aad, size_t aad_len, const char* in,
+                 size_t in_len, std::string& out) {
+  out.assign(in_len + Wal::kTagLen, '\0');
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (ctx == nullptr) return false;
+  bool ok = false;
+  int outl = 0;
+  size_t produced = 0;
+  do {
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) !=
+        1)
+      break;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN,
+                            static_cast<int>(Wal::kNonceLen),
+                            nullptr) != 1)
+      break;
+    if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce) != 1) break;
+    if (aad_len > 0 &&
+        EVP_EncryptUpdate(ctx, nullptr, &outl, aad,
+                          static_cast<int>(aad_len)) != 1)
+      break;
+    if (in_len > 0 &&
+        EVP_EncryptUpdate(ctx, reinterpret_cast<unsigned char*>(out.data()),
+                          &outl, reinterpret_cast<const unsigned char*>(in),
+                          static_cast<int>(in_len)) != 1)
+      break;
+    produced = static_cast<size_t>(outl);
+    if (produced != in_len) break;  // GCM stroemt (kein Padding/Buffering)
+    if (EVP_EncryptFinal_ex(
+            ctx, reinterpret_cast<unsigned char*>(out.data()) + produced,
+            &outl) != 1)
+      break;
+    produced += static_cast<size_t>(outl);  // GCM-Final liefert 0
+    if (produced != in_len) break;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG,
+                            static_cast<int>(Wal::kTagLen),
+                            reinterpret_cast<unsigned char*>(out.data()) +
+                                in_len) != 1)
+      break;
+    ok = true;
+  } while (false);
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok) out.clear();
+  return ok;
+}
+
+// Rueckgabe false bei Tag-Mismatch (falscher Schluessel/Tamper) oder Fehler.
+bool gcm_decrypt(const Wal::Key32& key, const unsigned char nonce[12],
+                 const unsigned char* aad, size_t aad_len, const char* blob,
+                 size_t blob_len, std::string& out_plain) {
+  if (blob_len < Wal::kTagLen) return false;
+  const size_t in_len = blob_len - Wal::kTagLen;
+  out_plain.assign(in_len, '\0');
+  EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+  if (ctx == nullptr) return false;
+  bool ok = false;
+  int outl = 0;
+  size_t produced = 0;
+  do {
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), nullptr, nullptr, nullptr) !=
+        1)
+      break;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN,
+                            static_cast<int>(Wal::kNonceLen),
+                            nullptr) != 1)
+      break;
+    if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce) != 1) break;
+    if (aad_len > 0 &&
+        EVP_DecryptUpdate(ctx, nullptr, &outl, aad,
+                          static_cast<int>(aad_len)) != 1)
+      break;
+    if (in_len > 0 &&
+        EVP_DecryptUpdate(
+            ctx, reinterpret_cast<unsigned char*>(out_plain.data()), &outl,
+            reinterpret_cast<const unsigned char*>(blob),
+            static_cast<int>(in_len)) != 1)
+      break;
+    produced = static_cast<size_t>(outl);
+    if (produced != in_len) break;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
+                            static_cast<int>(Wal::kTagLen),
+                            const_cast<char*>(blob) + in_len) != 1)
+      break;
+    if (EVP_DecryptFinal_ex(
+            ctx, reinterpret_cast<unsigned char*>(out_plain.data()) + produced,
+            &outl) != 1)
+      break;  // Tag-Mismatch -> ok=false
+    produced += static_cast<size_t>(outl);
+    if (produced != in_len) break;
+    ok = true;
+  } while (false);
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok) out_plain.clear();
+  return ok;
+}
+#endif  // DBENGINE_WITH_TLS
+
 // Audit-Konvention (s. wal.h): Escaping pro Feld.
 std::string audit_escape(std::string_view s) {
   std::string out;
@@ -225,6 +368,72 @@ uint32_t Wal::record_crc(uint64_t lsn, uint32_t len, const char* payload) {
   return c;
 }
 
+uint32_t Wal::enc_record_crc(uint64_t lsn, uint32_t raw_len,
+                             const unsigned char* nonce, const char* blob,
+                             uint32_t blob_len) {
+  // CRC ueber lsn-LE + raw_len-LE (inkl. Marker-Bit) + nonce + blob.
+  // Verkettung im selben ~c-Arbeitsraum wie record_crc (s. dort).
+  char pre[8 + 4 + 12];
+  put_u64le(pre, lsn);
+  put_u32le(pre + 8, raw_len);
+  std::memcpy(pre + 12, nonce, kNonceLen);
+  uint32_t c = crc32(pre, sizeof(pre), 0);
+  if (blob_len && blob) {
+    static uint32_t table[256];
+    static bool init = false;
+    if (!init) {
+      crc32_table_init(table);
+      init = true;
+    }
+    uint32_t raw = ~c;
+    const auto* p = reinterpret_cast<const unsigned char*>(blob);
+    for (uint32_t i = 0; i < blob_len; ++i)
+      raw = table[(raw ^ p[i]) & 0xFF] ^ (raw >> 8);
+    return ~raw;
+  }
+  return c;
+}
+
+void Wal::setEncryptionKey(const Key32& key) {
+#ifdef DBENGINE_WITH_TLS
+  std::lock_guard<std::mutex> g(mu_);
+  enc_key_ = key;
+  enc_enabled_ = true;
+#else
+  (void)key;
+  throw std::logic_error(
+      "WAL encryption requires a DBENGINE_WITH_TLS build (OpenSSL "
+      "AES-256-GCM); refusing fake crypto");
+#endif
+}
+
+void Wal::setEncryptionKey(std::string_view raw32) {
+#ifdef DBENGINE_WITH_TLS
+  if (raw32.size() != kKeyLen)
+    throw std::invalid_argument("WAL encryption key must be exactly 32 bytes");
+  Key32 k{};
+  std::memcpy(k.data(), raw32.data(), kKeyLen);
+  setEncryptionKey(k);
+  std::memset(k.data(), 0, kKeyLen);  // Kopie auf dem Stack wischen
+#else
+  (void)raw32;
+  throw std::logic_error(
+      "WAL encryption requires a DBENGINE_WITH_TLS build (OpenSSL "
+      "AES-256-GCM); refusing fake crypto");
+#endif
+}
+
+void Wal::clearEncryptionKey() {
+  std::lock_guard<std::mutex> g(mu_);
+  std::memset(enc_key_.data(), 0, enc_key_.size());
+  enc_enabled_ = false;
+}
+
+bool Wal::encryption_enabled() const {
+  std::lock_guard<std::mutex> g(mu_);
+  return enc_enabled_;
+}
+
 void Wal::write_all(int fd, const void* buf, size_t n) {
   const char* p = static_cast<const char*>(buf);
   size_t done = 0;
@@ -245,7 +454,9 @@ int64_t Wal::file_size(int fd) {
   return static_cast<int64_t>(st.st_size);
 }
 
-Wal::ScanResult Wal::scan(int fd) {
+Wal::ScanResult Wal::scan(int fd) { return scan(fd, nullptr); }
+
+Wal::ScanResult Wal::scan(int fd, const Key32* key) {
   ScanResult out;
   if (::lseek(fd, 0, SEEK_SET) < 0)
     throw std::runtime_error(std::string("WAL lseek: ") + std::strerror(errno));
@@ -257,16 +468,53 @@ Wal::ScanResult Wal::scan(int fd) {
     uint64_t lsn = get_u64le(hdr + 4);
     uint32_t len = get_u32le(hdr + 12);
     uint32_t want = get_u32le(hdr + 16);
-    if (len > kMaxPayload) break;  // Korrupt -> stop
-    if (lsn == 0 || lsn < out.max_lsn) break;  // LSN muss steigen (0 ungueltig)
-    std::string payload;
-    payload.resize(len);
-    if (len && !read_full(fd, payload.data(), len)) break;  // torn payload
-    if (record_crc(lsn, len, payload.data()) != want) break;  // CRC -> stop
+    const bool enc = (len & kEncFlag) != 0;
+    uint32_t stored = len & ~kEncFlag;
+    if (!enc) {
+      // Plain-Pfad: byte-identisch zu V1 (unveraendert).
+      if (len > kMaxPayload) break;  // Korrupt -> stop
+      if (lsn == 0 || lsn < out.max_lsn) break;  // LSN muss steigen
+      std::string payload;
+      payload.resize(len);
+      if (len && !read_full(fd, payload.data(), len)) break;  // torn payload
+      if (record_crc(lsn, len, payload.data()) != want) break;  // CRC -> stop
+      out.max_lsn = lsn;
+      pos += static_cast<int64_t>(sizeof(hdr) + len);
+      out.valid_bytes = pos;
+      out.records.push_back(WalRecord{lsn, std::move(payload)});
+      continue;
+    }
+    // GCM-Pfad: stored = Cipher+Tag-Bytes, Nonce folgt dem Header.
+    if (stored < kTagLen || stored - kTagLen > kMaxPayload) break;  // korrupt
+    if (lsn == 0 || lsn < out.max_lsn) break;  // LSN muss steigen
+    unsigned char nonce[kNonceLen];
+    if (!read_full(fd, nonce, sizeof(nonce))) break;  // torn nonce -> stop
+    std::string blob;
+    blob.resize(stored);
+    if (!read_full(fd, blob.data(), stored)) break;  // torn blob -> stop
+    if (enc_record_crc(lsn, len, nonce, blob.data(), stored) != want)
+      break;  // CRC ueber Chiffre -> stop (Torn-Erkennung)
+    if (key == nullptr) {
+      out.need_key = true;  // Prefix liefern, Aufrufer entscheidet (fail-closed)
+      break;
+    }
+#ifdef DBENGINE_WITH_TLS
+    unsigned char aad[16];
+    make_aad(kMagic, lsn, len, aad);
+    std::string plain;
+    if (!gcm_decrypt(*key, nonce, aad, sizeof(aad), blob.data(), stored,
+                     plain)) {
+      out.auth_failed = true;  // falscher Schluessel/Tamper -> Prefix, fail-closed
+      break;
+    }
     out.max_lsn = lsn;
-    pos += static_cast<int64_t>(sizeof(hdr) + len);
+    pos += static_cast<int64_t>(sizeof(hdr) + sizeof(nonce) + stored);
     out.valid_bytes = pos;
-    out.records.push_back(WalRecord{lsn, std::move(payload)});
+    out.records.push_back(WalRecord{lsn, std::move(plain)});
+#else
+    out.need_key = true;  // ohne TLS nie entschluesselbar
+    break;
+#endif
   }
   return out;
 }
@@ -282,7 +530,22 @@ void Wal::open() {
   if (fd < 0)
     throw std::runtime_error(std::string("WAL open: ") + std::strerror(errno));
   // Recovery beim Start: scanne, setze next_lsn, kappe torn tail.
-  ScanResult s = scan(fd);
+  const Key32* key = enc_enabled_ ? &enc_key_ : nullptr;
+  ScanResult s = scan(fd, key);
+  // Fail-closed statt Datenverlust: GCM-Records ohne Schluessel oder mit
+  // falschem Schluessel duerfen NICHT gekappt werden (kein Truncate).
+  if (s.need_key) {
+    ::close(fd);
+    throw std::runtime_error(
+        "WAL open: encrypted records present but no key set "
+        "(call setEncryptionKey before open)");
+  }
+  if (s.auth_failed) {
+    ::close(fd);
+    throw std::runtime_error(
+        "WAL open: GCM auth failed (wrong key or tampered tail); not "
+        "truncating");
+  }
   int64_t sz = file_size(fd);
   if (sz > s.valid_bytes) {
     // Torn tail kappen (abgerissener write nach Crash).
@@ -304,11 +567,47 @@ void Wal::open() {
   cv_.notify_all();
 }
 
+void Wal::append_encrypted(int fd, const Key32& key, uint64_t lsn,
+                           const char* data, size_t n) {
+#ifdef DBENGINE_WITH_TLS
+  unsigned char nonce[kNonceLen];
+  make_nonce(lsn, nonce);
+  const uint32_t stored =
+      static_cast<uint32_t>(n) + static_cast<uint32_t>(kTagLen);
+  const uint32_t raw = stored | kEncFlag;
+  unsigned char aad[16];
+  make_aad(kMagic, lsn, raw, aad);
+  std::string blob;
+  if (!gcm_encrypt(key, nonce, aad, sizeof(aad), data, n, blob))
+    throw std::runtime_error("WAL GCM encrypt failed");
+  char hdr[4 + 8 + 4 + 4];
+  put_u32le(hdr, kMagic);
+  put_u64le(hdr + 4, lsn);
+  put_u32le(hdr + 12, raw);
+  put_u32le(hdr + 16, enc_record_crc(lsn, raw, nonce, blob.data(), stored));
+  write_record_enc(fd, hdr, nonce, blob.data(), stored);
+#else
+  (void)fd;
+  (void)key;
+  (void)lsn;
+  (void)data;
+  (void)n;
+  throw std::logic_error(
+      "WAL encryption requires a DBENGINE_WITH_TLS build (OpenSSL "
+      "AES-256-GCM); refusing fake crypto");
+#endif
+}
+
 uint64_t Wal::append(std::string_view payload) {
   std::lock_guard<std::mutex> g(mu_);
   ensure_open();
   if (payload.size() > kMaxPayload) throw std::runtime_error("WAL payload too large");
   uint64_t lsn = next_lsn_++;
+  if (enc_enabled_) {
+    append_encrypted(fd_, enc_key_, lsn, payload.data(), payload.size());
+    ++appends_;
+    return lsn;
+  }
   uint32_t len = static_cast<uint32_t>(payload.size());
   char hdr[4 + 8 + 4 + 4];
   put_u32le(hdr, kMagic);
@@ -330,6 +629,12 @@ std::vector<uint64_t> Wal::append_many(
   for (const auto& p : payloads) {
     if (p.size() > kMaxPayload) throw std::runtime_error("WAL payload too large");
     uint64_t lsn = next_lsn_++;
+    if (enc_enabled_) {
+      append_encrypted(fd_, enc_key_, lsn, p.data(), p.size());
+      ++appends_;
+      out.push_back(lsn);
+      continue;
+    }
     uint32_t len = static_cast<uint32_t>(p.size());
     char hdr[4 + 8 + 4 + 4];
     put_u32le(hdr, kMagic);
@@ -358,7 +663,9 @@ std::vector<WalRecord> Wal::replay() {
   ensure_open();
   // Verlaufsgarantie: was der Aufrufer lesen will, muss vorher flush() sein.
   // Wir lesen vom Dateianfang; scan() toleriert torn tail.
-  ScanResult s = scan(fd_);
+  // Lesepfad: Prefix bis zum ersten GCM-Record ohne Schluessel (kein Throw).
+  const Key32* key = enc_enabled_ ? &enc_key_ : nullptr;
+  ScanResult s = scan(fd_, key);
   if (::lseek(fd_, 0, SEEK_END) < 0)
     throw std::runtime_error(std::string("WAL lseek-end: ") + std::strerror(errno));
   return s.records;
@@ -370,7 +677,7 @@ std::vector<WalRecord> Wal::replay_file(const std::string& path) {
     if (errno == ENOENT) return {};  // keine Datei -> leeres Log
     throw std::runtime_error(std::string("WAL replay open: ") + std::strerror(errno));
   }
-  ScanResult s = scan(fd);
+  ScanResult s = scan(fd);  // statisch: ohne Schluessel -> Prefix bis GCM, kappt nie
   ::close(fd);
   return s.records;
 }
@@ -378,7 +685,16 @@ std::vector<WalRecord> Wal::replay_file(const std::string& path) {
 void Wal::checkpoint(uint64_t checkpoint_lsn) {
   std::unique_lock<std::mutex> g(mu_);
   ensure_open();
-  ScanResult s = scan(fd_);
+  const Key32* key = enc_enabled_ ? &enc_key_ : nullptr;
+  ScanResult s = scan(fd_, key);
+  // Fail-closed: ohne passenden Schluessel nichts verwerfen/umschreiben.
+  if (s.need_key)
+    throw std::runtime_error(
+        "WAL checkpoint: encrypted records present but no key set "
+        "(call setEncryptionKey before checkpoint)");
+  if (s.auth_failed)
+    throw std::runtime_error(
+        "WAL checkpoint: GCM auth failed (wrong key or tampered tail)");
   std::string tmp = path_ + ".chkpt.tmp";
   int tfd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (tfd < 0)
@@ -386,6 +702,13 @@ void Wal::checkpoint(uint64_t checkpoint_lsn) {
   uint64_t max_kept = 0;
   for (const auto& r : s.records) {
     if (r.lsn <= checkpoint_lsn) continue;
+    // scan() liefert Klartext; bei aktivem Key frisch verschluesselt
+    // zurueckschreiben (neue Nonce), sonst plain (byte-identisch zu V1).
+    if (enc_enabled_) {
+      append_encrypted(tfd, enc_key_, r.lsn, r.data.data(), r.data.size());
+      max_kept = r.lsn;
+      continue;
+    }
     uint32_t len = static_cast<uint32_t>(r.data.size());
     char hdr[4 + 8 + 4 + 4];
     put_u32le(hdr, kMagic);

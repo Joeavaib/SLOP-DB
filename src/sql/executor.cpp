@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -599,6 +600,10 @@ struct RbacState {
   std::string role;  // "" = Admin
   // norm-Tabelle -> Rolle -> Privilegien (upper).
   std::map<std::string, std::map<std::string, std::set<std::string>>> grants;
+  // RLS-Registry (Spiegel zu Database::policies_/rls_on_): norm-Tabelle ->
+  // Policies; rls_on = Tabellen mit ENABLE ROW LEVEL SECURITY.
+  std::map<std::string, std::vector<CreatePolicyStmt>> policies;
+  std::set<std::string> rls_on;
 };
 std::map<const Executor*, RbacState> g_rbac;
 
@@ -648,6 +653,98 @@ std::vector<std::string> rbacSplitPrivs(const std::string& s) {
   if (!rbacPrivValid(cur)) throw SqlError("Korrupter GRANT-Record");
   if (std::find(out.begin(), out.end(), cur) == out.end()) out.push_back(cur);
   return out;
+}
+
+// ---- RLS: Evaluator + WAL-Codec -------------------------------------------
+// Der Executor wertet USING ueber eine Temp-Database aus (exakt dieselbe
+// Semantik wie Database::rowPassesRls inkl. LIKE/current_user, kein
+// Doppel-Code). Aufbau pro Statement (Schemas + Policies + Rolle), danach
+// O(1)-Checks je Row.
+Database makeRlsEvaluator(
+    const RbacState& rs,
+    const std::map<std::string, const TableSchema*>& schemas) {
+  Database db;
+  for (const auto& [tn, sc] : schemas) {
+    if (sc == nullptr) continue;
+    CreateTableStmt c;
+    c.table = tn;
+    c.columns = sc->columns;
+    try {
+      db.execCreate(c);
+    } catch (...) {
+    }
+  }
+  for (const auto& [tn, vec] : rs.policies) {
+    if (schemas.find(tn) == schemas.end()) continue;
+    for (const auto& p : vec) {
+      try {
+        db.execCreatePolicy(p);
+      } catch (...) {
+      }
+    }
+  }
+  for (const auto& tn : rs.rls_on) {
+    if (schemas.find(tn) == schemas.end()) continue;
+    try {
+      AlterTableRlsStmt a;
+      a.table = tn;
+      a.enable = true;
+      db.execAlterRls(a);
+    } catch (...) {
+    }
+  }
+  if (!rs.role.empty()) {
+    SetRoleStmt sr;
+    sr.role = rs.role;
+    sr.reset = false;
+    db.execSetRole(sr);
+  }
+  return db;
+}
+
+bool rlsPolicyCmdValid(const std::string& c) {
+  return c == "SELECT" || c == "INSERT" || c == "UPDATE" ||
+         c == "DELETE" || c == "ALL";
+}
+
+// Ein USING-Wert als WAL-Feld: "U:" (current_user) | "N:" | "I:n" | "F:x" |
+// "S:s" | "B:0/1" (S roh, walEscape der Huelle sichert \x1f).
+std::string rlsEncodeValue(const Value& v, bool isCur) {
+  if (isCur) return "U:";
+  if (std::holds_alternative<std::monostate>(v)) return "N:";
+  if (auto* iv = std::get_if<int64_t>(&v)) return "I:" + std::to_string(*iv);
+  if (auto* dv = std::get_if<double>(&v)) {
+    std::ostringstream oss;
+    oss << std::setprecision(17) << *dv;
+    return "F:" + oss.str();
+  }
+  if (auto* sv = std::get_if<std::string>(&v)) return "S:" + *sv;
+  if (auto* bv = std::get_if<bool>(&v))
+    return std::string("B:") + (*bv ? "1" : "0");
+  throw SqlError("Unkodierbarer POLICY-Wert");
+}
+
+std::pair<Value, bool> rlsDecodeValue(const std::string& f) {
+  if (f == "U:") return {Value{std::monostate{}}, true};
+  if (f.size() < 2 || f[1] != ':') throw SqlError("Korrupter POLICY-Record");
+  const char t = f[0];
+  const std::string p = f.substr(2);
+  switch (t) {
+    case 'N':
+      return {Value{std::monostate{}}, false};
+    case 'I':
+      return {Value{static_cast<int64_t>(std::stoll(p))}, false};
+    case 'F':
+      return {Value{std::stod(p)}, false};
+    case 'S':
+      return {Value{p}, false};
+    case 'B':
+      if (p == "1") return {Value{true}, false};
+      if (p == "0") return {Value{false}, false};
+      throw SqlError("Korrupter POLICY-Record");
+    default:
+      throw SqlError("Korrupter POLICY-Record");
+  }
 }
 
 }  // namespace
@@ -887,6 +984,12 @@ bool Executor::applyMirrorRecord(const std::string& data) {
   }
   if ((parts[0] == "G" || parts[0] == "R") && parts.size() == 4) {
     return true;  // RBAC: Rechte sind WAL-persistiert, Spiegel ist KV-only
+  }
+  if (parts[0] == "P" && parts.size() >= 7) {
+    return true;  // RLS-Policy: Registry-only, Spiegel ist KV-only
+  }
+  if (parts[0] == "E" && parts.size() == 3) {
+    return true;  // RLS-Schalter: Registry-only, Spiegel ist KV-only
   }
   return true;  // unbekannter Opcode: recover skipt -> kein State -> Advance ok
 }
@@ -1331,6 +1434,96 @@ Result Executor::executeInner(const std::string& sql) {
       rs.role = sr.reset ? "" : sr.role;
       return {{}, {}, sr.reset ? "RESET ROLE" : "SET ROLE", 0};
     }
+    if (std::holds_alternative<CreatePolicyStmt>(st)) {
+      const CreatePolicyStmt& p = std::get<CreatePolicyStmt>(st);
+      rbacRequireAdmin(rs, "CREATE POLICY");
+      const std::string norm = normalizeTable(p.table);
+      auto tit = tables_.find(norm);
+      if (tit == tables_.end())
+        throw SqlError("Tabelle unbekannt: " + p.table);
+      for (const auto& q : rs.policies[norm])
+        if (toLower(q.policy) == toLower(p.policy))
+          throw SqlError("Policy existiert bereits: " + p.policy);
+      // USING-Spalten frueh validieren (unbekannt -> SqlError, kein WAL).
+      auto checkCond = [&](const Condition& c) {
+        if (c.subquery)
+          throw SqlError("Subquery in POLICY USING wird nicht unterstuetzt");
+        if (!c.lhs_is_current) {
+          if (schemaColIndex(tit->second.columns, c.column) < 0)
+            throw SqlError("Unbekannte Spalte in POLICY USING: " + c.column);
+        }
+      };
+      for (const auto& c : p.where) checkCond(c);
+      for (const auto& gr : p.where_groups)
+        for (const auto& c : gr) checkCond(c);
+      if (!rlsPolicyCmdValid(p.command))
+        throw SqlError("Unbekanntes POLICY-Ziel: " + p.command);
+      rs.policies[norm].push_back(p);
+      if (wal_ != nullptr) {
+        std::vector<std::string> fields;
+        fields.push_back("P");
+        fields.push_back(norm);
+        fields.push_back(walEscape(p.policy));
+        fields.push_back(p.command);
+        fields.push_back(walEscape(p.role));
+        std::vector<std::vector<Condition>> groups =
+            p.where_groups.empty() ? std::vector<std::vector<Condition>>{p.where}
+                                   : p.where_groups;
+        fields.push_back(std::to_string(groups.size()));
+        for (const auto& gr : groups) {
+          fields.push_back(std::to_string(gr.size()));
+          for (const auto& c : gr) {
+            fields.push_back(walEscape(c.column));
+            fields.push_back(walEscape(c.op));
+            fields.push_back(c.lhs_is_current ? "1" : "0");
+            fields.push_back(walEscape(rlsEncodeValue(c.value, c.value_is_current)));
+            fields.push_back(walEscape(rlsEncodeValue(c.second, c.second_is_current)));
+            fields.push_back(std::to_string(c.list.size()));
+            for (std::size_t i = 0; i < c.list.size(); ++i) {
+              bool cur = (i < c.list_is_current.size() && c.list_is_current[i]);
+              fields.push_back(walEscape(rlsEncodeValue(c.list[i], cur)));
+            }
+          }
+        }
+        std::string payload;
+        for (std::size_t i = 0; i < fields.size(); ++i) {
+          if (i) payload += kWalSep;
+          payload += fields[i];
+        }
+        wal_->append(payload);
+        wal_->flush();
+        const std::vector<std::string> mirror_batch{payload};
+        syncMirrorBatch(&mirror_batch);
+      }
+      return {{}, {}, "CREATE POLICY", 0};
+    }
+    if (std::holds_alternative<AlterTableRlsStmt>(st)) {
+      const AlterTableRlsStmt& a = std::get<AlterTableRlsStmt>(st);
+      rbacRequireAdmin(rs, "ALTER TABLE ... ROW LEVEL SECURITY");
+      const std::string norm = normalizeTable(a.table);
+      if (tables_.find(norm) == tables_.end())
+        throw SqlError("Tabelle unbekannt: " + a.table);
+      if (a.enable)
+        rs.rls_on.insert(norm);
+      else
+        rs.rls_on.erase(norm);
+      if (wal_ != nullptr) {
+        std::string payload;
+        payload += 'E';
+        payload += kWalSep;
+        payload += norm;
+        payload += kWalSep;
+        payload += (a.enable ? "1" : "0");
+        wal_->append(payload);
+        wal_->flush();
+        const std::vector<std::string> mirror_batch{payload};
+        syncMirrorBatch(&mirror_batch);
+      }
+      return {{}, {},
+              a.enable ? "ENABLE ROW LEVEL SECURITY"
+                       : "DISABLE ROW LEVEL SECURITY",
+              0};
+    }
     if (std::holds_alternative<CreateTableStmt>(st)) {
       rbacRequireAdmin(rs, "CREATE TABLE");
     } else if (std::holds_alternative<DropTableStmt>(st)) {
@@ -1486,12 +1679,33 @@ Result Executor::executeInner(const std::string& sql) {
       return false;
     };
     std::vector<std::pair<std::string, std::string>> hits;  // (key, newEnc)
+    // RLS-Evaluator (Visibility + WITH CHECK, exakt Database-Semantik).
+    const RbacState& rlsU = rbacFor(this);
+    Database* rlsEvalU = nullptr;
+    std::unique_ptr<Database> rlsEvalHoldU;
+    Table rlsTabU;
+    if (!rlsU.role.empty() && rlsU.rls_on.count(norm) > 0) {
+      std::map<std::string, const TableSchema*> scm;
+      scm[norm] = &sch;
+      for (const auto& [tn, schp] : extraSch) scm[tn] = schp;
+      rlsEvalHoldU = std::make_unique<Database>(makeRlsEvaluator(rlsU, scm));
+      rlsEvalU = rlsEvalHoldU.get();
+      rlsTabU.columns = sch.columns;
+    }
     for (auto& [k, row] : vis) {
       if (!isMatch(row)) continue;
+      if (rlsEvalU != nullptr) {
+        if (!rlsEvalU->rowPassesRls(rlsTabU, row, norm, "UPDATE")) continue;
+      }
       for (std::size_t i = 0; i < u.sets.size(); ++i) {
         const std::size_t ti = static_cast<std::size_t>(setIdx[i]);
         row[ti] = coerceValue(u.sets[i].second, sch.columns[ti].type,
                               sch.columns[ti].name);
+      }
+      if (rlsEvalU != nullptr) {
+        if (!rlsEvalU->rowPassesRls(rlsTabU, row, norm, "UPDATE"))
+          throw SqlError("permission denied for table " + u.table +
+                         " (SQLSTATE 42501)");
       }
       hits.emplace_back(k, encodeRow(row));
     }
@@ -1618,6 +1832,18 @@ Result Executor::executeInner(const std::string& sql) {
     sel.where_groups = d.where_groups;
     Result matched = tmp.execSelect(sel);
     std::vector<std::string> keys;
+    const RbacState& rlsD = rbacFor(this);
+    Database* rlsEvalD = nullptr;
+    std::unique_ptr<Database> rlsEvalHoldD;
+    Table rlsTabD;
+    if (!rlsD.role.empty() && rlsD.rls_on.count(norm) > 0) {
+      std::map<std::string, const TableSchema*> scm;
+      scm[norm] = &sch;
+      for (const auto& [tn, schp] : extraSch) scm[tn] = schp;
+      rlsEvalHoldD = std::make_unique<Database>(makeRlsEvaluator(rlsD, scm));
+      rlsEvalD = rlsEvalHoldD.get();
+      rlsTabD.columns = sch.columns;
+    }
     for (const auto& [k, row] : vis) {
       bool hit = false;
       for (auto& m : matched.rows) {
@@ -1635,6 +1861,9 @@ Result Executor::executeInner(const std::string& sql) {
         }
       }
       if (!hit) continue;
+      if (rlsEvalD != nullptr) {
+        if (!rlsEvalD->rowPassesRls(rlsTabD, row, norm, "DELETE")) continue;
+      }
       keys.push_back(k);
     }
     if (keys.empty()) return {{}, {}, "DELETE 0", 0};
@@ -1730,6 +1959,8 @@ Result Executor::executeInner(const std::string& sql) {
     tables_.erase(it);
     replica_.erase(norm);  // HTAP: Scan-Replika konsistent verwerfen
     rbacFor(this).grants.erase(norm);  // Rechte fallen mit der Tabelle (PG)
+    rbacFor(this).policies.erase(norm);  // RLS-Policies fallen mit (PG)
+    rbacFor(this).rls_on.erase(norm);
     return {{}, {}, "DROP TABLE", 0};
   }
   return execSelect(std::get<SelectStmt>(st));
@@ -1809,6 +2040,24 @@ Result Executor::execInsert(const InsertStmt& s) {
       full[ti] = coerceValue(r[i], sch.columns[ti].type, sch.columns[ti].name);
     }
     fullRows.push_back(std::move(full));
+  }
+
+  // RLS WITH CHECK: neue Rows muessen USING erfuellen (sonst 42501),
+  // vor jedem WAL/KV/MVCC-Seiteneffekt (fail fast, keine Halb-Writes).
+  {
+    const RbacState& rlsI = rbacFor(this);
+    if (!rlsI.role.empty() && rlsI.rls_on.count(norm) > 0) {
+      std::map<std::string, const TableSchema*> scm;
+      scm[norm] = &sch;
+      Database eval = makeRlsEvaluator(rlsI, scm);
+      Table evT;
+      evT.columns = sch.columns;
+      for (const auto& full : fullRows) {
+        if (!eval.rowPassesRls(evT, full, norm, "INSERT"))
+          throw SqlError("permission denied for table " + s.table +
+                         " (SQLSTATE 42501)");
+      }
+    }
   }
 
   // Keys erzeugen (pk = erste Spalte; Kollision -> "#rowid"-Suffix).
@@ -1947,6 +2196,26 @@ Result Executor::execSelect(const SelectStmt& s) {
   } catch (...) {
     need.clear();  // Fallback: alles voll dekodieren (s. decodeRowSelected)
   }
+  // RLS: USING-Spalten muessen voll dekodiert sein (Pushdown wuesste sonst
+  // nichts von der Policy und saehe NULL). Konservativ: RLS-Tabellen voll.
+  const RbacState& rlsS = rbacFor(this);
+  bool rlsActive = false;
+  if (!rlsS.role.empty() && !rlsS.rls_on.empty()) {
+    for (const auto& [tn, sc] : schemas) {
+      (void)sc;
+      if (rlsS.rls_on.count(tn) > 0) {
+        rlsActive = true;
+        break;
+      }
+    }
+  }
+  if (rlsActive) {
+    for (const auto& [tn, sc] : schemas) {
+      if (sc == nullptr) continue;
+      if (rlsS.rls_on.count(tn) == 0) continue;
+      need[tn].assign(sc->columns.size(), 1);
+    }
+  }
   auto loadRows = [&](const std::string& tnorm, const TableSchema& sc) {
     std::vector<std::vector<Value>> rows;
     auto nit = need.find(tnorm);
@@ -2001,6 +2270,25 @@ Result Executor::execSelect(const SelectStmt& s) {
     snapTables.emplace(tn, std::move(t));
   }
   mvcc_.Commit(rtxn);
+
+  // RLS-Visibility: Rows ohne USING-Treffer unsichtbar (vor Projektion/AGGR).
+  if (rlsActive) {
+    Database eval = makeRlsEvaluator(rlsS, schemas);
+    for (auto& [tn, tab] : snapTables) {
+      if (eval.rlsEnabled(tn)) {
+        std::vector<std::vector<Value>> kept;
+        kept.reserve(tab.rows.size());
+        for (const auto& row : tab.rows) {
+          try {
+            if (eval.rowPassesRls(tab, row, tn, "SELECT")) kept.push_back(row);
+          } catch (...) {
+            throw;
+          }
+        }
+        tab.rows = std::move(kept);
+      }
+    }
+  }
 
   Database db;
   return db.execSelectSnapshot(s, std::move(snapTables));
@@ -2205,6 +2493,8 @@ std::size_t Executor::recover() {
           tables_.erase(norm);
           replica_.erase(norm);  // HTAP: Scan-Replika konsistent verwerfen
           rbacFor(this).grants.erase(norm);  // Rechte fallen mit (wie live)
+          rbacFor(this).policies.erase(norm);  // RLS-Policies fallen mit
+          rbacFor(this).rls_on.erase(norm);
           if (ok) {
             ++recover_applied_;
           } else {
@@ -2236,6 +2526,108 @@ std::size_t Executor::recover() {
           }
         }
         ++recover_applied_;
+      } catch (...) {
+        ++recover_skipped_;
+      }
+    } else if (parts[0] == "P" && parts.size() >= 7) {
+      // RLS-Policy-Replay: Registry wiederherstellen (kein WAL-Append, kein
+      // Mirror-State). Ohne Schema nicht replaybar -> Skip (wie INSERT).
+      // Idempotent: Doppel-Replay bei gleichem Namen wird uebersprungen.
+      try {
+        const std::string norm = normalizeTable(parts[1]);
+        auto tit = tables_.find(norm);
+        if (tit == tables_.end()) {
+          ++recover_skipped_;
+        } else {
+          const std::string policy = walUnescape(parts[2]);
+          const std::string cmd = parts[3];
+          const std::string role = walUnescape(parts[4]);
+          if (!rlsPolicyCmdValid(cmd)) throw SqlError("Korrupter POLICY-Record");
+          std::size_t pos = 6;
+          const std::size_t nGroups =
+              static_cast<std::size_t>(std::stoull(parts[5]));
+          if (nGroups == 0 || nGroups > 1024) throw SqlError("Korrupter POLICY-Record");
+          std::vector<std::vector<Condition>> groups;
+          groups.reserve(nGroups);
+          for (std::size_t gi = 0; gi < nGroups; ++gi) {
+            if (pos >= parts.size()) throw SqlError("Korrupter POLICY-Record");
+            const std::size_t nConds =
+                static_cast<std::size_t>(std::stoull(parts[pos++]));
+            if (nConds == 0 || nConds > 1024) throw SqlError("Korrupter POLICY-Record");
+            std::vector<Condition> conj;
+            conj.reserve(nConds);
+            for (std::size_t ci = 0; ci < nConds; ++ci) {
+              if (pos + 5 >= parts.size()) throw SqlError("Korrupter POLICY-Record");
+              Condition c;
+              c.column = walUnescape(parts[pos++]);
+              c.op = walUnescape(parts[pos++]);
+              const std::string fl = parts[pos++];
+              if (fl != "0" && fl != "1") throw SqlError("Korrupter POLICY-Record");
+              c.lhs_is_current = (fl == "1");
+              auto [vv, vcur] = rlsDecodeValue(walUnescape(parts[pos++]));
+              c.value = vv;
+              c.value_is_current = vcur;
+              auto [sv, scur] = rlsDecodeValue(walUnescape(parts[pos++]));
+              c.second = sv;
+              c.second_is_current = scur;
+              const std::size_t nList =
+                  static_cast<std::size_t>(std::stoull(parts[pos++]));
+              if (nList > 1024) throw SqlError("Korrupter POLICY-Record");
+              for (std::size_t li = 0; li < nList; ++li) {
+                if (pos >= parts.size()) throw SqlError("Korrupter POLICY-Record");
+                auto [ev, ecur] = rlsDecodeValue(walUnescape(parts[pos++]));
+                c.list.push_back(ev);
+                c.list_is_current.push_back(ecur ? 1 : 0);
+              }
+              // Spalten validieren (unbekannt -> Skip wie live-SqlError).
+              if (!c.lhs_is_current) {
+                if (schemaColIndex(tit->second.columns, c.column) < 0)
+                  throw SqlError("Korrupter POLICY-Record (Spalte)");
+              }
+              conj.push_back(std::move(c));
+            }
+            groups.push_back(std::move(conj));
+          }
+          if (pos != parts.size()) throw SqlError("Korrupter POLICY-Record");
+          RbacState& rs = rbacFor(this);
+          bool dup = false;
+          for (const auto& q : rs.policies[norm])
+            if (toLower(q.policy) == toLower(policy)) dup = true;
+          if (!dup) {
+            CreatePolicyStmt ps;
+            ps.policy = policy;
+            ps.table = norm;
+            ps.command = cmd;
+            ps.role = role;
+            if (groups.size() == 1) {
+              ps.where = groups[0];
+            } else {
+              ps.where_groups = std::move(groups);
+            }
+            rs.policies[norm].push_back(std::move(ps));
+          }
+          ++recover_applied_;
+        }
+      } catch (...) {
+        ++recover_skipped_;
+      }
+    } else if (parts[0] == "E" && parts.size() == 3) {
+      // RLS-Schalter-Replay: ENABLE/DISABLE wiederherstellen. Ohne Schema ->
+      // Skip (wie live-SqlError bei unbekannter Tabelle).
+      try {
+        const std::string norm = normalizeTable(parts[1]);
+        if (tables_.find(norm) == tables_.end()) {
+          ++recover_skipped_;
+        } else if (parts[2] != "0" && parts[2] != "1") {
+          ++recover_skipped_;
+        } else {
+          RbacState& rs = rbacFor(this);
+          if (parts[2] == "1")
+            rs.rls_on.insert(norm);
+          else
+            rs.rls_on.erase(norm);
+          ++recover_applied_;
+        }
       } catch (...) {
         ++recover_skipped_;
       }

@@ -214,7 +214,11 @@ class Parser {
   explicit Parser(std::vector<Token> toks) : toks_(std::move(toks)) {}
 
   Statement run() {
-    if (matchKeyword("CREATE")) return parseCreate();
+    if (matchKeyword("CREATE")) {
+      if (peekKeyword("POLICY")) return parseCreatePolicy();
+      return parseCreate();
+    }
+    if (matchKeyword("ALTER")) return parseAlterRls();
     if (matchKeyword("INSERT")) return parseInsert();
     if (matchKeyword("SELECT")) return parseSelect();
     if (matchKeyword("UPDATE")) return parseUpdate();
@@ -228,7 +232,8 @@ class Parser {
       throw SqlError(
           "TRUNCATE wird nicht unterstuetzt (DELETE FROM ... verwenden)");
     throw SqlError(
-        "Nur CREATE TABLE / INSERT / SELECT / UPDATE / DELETE / DROP TABLE / "
+        "Nur CREATE TABLE / CREATE POLICY / ALTER TABLE ... ROW LEVEL "
+        "SECURITY / INSERT / SELECT / UPDATE / DELETE / DROP TABLE / "
         "GRANT / REVOKE / SET ROLE / RESET ROLE werden unterstuetzt");
   }
 
@@ -517,6 +522,286 @@ class Parser {
     SetRoleStmt s;
     s.reset = true;
     return s;
+  }
+
+  // RLS: CREATE POLICY name ON t [FOR SELECT|INSERT|UPDATE|DELETE|ALL]
+  // [TO r] USING (cond). FOR-Default ALL, TO-Default "*" (alle Rollen).
+  CreatePolicyStmt parseCreatePolicy() {
+    expectKeyword("POLICY");
+    CreatePolicyStmt s;
+    s.policy = parseIdent();
+    expectKeyword("ON");
+    s.table = parseIdent();
+    if (peekKeyword("FOR")) {
+      ++pos_;
+      const Token& t = peek();
+      if (t.kind != TokKind::Ident)
+        throw SqlError("Erwartet FOR-Ziel (SELECT/INSERT/UPDATE/DELETE/ALL)");
+      std::string u = toUpper(t.text);
+      if (u != "SELECT" && u != "INSERT" && u != "UPDATE" &&
+          u != "DELETE" && u != "ALL")
+        throw SqlError("Unbekanntes POLICY-Ziel: " + t.text);
+      ++pos_;
+      s.command = u;
+    }
+    if (peekKeyword("TO")) {
+      ++pos_;
+      // PUBLIC (unquoted) = alle Rollen, wie PG.
+      if (peekKeyword("PUBLIC")) {
+        ++pos_;
+        s.role = "*";
+      } else {
+        s.role = parseRole();
+      }
+    }
+    expectKeyword("USING");
+    expectSymbol("(");
+    parsePolicyWhereClause(s.where, s.where_groups);
+    expectSymbol(")");
+    if (s.policy.empty()) throw SqlError("CREATE POLICY ohne Namen");
+    return s;
+  }
+
+  AlterTableRlsStmt parseAlterRls() {
+    expectKeyword("TABLE");
+    AlterTableRlsStmt s;
+    s.table = parseIdent();
+    if (matchKeyword("ENABLE")) {
+      s.enable = true;
+    } else if (matchKeyword("DISABLE")) {
+      s.enable = false;
+    } else {
+      throw SqlError("Erwartet ENABLE oder DISABLE in ALTER TABLE");
+    }
+    expectKeyword("ROW");
+    expectKeyword("LEVEL");
+    expectKeyword("SECURITY");
+    return s;
+  }
+
+  // current_user/current_role/session_user (case-insensitiv, unquoted Ident)?
+  bool peekCurrentUser() const {
+    const Token& t = peek();
+    if (t.kind != TokKind::Ident) return false;
+    std::string u = toUpper(t.text);
+    return u == "CURRENT_USER" || u == "CURRENT_ROLE" ||
+           u == "SESSION_USER";
+  }
+
+  // Literal oder current_user als Vergleichswert (USING-RHS).
+  // Rueckgabe: (Wert, ist_current_user). Subqueries in USING verboten.
+  std::pair<Value, bool> parsePolicyValue() {
+    if (peekCurrentUser()) {
+      ++pos_;
+      return {Value{std::monostate{}}, true};
+    }
+    // Skalare Subquery ablehnen (explizit statt kryptischem Literal-Fehler).
+    if (peek().kind == TokKind::Symbol && peek().text == "(" &&
+        peekKeyword("SELECT", 1))
+      throw SqlError("Subquery in POLICY USING wird nicht unterstuetzt");
+    return {parseLiteral(), false};
+  }
+
+  static std::string invertCmpOp(const std::string& op) {
+    if (op == "<") return ">";
+    if (op == "<=") return ">=";
+    if (op == ">") return "<";
+    if (op == ">=") return "<=";
+    return op;  // "=","<>" symmetrisch
+  }
+
+  // USING-Condition: LHS Spalte oder current_user; RHS Literal oder
+  // current_user (bzw. Spalte bei getauschtem current_user-LHS). Sonst exakt
+  // die WHERE-Operatoren (LIKE/ILIKE/BETWEEN/IN/IS NULL inklusive).
+  Condition parsePolicyCondition() {
+    Condition c;
+    bool lhsCur = peekCurrentUser();
+    std::string lhsCol;
+    if (lhsCur) {
+      ++pos_;
+    } else {
+      lhsCol = parseColRef();
+    }
+    bool neg = false;
+    if (peekKeyword("NOT")) {
+      ++pos_;
+      neg = true;
+    }
+    const Token& t = next();
+    if (t.kind == TokKind::Ident) {
+      std::string kw = toUpper(t.text);
+      if (kw == "LIKE" || kw == "ILIKE") {
+        if (lhsCur) {
+          if (!lhsCol.empty()) throw SqlError("Unerwarteter Operator");
+          // current_user LIKE 'pat': spaltenlose Konstante.
+          c.lhs_is_current = true;
+          c.op = neg ? ("NOT " + kw) : kw;
+          auto [v, cur] = parsePolicyValue();
+          if (cur) throw SqlError("current_user LIKE current_user sinnlos");
+          c.value = v;
+          return c;
+        }
+        c.column = lhsCol;
+        c.op = neg ? ("NOT " + kw) : kw;
+        auto [v, cur] = parsePolicyValue();
+        c.value = v;
+        c.value_is_current = cur;
+        return c;
+      }
+      if (kw == "BETWEEN") {
+        if (lhsCur) throw SqlError("BETWEEN mit current_user-LHS sinnlos");
+        c.column = lhsCol;
+        c.op = neg ? "NOT BETWEEN" : "BETWEEN";
+        auto [lo, loCur] = parsePolicyValue();
+        c.value = lo;
+        c.value_is_current = loCur;
+        expectKeyword("AND");
+        auto [hi, hiCur] = parsePolicyValue();
+        c.second = hi;
+        c.second_is_current = hiCur;
+        return c;
+      }
+      if (kw == "IN") {
+        if (peekKeyword("SELECT"))
+          throw SqlError("Subquery in POLICY USING wird nicht unterstuetzt");
+        if (lhsCur) {
+          // current_user IN (literals...): spaltenlose Konstante.
+          c.lhs_is_current = true;
+          c.op = neg ? "NOT IN" : "IN";
+          expectSymbol("(");
+          if (peekKeyword("SELECT"))
+            throw SqlError("Subquery in POLICY USING wird nicht unterstuetzt");
+          if (peek().kind == TokKind::Symbol && peek().text == ")")
+            throw SqlError("IN-Liste darf nicht leer sein");
+          while (true) {
+            auto [v, cur] = parsePolicyValue();
+            if (cur) throw SqlError("current_user IN (...) mit current_user");
+            c.list.push_back(v);
+            c.list_is_current.push_back(0);
+            if (matchSymbol(",")) continue;
+            break;
+          }
+          expectSymbol(")");
+          return c;
+        }
+        c.column = lhsCol;
+        c.op = neg ? "NOT IN" : "IN";
+        expectSymbol("(");
+        if (peekKeyword("SELECT"))
+          throw SqlError("Subquery in POLICY USING wird nicht unterstuetzt");
+        if (peek().kind == TokKind::Symbol && peek().text == ")")
+          throw SqlError("IN-Liste darf nicht leer sein");
+        while (true) {
+          auto [v, cur] = parsePolicyValue();
+          c.list.push_back(v);
+          c.list_is_current.push_back(cur ? 1 : 0);
+          if (matchSymbol(",")) continue;
+          break;
+        }
+        expectSymbol(")");
+        return c;
+      }
+      if (kw == "IS") {
+        if (neg) throw SqlError("Unbekannter Operator: NOT IS");
+        bool is_not = false;
+        if (peekKeyword("NOT")) {
+          ++pos_;
+          is_not = true;
+        }
+        expectKeyword("NULL");
+        if (lhsCur) {
+          c.lhs_is_current = true;
+          c.op = is_not ? "IS NOT NULL" : "IS NULL";
+          c.value = Value{std::monostate{}};
+          return c;
+        }
+        c.column = lhsCol;
+        c.op = is_not ? "IS NOT NULL" : "IS NULL";
+        c.value = Value{std::monostate{}};
+        return c;
+      }
+      throw SqlError("Unbekannter Operator: " +
+                     (neg ? ("NOT " + t.text) : t.text));
+    }
+    if (t.kind == TokKind::Symbol) {
+      if (neg) throw SqlError("Unbekannter Operator: NOT " + t.text);
+      static const char* kOps[] = {"=", "<", "<=", ">", ">=", "<>", "!="};
+      bool ok = false;
+      for (auto o : kOps)
+        if (t.text == o) ok = true;
+      if (!ok) throw SqlError("Unbekannter Operator: " + t.text);
+      std::string op = t.text;
+      if (op == "!=") op = "<>";
+      // RHS: current_user? Literal? Spalte (nur bei current_user-LHS)?
+      if (peekCurrentUser()) {
+        ++pos_;
+        if (lhsCur) throw SqlError("current_user = current_user sinnlos");
+        c.column = lhsCol;
+        c.op = op;
+        c.value_is_current = true;
+        return c;
+      }
+      // Literal-Erkennung wie parseJoinCond (Zahl/String/NULL/TRUE/FALSE).
+      const Token& u = peek();
+      bool isLit =
+          (u.kind == TokKind::Integer || u.kind == TokKind::Float ||
+           u.kind == TokKind::String);
+      if (!isLit && u.kind == TokKind::Symbol &&
+          (u.text == "-" || u.text == "+"))
+        isLit = true;
+      if (!isLit && u.kind == TokKind::Ident) {
+        std::string ku = toUpper(u.text);
+        if (ku == "NULL" || ku == "TRUE" || ku == "FALSE" ||
+            ku == "DEFAULT")
+          isLit = true;
+      }
+      if (isLit) {
+        auto [v, cur] = parsePolicyValue();
+        (void)cur;
+        if (lhsCur) {
+          // current_user OP literal: spaltenlose Konstante.
+          c.lhs_is_current = true;
+          c.op = op;
+          c.value = v;
+          return c;
+        }
+        c.column = lhsCol;
+        c.op = op;
+        c.value = v;
+        return c;
+      }
+      // Nicht-Literal: nur als getauschte Spalte bei current_user-LHS.
+      if (!lhsCur)
+        throw SqlError("Erwartet Literal oder current_user in POLICY USING");
+      if (peek().kind == TokKind::Symbol && peek().text == "(")
+        throw SqlError("Subquery in POLICY USING wird nicht unterstuetzt");
+      std::string rhsCol = parseColRef();
+      // LIKE-Familie nicht tauschbar (sinnlos) -> nur Vergleichs-Ops.
+      c.column = rhsCol;
+      c.op = invertCmpOp(op);
+      c.value_is_current = true;
+      return c;
+    }
+    throw SqlError("Erwartet Operator nach Spaltenname");
+  }
+
+  void parsePolicyWhereClause(std::vector<Condition>& where,
+                              std::vector<std::vector<Condition>>& groups) {
+    std::vector<std::vector<Condition>> tmp;
+    while (true) {
+      std::vector<Condition> conj;
+      conj.push_back(parsePolicyCondition());
+      while (matchKeyword("AND")) conj.push_back(parsePolicyCondition());
+      tmp.push_back(std::move(conj));
+      if (matchKeyword("OR")) continue;
+      break;
+    }
+    if (tmp.size() == 1) {
+      where = std::move(tmp[0]);
+    } else {
+      where.clear();
+      groups = std::move(tmp);
+    }
   }
 
   // WHERE als DNF (AND bindet staerker als OR): eine Konjunktion -> `where`,
@@ -2994,6 +3279,8 @@ std::string statementKind(const Statement& s) {
   if (std::holds_alternative<GrantStmt>(s)) return "GRANT";
   if (std::holds_alternative<RevokeStmt>(s)) return "REVOKE";
   if (std::holds_alternative<SetRoleStmt>(s)) return "SET";
+  if (std::holds_alternative<CreatePolicyStmt>(s)) return "CREATE POLICY";
+  if (std::holds_alternative<AlterTableRlsStmt>(s)) return "ALTER TABLE";
   return "SELECT";
 }
 
@@ -3065,6 +3352,187 @@ Result Database::execSetRole(const SetRoleStmt& s) {
   return {{}, {}, s.reset ? "RESET ROLE" : "SET ROLE", 0};
 }
 
+// ---------- RLS (Row-Level Security) ----------
+
+bool Database::rlsEnabled(const std::string& normTable) const {
+  return rls_on_.count(normTable) > 0;
+}
+
+bool Database::evalPolicyCond(const Table& t, const std::vector<Value>& row,
+                              const Condition& c) const {
+  if (c.subquery)
+    throw SqlError("Subquery in POLICY USING wird nicht unterstuetzt");
+  const Value roleVal{role_};
+  // Spaltenlose Konstante: "current_user OP literal/Liste".
+  if (c.lhs_is_current) {
+    if (c.op == "IS NULL") return false;
+    if (c.op == "IS NOT NULL") return true;
+    if (c.op == "IN" || c.op == "NOT IN") {
+      bool is_not = (c.op == "NOT IN");
+      bool has_null = false;
+      for (auto& e : c.list) {
+        if (valueIsNull(e)) {
+          has_null = true;
+          continue;
+        }
+        if (compareValues(roleVal, e) == 0) return !is_not;
+      }
+      if (!is_not) return false;
+      return !has_null;
+    }
+    if (c.op == "LIKE" || c.op == "ILIKE" || c.op == "NOT LIKE" ||
+        c.op == "NOT ILIKE") {
+      if (valueIsNull(c.value)) return false;
+      auto* ps = std::get_if<std::string>(&c.value);
+      if (!ps) throw SqlError(c.op + " braucht TEXT-Operanden");
+      bool m = likeMatch(role_, *ps, c.op == "ILIKE" || c.op == "NOT ILIKE");
+      return (c.op == "LIKE" || c.op == "ILIKE") ? m : !m;
+    }
+    if (valueIsNull(c.value)) return false;
+    if (c.op == "BETWEEN" || c.op == "NOT BETWEEN") return false;
+    int cmp = compareValues(roleVal, c.value);
+    if (cmp == -2) return false;
+    if (c.op == "=") return cmp == 0;
+    if (c.op == "<>") return cmp != 0;
+    if (c.op == "<") return cmp < 0;
+    if (c.op == "<=") return cmp <= 0;
+    if (c.op == ">") return cmp > 0;
+    if (c.op == ">=") return cmp >= 0;
+    throw SqlError("Unbekannter Operator: " + c.op);
+  }
+  int idx = t.colIndex(c.column);
+  if (idx < 0) throw SqlError("Unbekannte Spalte in POLICY USING: " + c.column);
+  const Value& v = row[static_cast<std::size_t>(idx)];
+  if (c.op == "IS NULL") return valueIsNull(v);
+  if (c.op == "IS NOT NULL") return !valueIsNull(v);
+  if (c.op == "IN" || c.op == "NOT IN") {
+    if (valueIsNull(v)) return false;
+    bool has_null = false;
+    for (std::size_t i = 0; i < c.list.size(); ++i) {
+      Value e = (i < c.list_is_current.size() && c.list_is_current[i])
+                    ? roleVal
+                    : c.list[i];
+      if (valueIsNull(e)) {
+        has_null = true;
+        continue;
+      }
+      if (compareValues(v, e) == 0) return (c.op == "IN");
+    }
+    if (c.op == "IN") return false;
+    return !has_null;
+  }
+  Value rhs = c.value_is_current ? roleVal : c.value;
+  Value rhs2 = c.second_is_current ? roleVal : c.second;
+  if (valueIsNull(v) || valueIsNull(rhs)) return false;
+  if (c.op == "BETWEEN" || c.op == "NOT BETWEEN") {
+    if (valueIsNull(rhs2)) return false;
+    int lo = compareValues(v, rhs);
+    int hi = compareValues(v, rhs2);
+    if (lo == -2 || hi == -2) return false;
+    bool in = (lo >= 0 && hi <= 0);
+    return (c.op == "BETWEEN") ? in : !in;
+  }
+  if (c.op == "LIKE" || c.op == "ILIKE" || c.op == "NOT LIKE" ||
+      c.op == "NOT ILIKE") {
+    auto* vs = std::get_if<std::string>(&v);
+    auto* ps = std::get_if<std::string>(&rhs);
+    if (!vs || !ps) throw SqlError(c.op + " braucht TEXT-Operanden");
+    bool m = likeMatch(*vs, *ps, c.op == "ILIKE" || c.op == "NOT ILIKE");
+    return (c.op == "LIKE" || c.op == "ILIKE") ? m : !m;
+  }
+  int cmp = compareValues(v, rhs);
+  if (cmp == -2) return false;
+  if (c.op == "=") return cmp == 0;
+  if (c.op == "<>") return cmp != 0;
+  if (c.op == "<") return cmp < 0;
+  if (c.op == "<=") return cmp <= 0;
+  if (c.op == ">") return cmp > 0;
+  if (c.op == ">=") return cmp >= 0;
+  throw SqlError("Unbekannter Operator: " + c.op);
+}
+
+bool Database::rowPassesRls(const Table& t, const std::vector<Value>& row,
+                             const std::string& normTable,
+                             const std::string& op) const {
+  if (role_.empty()) return true;  // Owner/Admin bypassed immer
+  if (!rlsEnabled(normTable)) return true;
+  auto it = policies_.find(normTable);
+  if (it == policies_.end()) return false;  // enabled, keine Policy -> deny
+  bool anyApplicable = false;
+  for (auto& p : it->second) {
+    if (p.command != "ALL" && p.command != op) continue;
+    if (p.role != "*" && p.role != role_) continue;
+    anyApplicable = true;
+    bool pass;
+    if (!p.where_groups.empty()) {
+      pass = false;
+      for (auto& conj : p.where_groups) {
+        bool ok = true;
+        for (auto& cc : conj) {
+          if (!evalPolicyCond(t, row, cc)) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          pass = true;
+          break;
+        }
+      }
+    } else {
+      pass = true;
+      for (auto& cc : p.where) {
+        if (!evalPolicyCond(t, row, cc)) {
+          pass = false;
+          break;
+        }
+      }
+    }
+    if (pass) return true;  // Policies per OR
+  }
+  (void)anyApplicable;
+  if (!anyApplicable) return false;  // keine Policy fuer Rolle+Op -> deny
+  return false;
+}
+
+Result Database::execCreatePolicy(const CreatePolicyStmt& s) {
+  requireAdmin("CREATE POLICY");
+  auto it = tables_.find(foldIdent(s.table));
+  if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  const std::string norm = foldIdent(s.table);
+  auto& vec = policies_[norm];
+  for (auto& p : vec)
+    if (foldIdent(p.policy) == foldIdent(s.policy))
+      throw SqlError("Policy existiert bereits: " + s.policy);
+  // USING-Spalten frueh validieren (unbekannt -> SqlError, keine Halb-Registry).
+  const Table& t = it->second;
+  auto check = [&](const Condition& c) {
+    if (c.subquery)
+      throw SqlError("Subquery in POLICY USING wird nicht unterstuetzt");
+    if (!c.lhs_is_current) {
+      if (t.colIndex(c.column) < 0)
+        throw SqlError("Unbekannte Spalte in POLICY USING: " + c.column);
+    }
+  };
+  for (auto& c : s.where) check(c);
+  for (auto& gr : s.where_groups)
+    for (auto& c : gr) check(c);
+  vec.push_back(s);
+  return {{}, {}, "CREATE POLICY", 0};
+}
+
+Result Database::execAlterRls(const AlterTableRlsStmt& s) {
+  requireAdmin("ALTER TABLE ... ROW LEVEL SECURITY");
+  auto it = tables_.find(foldIdent(s.table));
+  if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
+  const std::string norm = foldIdent(s.table);
+  if (s.enable)
+    rls_on_.insert(norm);
+  else
+    rls_on_.erase(norm);
+  return {{}, {}, s.enable ? "ENABLE ROW LEVEL SECURITY" : "DISABLE ROW LEVEL SECURITY", 0};
+}
+
 Result Database::execCreate(const CreateTableStmt& s) {
   requireAdmin("CREATE TABLE");
   std::string key = foldIdent(s.table);
@@ -3096,6 +3564,8 @@ Result Database::execInsert(const InsertStmt& s) {
     }
   }
   std::size_t n = 0;
+  std::vector<std::vector<Value>> pending;
+  pending.reserve(s.rows.size());
   for (auto& r : s.rows) {
     if (r.size() != colMap.size())
       throw SqlError("INSERT: Spaltenzahl passt nicht (" +
@@ -3106,6 +3576,14 @@ Result Database::execInsert(const InsertStmt& s) {
       full[(std::size_t)colMap[i]] =
           coerceTo(r[i], t.columns[(std::size_t)colMap[i]].type,
                    t.columns[(std::size_t)colMap[i]].name);
+    // RLS WITH CHECK: neue Rows muessen USING erfuellen (sonst 42501).
+    // Pruefung vor jeder Mutation (kein Halb-Insert bei Fehler).
+    if (!rowPassesRls(t, full, foldIdent(s.table), "INSERT"))
+      throw SqlError("permission denied for table " + s.table +
+                     " (SQLSTATE 42501)");
+    pending.push_back(std::move(full));
+  }
+  for (auto& full : pending) {
     t.rows.push_back(std::move(full));
     ++n;
   }
@@ -3163,20 +3641,33 @@ Result Database::execUpdate(const UpdateStmt& s) {
   SelectStmt f;
   f.where = s.where;
   f.where_groups = s.where_groups;
-  std::size_t n = 0;
-  for (auto& row : t.rows) {
+  const std::string normU = foldIdent(s.table);
+  // Phase 1: sichtbare Treffer sammeln (WHERE + RLS-Visibility), neue Zeilen
+  // berechnen + WITH CHECK pruefen (keine Mutation vor allen Checks).
+  std::vector<std::size_t> hitIdx;
+  std::vector<std::vector<Value>> newRows;
+  for (std::size_t ri = 0; ri < t.rows.size(); ++ri) {
+    auto& row = t.rows[ri];
     bool ok = subs.empty()
                   ? evalWhere(t, row, f)
                   : evalWhereSub(t, row, s.where, s.where_groups, subs);
     if (!ok) continue;
+    if (!rowPassesRls(t, row, normU, "UPDATE")) continue;  // unsichtbar
+    std::vector<Value> neu = row;
     for (std::size_t i = 0; i < s.sets.size(); ++i) {
       const std::size_t ti = static_cast<std::size_t>(setIdx[i]);
-      row[ti] = coerceTo(s.sets[i].second, t.columns[ti].type,
+      neu[ti] = coerceTo(s.sets[i].second, t.columns[ti].type,
                          t.columns[ti].name);
     }
-    ++n;
+    if (!rowPassesRls(t, neu, normU, "UPDATE"))
+      throw SqlError("permission denied for table " + s.table +
+                     " (SQLSTATE 42501)");
+    hitIdx.push_back(ri);
+    newRows.push_back(std::move(neu));
   }
-  return { {}, {}, "UPDATE " + std::to_string(n), n };
+  for (std::size_t i = 0; i < hitIdx.size(); ++i)
+    t.rows[hitIdx[i]] = std::move(newRows[i]);
+  return { {}, {}, "UPDATE " + std::to_string(hitIdx.size()), hitIdx.size() };
 }
 
 Result Database::execDelete(const DeleteStmt& s) {
@@ -3221,13 +3712,22 @@ Result Database::execDelete(const DeleteStmt& s) {
   SelectStmt f;
   f.where = s.where;
   f.where_groups = s.where_groups;
+  const std::string normD = foldIdent(s.table);
   std::vector<std::vector<Value>> kept;
   kept.reserve(t.rows.size());
   for (auto& row : t.rows) {
     bool ok = subs.empty()
                   ? evalWhere(t, row, f)
                   : evalWhereSub(t, row, s.where, s.where_groups, subs);
-    if (!ok) kept.push_back(row);
+    if (!ok) {
+      kept.push_back(row);
+      continue;
+    }
+    // RLS-Visibility: Rows ohne USING-Treffer sind unsichtbar (kein DELETE).
+    if (!rowPassesRls(t, row, normD, "DELETE")) {
+      kept.push_back(row);
+      continue;
+    }
   }
   std::size_t n = t.rows.size() - kept.size();
   t.rows = std::move(kept);
@@ -3243,6 +3743,8 @@ Result Database::execDrop(const DropTableStmt& s) {
   }
   tables_.erase(it);
   grants_.erase(foldIdent(s.table));  // Rechte fallen mit der Tabelle (PG)
+  policies_.erase(foldIdent(s.table));  // RLS-Policies fallen mit (PG)
+  rls_on_.erase(foldIdent(s.table));
   return { {}, {}, "DROP TABLE", 0 };
 }
 
@@ -3287,9 +3789,31 @@ Result Database::execSelect(const SelectStmt& s) {
       throw SqlError("Tabelle unbekannt: " + s.join_table);
     requirePriv(s.table, "SELECT");
     requirePriv(s.join_table, "SELECT");
+    // RLS-Visibility je Seite (Pre-Filter wie Single-Table, vor JOIN/AGGR).
+    Table lf = lit->second;
+    Table rf = rit->second;
+    const Table* lp = &lit->second;
+    const Table* rp = &rit->second;
+    const std::string normL = foldIdent(s.table);
+    const std::string normR = foldIdent(s.join_table);
+    if (!role_.empty() &&
+        (rlsEnabled(normL) || rlsEnabled(normR))) {
+      lf.rows.clear();
+      for (auto& row : lit->second.rows)
+        if (rowPassesRls(lit->second, row, normL, "SELECT")) lf.rows.push_back(row);
+      rf.rows.clear();
+      // Self-Join: rechte Seite aus derselben (gefilterten) Zeilenmenge.
+      const Table& rsrc =
+          (normL == normR) ? lit->second : rit->second;
+      const std::string& rnorm = (normL == normR) ? normL : normR;
+      for (auto& row : rsrc.rows)
+        if (rowPassesRls(rsrc, row, rnorm, "SELECT")) rf.rows.push_back(row);
+      lp = &lf;
+      rp = &rf;
+    }
     JoinCtx j;
-    j.left = &lit->second;
-    j.right = &rit->second;
+    j.left = lp;
+    j.right = rp;
     j.lTable = s.table;
     j.rTable = s.join_table;
     j.lEff = s.table_alias.empty() ? s.table : s.table_alias;
@@ -3308,13 +3832,16 @@ Result Database::execSelect(const SelectStmt& s) {
   if (it == tables_.end()) throw SqlError("Tabelle unbekannt: " + s.table);
   requirePriv(s.table, "SELECT");
   const Table& t = it->second;
-  // Filter (AND bzw. DNF bei OR; ohne Subqueries exakt der Altpfad)
+  const std::string normS = foldIdent(s.table);
+  // Filter (AND bzw. DNF bei OR; ohne Subqueries exakt der Altpfad) + RLS.
   std::vector<std::vector<Value>> kept;
   for (auto& row : t.rows) {
     bool ok = subs.empty()
                   ? evalWhere(t, row, s)
                   : evalWhereSub(t, row, s.where, s.where_groups, subs);
-    if (ok) kept.push_back(row);
+    if (!ok) continue;
+    if (!rowPassesRls(t, row, normS, "SELECT")) continue;  // unsichtbar
+    kept.push_back(row);
   }
   if (!s.group_by.empty()) {
     return execGroupedAggregates(t, kept, s);
@@ -3404,6 +3931,10 @@ Result Database::execute(const std::string& sql) {
     return execRevoke(std::get<RevokeStmt>(st));
   if (std::holds_alternative<SetRoleStmt>(st))
     return execSetRole(std::get<SetRoleStmt>(st));
+  if (std::holds_alternative<CreatePolicyStmt>(st))
+    return execCreatePolicy(std::get<CreatePolicyStmt>(st));
+  if (std::holds_alternative<AlterTableRlsStmt>(st))
+    return execAlterRls(std::get<AlterTableRlsStmt>(st));
   return execSelect(std::get<SelectStmt>(st));
 }
 
