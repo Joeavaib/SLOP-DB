@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <regex>
 #include <sstream>
@@ -1851,6 +1852,73 @@ Value evalAggExprNode(const Table& t, const std::vector<Value>& row,
   throw SqlError("Ungueltiger Aggregat-Ausdruck");
 }
 
+// s107-aggfast: Index-aufgeloester Aggregat-Ausdruck (gleiche Semantik wie
+// evalAggExprNode, nur ohne colIndex-Stringsuche pro Zeile). Einmal pro
+// computeAggregate aufgebaut (nicht pro Row); leerer Row-Set loest nichts
+// auf (Fehlerverhalten bei 0 Zeilen unveraendert: kein Throw wie vorher).
+struct ResolvedAgg {
+  AggExpr::Kind kind = AggExpr::Kind::Column;
+  int idx = -1;  // nur Kind::Column
+  Value literal{std::monostate{}};
+  char op = 0;  // nur Kind::Binary
+  std::unique_ptr<ResolvedAgg> left;
+  std::unique_ptr<ResolvedAgg> right;
+};
+
+std::unique_ptr<ResolvedAgg> resolveAggExpr(const Table& t, const AggExpr& e) {
+  auto r = std::make_unique<ResolvedAgg>();
+  r->kind = e.kind;
+  r->literal = e.literal;
+  r->op = e.op;
+  if (e.kind == AggExpr::Kind::Column) {
+    int idx = t.colIndex(e.column);
+    if (idx < 0) throw SqlError("Unbekannte Spalte: " + e.column);
+    r->idx = idx;
+  } else if (e.kind == AggExpr::Kind::Binary) {
+    if (!e.left || !e.right) throw SqlError("Ungueltiger Aggregat-Ausdruck");
+    r->left = resolveAggExpr(t, *e.left);
+    r->right = resolveAggExpr(t, *e.right);
+  }
+  return r;
+}
+
+Value evalResolvedAgg(const std::vector<Value>& row, const ResolvedAgg& r) {
+  switch (r.kind) {
+    case AggExpr::Kind::Column:
+      return row[static_cast<std::size_t>(r.idx)];
+    case AggExpr::Kind::Literal:
+      return r.literal;
+    case AggExpr::Kind::Binary: {
+      Value lv = evalResolvedAgg(row, *r.left);
+      Value rv = evalResolvedAgg(row, *r.right);
+      if (valueIsNull(lv) || valueIsNull(rv))
+        return Value{std::monostate{}};
+      if (std::holds_alternative<std::string>(lv) ||
+          std::holds_alternative<std::string>(rv) ||
+          std::holds_alternative<bool>(lv) ||
+          std::holds_alternative<bool>(rv))
+        throw SqlError("Aggregat-Ausdruck braucht numerische Operanden");
+      double a = aggToDouble(lv);
+      double b = aggToDouble(rv);
+      switch (r.op) {
+        case '+':
+          return Value{a + b};
+        case '-':
+          return Value{a - b};
+        case '*':
+          return Value{a * b};
+        case '/':
+          if (b == 0.0) return Value{std::monostate{}};
+          return Value{a / b};
+        default:
+          break;
+      }
+      throw SqlError("Unbekannter Operator in Aggregat");
+    }
+  }
+  throw SqlError("Ungueltiger Aggregat-Ausdruck");
+}
+
 void requireNumericForSumAvg(const Value& v, const std::string& func) {
   if (std::holds_alternative<std::string>(v) ||
       std::holds_alternative<bool>(v))
@@ -1867,10 +1935,18 @@ Value computeAggregate(const Table& t,
     return Value{static_cast<int64_t>(rows.size())};
   }
   if (!a.arg) throw SqlError("Aggregat ohne Argument: " + a.func);
+  // s107: Argument einmal aufloesen (statt colIndex pro Zeile). Nur bei
+  // nicht-leerem Set (leerer Set: kein Throw, wie vorher).
+  std::unique_ptr<ResolvedAgg> rarg;
+  if (!rows.empty()) rarg = resolveAggExpr(t, *a.arg);
+  auto argVal = [&](const std::vector<Value>* rp) -> Value {
+    if (rarg) return evalResolvedAgg(*rp, *rarg);
+    return evalAggExprNode(t, *rp, *a.arg);
+  };
   if (a.func == "COUNT") {
     int64_t c = 0;
     for (auto rp : rows) {
-      Value v = evalAggExprNode(t, *rp, *a.arg);
+      Value v = argVal(rp);
       if (!valueIsNull(v)) ++c;
     }
     return Value{c};
@@ -1879,7 +1955,7 @@ Value computeAggregate(const Table& t,
     bool any = false;
     double sum = 0.0;
     for (auto rp : rows) {
-      Value v = evalAggExprNode(t, *rp, *a.arg);
+      Value v = argVal(rp);
       if (valueIsNull(v)) continue;
       requireNumericForSumAvg(v, "SUM");
       sum += aggToDouble(v);
@@ -1891,7 +1967,7 @@ Value computeAggregate(const Table& t,
     double sum = 0.0;
     int64_t n = 0;
     for (auto rp : rows) {
-      Value v = evalAggExprNode(t, *rp, *a.arg);
+      Value v = argVal(rp);
       if (valueIsNull(v)) continue;
       requireNumericForSumAvg(v, "AVG");
       sum += aggToDouble(v);
@@ -1904,7 +1980,7 @@ Value computeAggregate(const Table& t,
     bool any = false;
     Value best{std::monostate{}};
     for (auto rp : rows) {
-      Value v = evalAggExprNode(t, *rp, *a.arg);
+      Value v = argVal(rp);
       if (valueIsNull(v)) continue;
       if (!any) {
         best = v;

@@ -891,3 +891,10 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor\" --output-on-failure && ./build/q6bench --selfcheck"
     engine: implement
     want: "Decode ohne Allokation: I/F via from_chars auf string_view mit stoll/stod-Fallback, gleiche Semantik/Fehler, Tests gruene"
+  - id: s107-aggfast
+    title: s107-aggfast
+    paths:
+      - src/sql/parser.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor\" --output-on-failure && ./build/q6bench --selfcheck"
+    engine: implement
+    want: "Aggregat-Fast-Path: AggExpr-Spaltenindizes einmal pro computeAggregate auflösen (gleiche Fehler/NULL-Semantik, leerer Set unverändert), Tests gruene"

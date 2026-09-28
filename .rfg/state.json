@@ -107,7 +107,8 @@
     "s103-sandboxduell",
     "s104-q6bench",
     "s105-q6fast",
-    "s106-decodefast"
+    "s106-decodefast",
+    "s107-aggfast"
   ],
   "verified": [
     "s07-index",
@@ -217,16 +218,17 @@
     "s103-sandboxduell",
     "s104-q6bench",
     "s105-q6fast",
-    "s106-decodefast"
+    "s106-decodefast",
+    "s107-aggfast"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s106-decodefast-1790616858",
-    "step_id": "s106-decodefast",
-    "commit": "ff86150d3b432b646b6ed31b24458a4161c79c1b",
+    "id": "cp-s107-aggfast-1790617068",
+    "step_id": "s107-aggfast",
+    "commit": "576d86e05faa974a78e669ae992ed3354f428030",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T17:34:18.563941+00:00"
+    "created_at": "2026-09-28T17:37:48.993258+00:00"
   },
   "checkpoints": [
     {
@@ -942,6 +944,13 @@
       "commit": "ff86150d3b432b646b6ed31b24458a4161c79c1b",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T17:34:18.563941+00:00"
+    },
+    {
+      "id": "cp-s107-aggfast-1790617068",
+      "step_id": "s107-aggfast",
+      "commit": "576d86e05faa974a78e669ae992ed3354f428030",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:37:48.993258+00:00"
     }
   ],
   "claim_step": "",
@@ -959,7 +968,8 @@
     "s103-sandboxduell",
     "s104-q6bench",
     "s105-q6fast",
-    "s106-decodefast"
+    "s106-decodefast",
+    "s107-aggfast"
   ],
   "claims": {}
 }
