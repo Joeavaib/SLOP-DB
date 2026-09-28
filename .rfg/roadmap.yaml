@@ -1074,3 +1074,14 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure && python3 tools/tpch/tpchvalid.py --data /tmp/tpchdata --db /tmp/tpchm2.db --out /tmp/valid.json"
     engine: implement
     want: "Korreliertes EXISTS per Hash-Semi-Join (q04 validiert): EXISTS/NOT EXISTS, equi-Korrelation, value_col-RHS, Pushdown-Markierung, Tests + Validierung gruen"
+  - id: s129-commajoin2
+    title: s129-commajoin2
+    paths:
+      - src/sql/parser.cpp
+      - tests/test_sql.cpp
+      - include/dbengine/sql/parser.h
+      - tools/tpch/tpchvalid.py
+      - docs/TPCH-FULL.md
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure && python3 tools/tpch/tpchvalid.py --data /tmp/tpchdata --db /tmp/tpchm2.db --out /tmp/valid.json"
+    engine: implement
+    want: "Komma-Join mit 2 Tabellen (q12/q19 validiert): Hash-Rewrite, WHERE-Klammern (DNF), Join-Eval mit value_col + CASE, Tests + Validierung gruen"

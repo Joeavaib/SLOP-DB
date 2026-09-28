@@ -109,11 +109,39 @@ int main() {
     }
     CHECK(t);
   }
-  // Komma-Join muss LAUT scheitern (frueher: nur erste Tabelle gelesen,
-  // Rest inkl. WHERE still verworfen).
+  // Komma-Join mit 3+ Tabellen bleibt LAUT (nur 2-Tabellen-Form via s129).
   bool threw = false;
   try {
-    db.execute("SELECT a FROM t, docs WHERE a = 1");
+    db.execute("SELECT a FROM t, docs, t AS x WHERE a = 1");
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+  // ---- s129: Komma-Join mit 2 Tabellen (= INNER JOIN per Hash) ----
+  auto rk = db.execute("CREATE TABLE u (id INT, v INT)");
+  CHECK(rk.message == "CREATE TABLE");
+  auto rki = db.execute("INSERT INTO u VALUES (1, 10), (2, 20), (5, 50)");
+  CHECK(rki.affected == 3);
+  // Equi + Rest-Filter, Ergebnis exakt.
+  auto rk1 = db.execute("SELECT a, v FROM t, u WHERE a = id AND v > 5 ORDER BY a");
+  CHECK(rk1.rows.size() == 2);
+  CHECK(valueToString(rk1.rows[0][0]) == "1");
+  CHECK(valueToString(rk1.rows[0][1]) == "10");
+  CHECK(valueToString(rk1.rows[1][0]) == "2");
+  CHECK(valueToString(rk1.rows[1][1]) == "20");
+  // OR-Zweige mit gemeinsamem Equi (q19-Muster).
+  auto rk2 = db.execute(
+      "SELECT a FROM t, u WHERE (a = id AND v > 5) OR (a = id AND v > 15) ORDER BY a");
+  CHECK(rk2.rows.size() == 2);
+  CHECK(valueToString(rk2.rows[0][0]) == "1");
+  CHECK(valueToString(rk2.rows[1][0]) == "2");
+  // Komma ohne Equi = Kreuzprodukt + Filter (korrekt, dokumentiert langsam).
+  auto rk3 = db.execute("SELECT a FROM t, u WHERE a = 1 AND id = 1");
+  CHECK(rk3.rows.size() == 1);
+  // Mischung Komma + JOIN-Schluesselwort wirft laut.
+  threw = false;
+  try {
+    db.execute("SELECT a FROM t, u JOIN docs ON a = 1");
   } catch (...) {
     threw = true;
   }

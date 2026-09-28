@@ -18,11 +18,13 @@ import subprocess
 import sys
 from decimal import Decimal
 
-QUERIES = ["q01", "q04", "q06", "q19", "q20"]
-# s126: q19/q20 nutzen Komma-Joins -> seit s126 LAUT abgelehnt (vorher
-# stillschweigend falsch!). Als dokumentiert-offen markiert: sie duerfen
-# (nur sie) mit Feature-Fehler scheitern, ohne das Gate zu schwaechen.
-EXPECTED_OPEN = {"q19", "q20"}
+QUERIES = ["q01", "q04", "q06", "q12", "q19", "q20"]
+# s126: q19/q20 nutzten Komma-Joins -> seit s126 LAUT abgelehnt (vorher
+# stillschweigend falsch!). q19 laeuft seit s129 (Comma-2-Hash-Rewrite) und
+# wird validiert; q20 braucht korrelierte Skalar-Subquery (offen).
+# Als dokumentiert-offen markiert: sie duerfen (nur sie) mit Feature-Fehler
+# scheitern, ohne das Gate zu schwaechen.
+EXPECTED_OPEN = {"q20"}
 
 
 def strip(sql):

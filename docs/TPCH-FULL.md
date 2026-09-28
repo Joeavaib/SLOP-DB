@@ -94,3 +94,27 @@ q19/q20 seit s126 LAUT abgelehnt (Komma-Join) statt still-falsch —
 Offen (laut, nicht still): CASE-Skalar-Arithmetik über Aggregaten
 (q14-Ratio), Multi-Join, Derived Tables, CASE-in-WHERE, unkorrelierte
 EXISTS mit Aggregaten.
+
+## 8. Comma-Join-2 + WHERE-Klammern (s129) — q19 validiert (4/22)
+
+`FROM a, b` (genau 2 Tabellen) wird auf den bestehenden INNER-JOIN-Pfad
+umgeschrieben (Hash-Keys entdeckt `execJoinRows` aus WHERE: Equi-Paare,
+die in ALLEN OR-Zweigen vorkommen; ohne gemeinsames Equi Nested-Loop +
+Filter — immer korrekt, da WHERE als Filter erhalten bleibt). 3+ Tabellen
+und Mischung mit JOIN-Schluesselwort werfen laut. Dazu:
+- Spalten-RHS (`a = b`) in der Join-Evaluierung (`evalJoinCondition`).
+- Geklammerte WHERE-Gruppen `(...)` via DNF-Normalisierung (AND-Distribution,
+  Tiefe ≤ 32, `NOT (...)`/leere Klammern laut); bisheriges AND/OR-Verhalten
+  unverändert (Fuzz grün).
+- Validiert: q19 = 60053.7630 wie DuckDB (SF0.01). q12 braucht zusätzlich
+  JOIN+GROUP (läuft noch nicht — Comma deckt nur 2 Tabellen ohne ON ab;
+  q12 FROM orders,lineitem ist Comma-2! — prüft s130).
+
+## 9. Comma-Join-2 + q12/q19 validiert (s129, 6/22)
+
+q12 (Comma-Join + CASE + GROUP BY) läuft und stimmt exakt mit DuckDB
+überein (SHIP 61/96, TRUCK 67/88, SF0.01); q19 = 60053.7630 wie DuckDB.
+Dazu fehlten noch: CASE im Join-Aggregat-Pfad (`evalJoinAggNode`),
+`value_col` in `evalJoinCondition`, WHERE-Klammern (DNF-Normalisierung).
+Validiert: q01, q04, q06, q12, q19 (+ q20 dokumentiert-offen: korrelierte
+Skalar-Subquery). Matrix-Stand: **5/22 validiert**, Rest failt laut.

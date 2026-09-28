@@ -286,6 +286,10 @@ struct SelectStmt {
   std::string join_table;
   std::string join_alias;  // "" = join_table
   std::vector<JoinCond> join_on;  // AND-Kette (>= 1 wenn has_join)
+  // s129: true = Join kam aus Komma-Syntax (`FROM a, b`, genau 2 Tabellen).
+  // join_on bleibt leer; Equi-Keys entdeckt execJoinRows zur Laufzeit aus
+  // WHERE (Hash wenn moeglich, sonst Nested-Loop + Filter — immer korrekt).
+  bool comma_join = false;
   std::vector<std::string> columns;  // leer + select_all = "*"
                                          // Eintraege "c" oder "t.c" (JOIN)
   std::vector<std::string> column_aliases;  // parallel zu columns, "" = kein Alias

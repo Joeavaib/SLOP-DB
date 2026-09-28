@@ -818,22 +818,58 @@ class Parser {
   // WHERE als DNF (AND bindet staerker als OR): eine Konjunktion -> `where`,
   // mehrere OR-Gruppen -> `groups`. Von SELECT/UPDATE/DELETE gemeinsam
   // genutzt (Semantik identisch).
-  void parseWhereClause(std::vector<Condition>& where,
-                        std::vector<std::vector<Condition>>& groups) {
-    std::vector<std::vector<Condition>> tmp;
+  // s129: geklammerte Gruppen `(...)` werden in DNF normalisiert
+  // (AND von DNFs = Kreuzprodukt der Konjunktionen, OR = Anhaengen).
+  // `NOT (...)` und leere Klammern werfen laut; Schachteltiefe <= 32.
+  std::vector<std::vector<Condition>> parseWhereOr(int depth) {
+    if (depth > 32) throw SqlError("WHERE zu tief geschachtelt (max 32)");
+    std::vector<std::vector<Condition>> out = parseWhereAnd(depth);
+    while (matchKeyword("OR")) {
+      auto rhs = parseWhereAnd(depth);
+      out.insert(out.end(), rhs.begin(), rhs.end());
+    }
+    return out;
+  }
+  std::vector<std::vector<Condition>> parseWhereAnd(int depth) {
+    if (depth > 32) throw SqlError("WHERE zu tief geschachtelt (max 32)");
+    std::vector<std::vector<Condition>> acc;
+    acc.emplace_back();
     while (true) {
-      std::vector<Condition> conj;
-      conj.push_back(parseCondition());
-      while (matchKeyword("AND")) conj.push_back(parseCondition());
-      tmp.push_back(std::move(conj));
-      if (matchKeyword("OR")) continue;
+      std::vector<std::vector<Condition>> unit;
+      if (peek().kind == TokKind::Symbol && peek().text == "(") {
+        ++pos_;
+        if (peekKeyword("SELECT"))
+          throw SqlError(
+              "Subquery als WHERE-Gruppe wird nicht unterstuetzt "
+              "(IN/EXISTS/Skalar am Vergleich nutzen)");
+        unit = parseWhereOr(depth + 1);
+        expectSymbol(")");
+      } else {
+        unit.emplace_back();
+        unit.back().push_back(parseCondition());
+      }
+      // AND-Distribution: acc x unit.
+      std::vector<std::vector<Condition>> next;
+      for (auto& a : acc)
+        for (auto& b : unit) {
+          std::vector<Condition> m = a;
+          m.insert(m.end(), b.begin(), b.end());
+          next.push_back(std::move(m));
+        }
+      acc = std::move(next);
+      if (matchKeyword("AND")) continue;
       break;
     }
-    if (tmp.size() == 1) {
-      where = std::move(tmp[0]);
+    return acc;
+  }
+  void parseWhereClause(std::vector<Condition>& where,
+                        std::vector<std::vector<Condition>>& groups) {
+    std::vector<std::vector<Condition>> dnf = parseWhereOr(0);
+    if (dnf.size() == 1) {
+      where = std::move(dnf[0]);
     } else {
       where.clear();
-      groups = std::move(tmp);
+      groups = std::move(dnf);
     }
   }
 
@@ -1463,12 +1499,35 @@ class Parser {
           "FROM (SELECT ...) wird nicht unterstuetzt (keine Derived Tables)");
     s.table = parseIdent();
     s.table_alias = parseOptAlias();
-    // s126: Komma-Join (FROM a, b) wird LAUT abgelehnt statt stillschweigend
-    // nur die erste Tabelle zu lesen und Rest (inkl. WHERE) zu verwerfen.
-    if (peek().kind == TokKind::Symbol && peek().text == ",")
-      throw SqlError(
-          "Komma-Join wird nicht unterstuetzt (explizites INNER JOIN mit ON "
-          "nutzen)");
+    // s129: Komma-Join mit genau 2 Tabellen (FROM a, b [AS y]) als
+    // INNER-JOIN-Form (Hash-Keys entdeckt execJoinRows aus WHERE).
+    // 3+ Tabellen oder Mischung mit JOIN-Schluesselwort werfen laut.
+    if (peek().kind == TokKind::Symbol && peek().text == ",") {
+      ++pos_;
+      s.join_table = parseIdent();
+      s.join_alias = parseOptAlias();
+      if (peek().kind == TokKind::Symbol && peek().text == ",")
+        throw SqlError(
+            "Nur 2 Tabellen im Komma-Join werden unterstuetzt "
+            "(mehr via explizite INNER JOINs erst ab V2)");
+      s.has_join = true;
+      s.comma_join = true;
+      {
+        const std::string lEff =
+            s.table_alias.empty() ? s.table : s.table_alias;
+        const std::string rEff =
+            s.join_alias.empty() ? s.join_table : s.join_alias;
+        if (!s.table.empty() && foldIdent(s.table) == foldIdent(s.join_table) &&
+            foldIdent(lEff) == foldIdent(rEff))
+          throw SqlError(
+              "Self-Join braucht zwei verschiedene Aliase "
+              "(FROM t AS x, t AS y ...)");
+      }
+      if (peekJoinStart())
+        throw SqlError(
+            "Komma-Join nicht mit JOIN-Schluesselwort mischen "
+            "(entweder Komma oder explizites INNER JOIN)");
+    }
     // Genau ein optionaler INNER JOIN: [INNER] JOIN u [AS y] ON ... [AND ...].
     if (peekJoinStart()) {
       if (peekKeyword("INNER")) {
@@ -3023,13 +3082,30 @@ bool evalJoinOnCond(const JoinCtx& j, const std::vector<Value>& crow,
 }
 
 // WHERE-Condition auf Combined-Row (Koerper wie evalCondition, nur
-// Aufloesung join-bewusst).
+// Aufloesung join-bewusst). s129: value_col-RHS analog (beide Seiten ueber
+// Combined-Row aufgeloest).
 bool evalJoinCondition(const JoinCtx& j, const std::vector<Value>& crow,
                        const Condition& c) {
   if (c.subquery)
     throw SqlError("Subquery ohne Ausfuehrungskontext (interner Fehler)");
   int idx = resolveJoinCol(j, c.column);
   const Value& v = crow[static_cast<std::size_t>(idx)];
+  if (!c.value_col.empty()) {
+    if (c.op != "=" && c.op != "<>" && c.op != "<" && c.op != "<=" &&
+        c.op != ">" && c.op != ">=")
+      throw SqlError("Spaltenvergleich nur mit Vergleichs-Operator");
+    int jdx = resolveJoinCol(j, c.value_col);
+    const Value& w = crow[static_cast<std::size_t>(jdx)];
+    if (valueIsNull(v) || valueIsNull(w)) return false;
+    int cmp = compareValues(v, w);
+    if (cmp == -2) return false;
+    if (c.op == "=") return cmp == 0;
+    if (c.op == "<>") return cmp != 0;
+    if (c.op == "<") return cmp < 0;
+    if (c.op == "<=") return cmp <= 0;
+    if (c.op == ">") return cmp > 0;
+    return cmp >= 0;  // ">="
+  }
   if (c.op == "IS NULL") return valueIsNull(v);
   if (c.op == "IS NOT NULL") return !valueIsNull(v);
   if (c.op == "IN" || c.op == "NOT IN") {
@@ -3130,6 +3206,28 @@ Value evalJoinAggNode(const JoinCtx& j, const std::vector<Value>& crow,
           break;
       }
       throw SqlError("Unbekannter Operator in Aggregat");
+    }
+    case AggExpr::Kind::Case: {
+      // s129: CASE auch auf Combined-Rows (WHERE-DNF via join-bewusstem Eval).
+      for (const auto& w : e.whens) {
+        bool matched = false;
+        for (const auto& conj : w.dnf) {
+          bool ok = true;
+          for (const auto& c : conj) {
+            if (!evalJoinCondition(j, crow, c)) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) {
+            matched = true;
+            break;
+          }
+        }
+        if (matched) return evalJoinAggNode(j, crow, *w.then);
+      }
+      if (e.else_) return evalJoinAggNode(j, crow, *e.else_);
+      return Value{std::monostate{}};
     }
   }
   throw SqlError("Ungueltiger Aggregat-Ausdruck");
@@ -3461,18 +3559,111 @@ bool joinIsHashable(const JoinCtx& j, const SelectStmt& s,
                     std::vector<int>& lKeys, std::vector<int>& rKeys) {
   lKeys.clear();
   rKeys.clear();
-  if (s.join_on.empty()) return false;
-  for (auto& c : s.join_on) {
-    if (c.op != "=" || !c.right_is_col) return false;
-    int li = resolveJoinCol(j, c.left);
-    int ri = resolveJoinCol(j, c.right);
-    bool lInL = static_cast<std::size_t>(li) < j.nL;
-    bool rInL = static_cast<std::size_t>(ri) < j.nL;
-    if (lInL == rInL) return false;  // gleiche Seite -> kein Join-Key
-    int lLocal = lInL ? li : ri;
-    int rLocal = (lInL ? ri : li) - static_cast<int>(j.nL);
-    lKeys.push_back(lLocal);
-    rKeys.push_back(rLocal);
+  if (!s.join_on.empty()) {
+    for (auto& c : s.join_on) {
+      if (c.op != "=" || !c.right_is_col) return false;
+      int li = resolveJoinCol(j, c.left);
+      int ri = resolveJoinCol(j, c.right);
+      bool lInL = static_cast<std::size_t>(li) < j.nL;
+      bool rInL = static_cast<std::size_t>(ri) < j.nL;
+      if (lInL == rInL) return false;  // gleiche Seite -> kein Join-Key
+      int lLocal = lInL ? li : ri;
+      int rLocal = (lInL ? ri : li) - static_cast<int>(j.nL);
+      lKeys.push_back(lLocal);
+      rKeys.push_back(rLocal);
+    }
+    return true;
+  }
+  // s129: Komma-Join ohne ON — Equi-Keys aus WHERE entdecken (Hash wenn
+  // moeglich, sonst Nested-Loop + Filter in execJoinRows; immer korrekt,
+  // da WHERE als Filter erhalten bleibt).
+  if (!s.comma_join) return false;
+  // Kandidaten: cross-table `=` mit Spalten-RHS, je Top-Level-Konjunktion.
+  // Nur Paare, die in ALLEN Konjunktionen vorkommen (sonst wuerde der Hash
+  // Zeilen verwerfen, die eine OR-Branch ohne Equi erfuellt).
+  std::vector<std::vector<std::pair<std::string, std::string>>> per_conj;
+  auto collect = [&](const std::vector<Condition>& conj) {
+    std::vector<std::pair<std::string, std::string>> found;
+    for (auto& c : conj) {
+      if (c.exists_pred || c.subquery || c.value_col.empty()) continue;
+      if (c.op != "=") continue;
+      // Beide Seiten muessen je genau einer Seite angehoeren (sonst kein
+      // Cross-Equi; Fehler hier NICHT laut — Filter entscheidet).
+      int li = -1, ri = -1;
+      try {
+        li = resolveJoinCol(j, c.column);
+      } catch (...) {
+        continue;
+      }
+      // RHS-Spalte aufloesen (wie evalJoinOnCond, aber ohne Wertvergleich).
+      int vj = -1;
+      try {
+        vj = resolveJoinCol(j, c.value_col);
+      } catch (...) {
+        continue;
+      }
+      const bool lInL =
+          static_cast<std::size_t>(li) < j.nL;
+      const bool vInL =
+          static_cast<std::size_t>(vj) < j.nL;
+      if (lInL == vInL) continue;  // gleiche Seite -> kein Join-Key
+      const std::string& lcol = lInL ? c.column : c.value_col;
+      const std::string& rcol = lInL ? c.value_col : c.column;
+      found.emplace_back(lcol, rcol);
+    }
+    return found;
+  };
+  if (!s.where_groups.empty()) {
+    for (auto& conj : s.where_groups) per_conj.push_back(collect(conj));
+  } else {
+    per_conj.push_back(collect(s.where));
+  }
+  if (per_conj.empty()) return false;
+  // Schnittmenge ueber Konjunktionen (Spaltennamen lower-gefoldet, als
+  // ungeordnetes Paar — Orientierung wird unten frisch aufgeloest).
+  auto canon = [](const std::pair<std::string, std::string>& pr) {
+    std::string a = pr.first, b = pr.second;
+    for (auto& ch : a)
+      ch = static_cast<char>(std::tolower((unsigned char)ch));
+    for (auto& ch : b)
+      ch = static_cast<char>(std::tolower((unsigned char)ch));
+    if (a > b) std::swap(a, b);
+    return std::make_pair(a, b);
+  };
+  std::map<std::pair<std::string, std::string>,
+           std::pair<std::string, std::string>>
+      common;
+  for (auto& pr : per_conj[0]) common[canon(pr)] = pr;
+  for (std::size_t gi = 1; gi < per_conj.size(); ++gi) {
+    std::map<std::pair<std::string, std::string>,
+             std::pair<std::string, std::string>>
+        next;
+    for (auto& pr : per_conj[gi]) {
+      auto it = common.find(canon(pr));
+      if (it != common.end()) next[it->first] = it->second;
+    }
+    common = std::move(next);
+  }
+  if (common.empty()) return false;  // kein gemeinsames Equi -> Nested-Loop
+  for (auto& [key, pr] : common) {
+    (void)key;
+    // Linke/rechte Seite bestimmen (kann pro Paar-Seite variieren).
+    int li = -1, ri = -1;
+    try {
+      li = resolveJoinCol(j, pr.first);
+    } catch (...) {
+      return false;
+    }
+    try {
+      ri = resolveJoinCol(j, pr.second);
+    } catch (...) {
+      return false;
+    }
+    const bool lInL = static_cast<std::size_t>(li) < j.nL;
+    const bool rInL = static_cast<std::size_t>(ri) < j.nL;
+    if (lInL == rInL) return false;  // unerwartet -> Nested-Loop (korrekt)
+    lKeys.push_back(lInL ? li : ri);
+    rKeys.push_back((lInL ? ri : li) - static_cast<int>(j.nL));
   }
   return true;
 }
@@ -4668,7 +4859,7 @@ Result Database::execSelect(const SelectStmt& s) {
       throw SqlError(
           "JOIN braucht disjunkte Tabellen-Aliase (Self-Join: FROM t AS x "
           "JOIN t AS y ...)");
-    if (s.join_on.empty())
+    if (s.join_on.empty() && !s.comma_join)
       throw SqlError("JOIN ohne ON wird nicht unterstuetzt");
     return execJoinSelect(j, s, subs);
   }
