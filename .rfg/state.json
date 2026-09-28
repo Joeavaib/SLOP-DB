@@ -122,7 +122,9 @@
     "s118-fuzzstate",
     "s119-fuzzmvcc",
     "s120-fuzzsql",
-    "s121-fairbench"
+    "s121-fairbench",
+    "s122-tpchkit",
+    "s123-tpchmatrix"
   ],
   "verified": [
     "s07-index",
@@ -247,16 +249,18 @@
     "s118-fuzzstate",
     "s119-fuzzmvcc",
     "s120-fuzzsql",
-    "s121-fairbench"
+    "s121-fairbench",
+    "s122-tpchkit",
+    "s123-tpchmatrix"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s121-fairbench-1790627945",
-    "step_id": "s121-fairbench",
-    "commit": "9df7c8eda8c52ac0ede158430a15c0b738f2efc0",
+    "id": "cp-s123-tpchmatrix-1790629396",
+    "step_id": "s123-tpchmatrix",
+    "commit": "0b9e2786bdfc93403f51dc5a7387127638f660c8",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T20:39:05.972514+00:00"
+    "created_at": "2026-09-28T21:03:16.599436+00:00"
   },
   "checkpoints": [
     {
@@ -1077,6 +1081,20 @@
       "commit": "9df7c8eda8c52ac0ede158430a15c0b738f2efc0",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T20:39:05.972514+00:00"
+    },
+    {
+      "id": "cp-s122-tpchkit-1790629090",
+      "step_id": "s122-tpchkit",
+      "commit": "a9dd31682900dc9a3adee49748fdf1a7cef8fd23",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T20:58:10.755830+00:00"
+    },
+    {
+      "id": "cp-s123-tpchmatrix-1790629396",
+      "step_id": "s123-tpchmatrix",
+      "commit": "0b9e2786bdfc93403f51dc5a7387127638f660c8",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T21:03:16.599436+00:00"
     }
   ],
   "claim_step": "",
@@ -1109,7 +1127,9 @@
     "s118-fuzzstate",
     "s119-fuzzmvcc",
     "s120-fuzzsql",
-    "s121-fairbench"
+    "s121-fairbench",
+    "s122-tpchkit",
+    "s123-tpchmatrix"
   ],
   "claims": {}
 }

@@ -1011,3 +1011,19 @@ steps:
     verify: cmake --build build -j4 && python3 tools/fairbench.py --rows 10000 --reps 2 --out /tmp/fair_smoke.json && test -f docs/FAIR-DUELL.md
     engine: implement
     want: "Fairer Drei-Wege-Duell: byte-identische Daten (validiert), Warmup+Median/p95, PRAGMA-Offenlegung, JSON + docs/FAIR-DUELL.md mit Methodik aus Recherche"
+  - id: s122-tpchkit
+    title: s122-tpchkit
+    paths:
+      - tools/tpch/
+      - docs/TPCH-FULL.md
+    verify: cmake --build build -j4 && python3 tools/tpch/tpchgen.py --sf 0.01 --out /tmp/tpchdata --manifest && test -f docs/TPCH-FULL.md
+    engine: implement
+    want: "TPC-H-Kit vendored: 22 kanonische qgen-Queries (Seed 42) + Generator DuckDB-dbgen->CSV (INT-Dates, Manifest mit Counts/Hashes) + TPCH-FULL-Doku (Dialekt-Adaptation)"
+  - id: s123-tpchmatrix
+    title: s123-tpchmatrix
+    paths:
+      - tools/tpch/tpchmatrix.py
+      - docs/TPCH-FULL.md
+    verify: cmake --build build -j4 && python3 tools/tpch/tpchmatrix.py --data /tmp/tpchdata --db /tmp/tpchm.db --queries tools/tpch/queries --out /tmp/matrix.json && test -f docs/TPCH-FULL.md
+    engine: implement
+    want: "Support-Matrix: Loader CSV->dbengine (Batches, Escapes) + alle 22 kanonischen Queries fahren (OK/FAIL+Hash+ms als JSON), Matrix an TPCH-FULL.md angehängt"
