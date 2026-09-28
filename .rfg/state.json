@@ -101,7 +101,10 @@
     "s97-vacuum",
     "s98-trace",
     "s99-docs2020",
-    "s100-ckptwarn"
+    "s100-ckptwarn",
+    "s101-netsandbox",
+    "s102-dummyapp",
+    "s103-sandboxduell"
   ],
   "verified": [
     "s07-index",
@@ -205,16 +208,19 @@
     "s97-vacuum",
     "s98-trace",
     "s99-docs2020",
-    "s100-ckptwarn"
+    "s100-ckptwarn",
+    "s101-netsandbox",
+    "s102-dummyapp",
+    "s103-sandboxduell"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s100-ckptwarn-1790614957",
-    "step_id": "s100-ckptwarn",
-    "commit": "29a5a9666a9b827740ec3a69f19f0192fb213f56",
+    "id": "cp-s103-sandboxduell-1790615381",
+    "step_id": "s103-sandboxduell",
+    "commit": "135942a27ff76ded5e914dc36b696c8a65665ca2",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T17:02:37.001446+00:00"
+    "created_at": "2026-09-28T17:09:41.637016+00:00"
   },
   "checkpoints": [
     {
@@ -888,6 +894,27 @@
       "commit": "29a5a9666a9b827740ec3a69f19f0192fb213f56",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T17:02:37.001446+00:00"
+    },
+    {
+      "id": "cp-s101-netsandbox-1790615233",
+      "step_id": "s101-netsandbox",
+      "commit": "ab9983a7dc609f1476a32beed42914613457a352",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:07:13.191557+00:00"
+    },
+    {
+      "id": "cp-s102-dummyapp-1790615293",
+      "step_id": "s102-dummyapp",
+      "commit": "22a46913e4801886eca0b6396e480aacf6b58310",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:08:13.845545+00:00"
+    },
+    {
+      "id": "cp-s103-sandboxduell-1790615381",
+      "step_id": "s103-sandboxduell",
+      "commit": "135942a27ff76ded5e914dc36b696c8a65665ca2",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:09:41.637016+00:00"
     }
   ],
   "claim_step": "",
@@ -899,7 +926,10 @@
     "s97-vacuum",
     "s98-trace",
     "s99-docs2020",
-    "s100-ckptwarn"
+    "s100-ckptwarn",
+    "s101-netsandbox",
+    "s102-dummyapp",
+    "s103-sandboxduell"
   ],
   "claims": {}
 }

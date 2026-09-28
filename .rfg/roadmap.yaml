@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 21: Doku Welle 20 + Checkpoint-Härtung + Raft-Membership-Doku. Alles verifiziert."
+  statement: "C++ DB Engine Welle 22: Virtuelle L2/L3-Sandbox + Dummy-App-Load + Stabilitäts/Speed-Duell. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -845,3 +845,26 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"dbfile|executor\" --output-on-failure"
     engine: implement
     want: "Checkpoint-Warnung ehrlich: Container ohne WAL ist leer, Exit-Checkpoint-Doku + CLI-Hinweis, alte Tests gruene"
+  - id: s101-netsandbox
+    title: s101-netsandbox
+    paths:
+      - tools/netsandbox.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ./build/netsandbox --selfcheck
+    engine: implement
+    want: "Virtuelle L2/L3-Sandbox: L2-Switch (MAC-Lerntable, Partition/Heal) + L3-Router (Subnetze/Routen) in-process STL-only, netsandbox-Binary mit --selfcheck"
+  - id: s102-dummyapp
+    title: s102-dummyapp
+    paths:
+      - tools/dummy_app.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ./build/dummy_app --selfcheck
+    engine: implement
+    want: "Dummy-App-Load: gemischter KV/SQL/ANN-Workload über Sandbox-L3 mit Throughput/p95 + Stabilitäts-Asserts, dummy_app-Binary mit --selfcheck"
+  - id: s103-sandboxduell
+    title: s103-sandboxduell
+    paths:
+      - docs/NETSANDBOX-DUELL.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R bench --output-on-failure && test -f docs/NETSANDBOX-DUELL.md
+    engine: implement
+    want: "Sandbox-Duellbericht: Dummy-App vs SQLite unter Partition/Heal, Methodik + Zahlen + ehrliches Urteil in docs/NETSANDBOX-DUELL.md"
