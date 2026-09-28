@@ -995,3 +995,11 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R fuzz --output-on-failure
     engine: implement
     want: "MVCC-Interleaving-Fuzz: Writer/Reader-Verschränkung + Purge gegen Versions-Modell (Snapshot-Schutz nie verletzt), deterministisch, ctest fuzz gruen"
+  - id: s120-fuzzsql
+    title: s120-fuzzsql
+    paths:
+      - tests/test_fuzz.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ctest --test-dir build -R fuzz --output-on-failure
+    engine: implement
+    want: "SQL-Fuzz: DML/DDL-Mix (INSERT/UPDATE/DELETE/SELECT-Aggregate/DROP/VACUUM) gegen Tabellen-Modell, exakte Result-Vergleiche, deterministisch, ctest fuzz gruen"

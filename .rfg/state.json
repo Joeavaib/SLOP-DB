@@ -120,7 +120,8 @@
     "s116-cdcindex",
     "s117-pagerstream",
     "s118-fuzzstate",
-    "s119-fuzzmvcc"
+    "s119-fuzzmvcc",
+    "s120-fuzzsql"
   ],
   "verified": [
     "s07-index",
@@ -243,16 +244,17 @@
     "s116-cdcindex",
     "s117-pagerstream",
     "s118-fuzzstate",
-    "s119-fuzzmvcc"
+    "s119-fuzzmvcc",
+    "s120-fuzzsql"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s119-fuzzmvcc-1790626462",
-    "step_id": "s119-fuzzmvcc",
-    "commit": "6c7d083f260a3c225edbe6f17c314704bb5ca525",
+    "id": "cp-s120-fuzzsql-1790626701",
+    "step_id": "s120-fuzzsql",
+    "commit": "4dd25ea2407586a64491aaff2a5bf72ea10f293c",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T20:14:22.440663+00:00"
+    "created_at": "2026-09-28T20:18:21.877712+00:00"
   },
   "checkpoints": [
     {
@@ -1059,6 +1061,13 @@
       "commit": "6c7d083f260a3c225edbe6f17c314704bb5ca525",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T20:14:22.440663+00:00"
+    },
+    {
+      "id": "cp-s120-fuzzsql-1790626701",
+      "step_id": "s120-fuzzsql",
+      "commit": "4dd25ea2407586a64491aaff2a5bf72ea10f293c",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T20:18:21.877712+00:00"
     }
   ],
   "claim_step": "",
@@ -1089,7 +1098,8 @@
     "s116-cdcindex",
     "s117-pagerstream",
     "s118-fuzzstate",
-    "s119-fuzzmvcc"
+    "s119-fuzzmvcc",
+    "s120-fuzzsql"
   ],
   "claims": {}
 }

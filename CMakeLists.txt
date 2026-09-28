@@ -366,7 +366,7 @@ add_test(NAME q6bench COMMAND q6bench --selfcheck)
 
 # s118-fuzzstate: deterministischer stateful Fuzzer (Modell + Reopens)
 add_executable(test_fuzz tests/test_fuzz.cpp)
-target_link_libraries(test_fuzz PRIVATE btreekv dbengine_wal dbengine_mvcc dbengine_kv)
+target_link_libraries(test_fuzz PRIVATE btreekv dbengine_wal dbengine_mvcc dbengine_kv executor sql)
 target_include_directories(test_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(test_fuzz PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME fuzz COMMAND test_fuzz)

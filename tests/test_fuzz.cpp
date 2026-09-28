@@ -6,8 +6,10 @@
 // Aufruf: test_fuzz [--seed N]. CTest-Name: fuzz.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <random>
@@ -17,6 +19,7 @@
 
 #include "dbengine/kv.h"
 #include "dbengine/kv/btree.h"
+#include "dbengine/sql/executor.h"
 #include "dbengine/storage/wal.h"
 #include "dbengine/txn/mvcc.h"
 
@@ -497,6 +500,234 @@ bool FuzzMvcc(unsigned seed) {
   return true;
 }
 
+// ---- Executor-SQL vs. Tabellen-Modell (DML/DDL/Aggregate) -----------------
+// Modell: map<id,val> (INT only, keine NULLs). WHERE-Templates nur ueber id,
+// Erwartung in C++ nachgerechnet, SELECTs mit ORDER BY id (deterministisch).
+// Frische IDs aus monotonem Zaehler (keine PK-Duplikate). DROP/CREATE-Zyklen,
+// VACUUM (kein Modell-Effekt), gelegentlich invalides SQL (muss werfen,
+// Modell + Engine danach weiter nutzbar).
+bool FuzzSql(unsigned seed) {
+  using dbengine::sql::Executor;
+  using dbengine::sql::Result;
+  using dbengine::sql::Value;
+  std::mt19937 rng(seed + 3000);
+  std::uniform_int_distribution<int> op_d(0, 99);
+  std::uniform_int_distribution<int> val_d(-1000, 1000);
+  dbengine::kv::KVStore kv;
+  dbengine::txn::MvccStore mvcc;
+  Executor ex(kv, mvcc, nullptr);
+  std::map<int64_t, int64_t> tab;
+  bool exists = false;
+  int64_t next_id = 1;
+  auto exec_ok = [&](const std::string& q, Result* out = nullptr) -> bool {
+    try {
+      Result r = ex.execute(q);
+      if (out) *out = std::move(r);
+      return true;
+    } catch (...) {
+      return false;
+    }
+  };
+  // WHERE-Generator: gibt (sql, praedikat) zurueck.
+  auto gen_where = [&](std::function<bool(int64_t)>* pred) -> std::string {
+    const int t = rng() % 6;
+    const int64_t a = val_d(rng) % 200, b = val_d(rng) % 200;
+    const int64_t lo = std::min(a, b), hi = std::max(a, b);
+    switch (t) {
+      case 0: *pred = [a](int64_t id) { return id == a; };
+        return "id = " + std::to_string(a);
+      case 1: *pred = [lo, hi](int64_t id) { return id >= lo && id <= hi; };
+        return "id BETWEEN " + std::to_string(lo) + " AND " + std::to_string(hi);
+      case 2: {
+        int64_t x = val_d(rng) % 200, y = val_d(rng) % 200, z = val_d(rng) % 200;
+        *pred = [x, y, z](int64_t id) { return id == x || id == y || id == z; };
+        return "id IN (" + std::to_string(x) + "," + std::to_string(y) + "," +
+               std::to_string(z) + ")";
+      }
+      case 3: *pred = [a](int64_t id) { return id < a; };
+        return "id < " + std::to_string(a);
+      case 4: *pred = [a](int64_t id) { return id >= a; };
+        return "id >= " + std::to_string(a);
+      default: *pred = [a](int64_t id) { return id != a; };
+        return "id <> " + std::to_string(a);
+    }
+  };
+  if (!exec_ok("CREATE TABLE t (id INT, val INT)")) {
+    std::cout << "FAIL fuzz-sql/create\n";
+    return false;
+  }
+  exists = true;
+  constexpr int kOps = 3000;
+  for (int step = 0; step < kOps; ++step) {
+    const int r = op_d(rng);
+    if (!exists) {
+      // Tabelle weg: nur CREATE ist legal; alles andere muss werfen.
+      if (r < 70) {
+        if (!exec_ok("CREATE TABLE t (id INT, val INT)")) {
+          std::cout << "FAIL fuzz-sql/recreate step=" << step << "\n";
+          return false;
+        }
+        exists = true;
+        tab.clear();
+      } else {
+        Result tmp;
+        if (exec_ok("SELECT * FROM t", &tmp)) {
+          std::cout << "FAIL fuzz-sql/select-on-missing step=" << step << "\n";
+          return false;
+        }
+      }
+      continue;
+    }
+    if (r < 35) {
+      // Multi-INSERT mit frischen IDs.
+      const int n = 1 + rng() % 5;
+      std::string q = "INSERT INTO t VALUES ";
+      std::vector<std::pair<int64_t, int64_t>> rows;
+      for (int i = 0; i < n; ++i) {
+        const int64_t id = next_id++, v = val_d(rng);
+        rows.emplace_back(id, v);
+        q += (i ? "," : "") + std::string("(") + std::to_string(id) + "," +
+             std::to_string(v) + ")";
+      }
+      if (!exec_ok(q)) {
+        std::cout << "FAIL fuzz-sql/insert step=" << step << " q=" << q << "\n";
+        return false;
+      }
+      for (auto& [id, v] : rows) tab[id] = v;
+    } else if (r < 50) {
+      std::function<bool(int64_t)> pred;
+      const std::string w = gen_where(&pred);
+      const int64_t nv = val_d(rng);
+      if (!exec_ok("UPDATE t SET val = " + std::to_string(nv) + " WHERE " + w)) {
+        std::cout << "FAIL fuzz-sql/update step=" << step << "\n";
+        return false;
+      }
+      for (auto& [id, v] : tab)
+        if (pred(id)) v = nv;
+    } else if (r < 60) {
+      std::function<bool(int64_t)> pred;
+      const std::string w = gen_where(&pred);
+      if (!exec_ok("DELETE FROM t WHERE " + w)) {
+        std::cout << "FAIL fuzz-sql/delete step=" << step << "\n";
+        return false;
+      }
+      for (auto it = tab.begin(); it != tab.end();) {
+        if (pred(it->first))
+          it = tab.erase(it);
+        else
+          ++it;
+      }
+    } else if (r < 80) {
+      // SELECT * mit/ohne WHERE, ORDER BY id, exakter Zeilenvergleich.
+      std::function<bool(int64_t)> pred;
+      const bool filtered = (rng() % 3 != 0);
+      const std::string w = filtered ? gen_where(&pred) : "";
+      Result got;
+      if (!exec_ok("SELECT id, val FROM t" + (filtered ? " WHERE " + w : "") +
+                       " ORDER BY id",
+                   &got)) {
+        std::cout << "FAIL fuzz-sql/select step=" << step << "\n";
+        return false;
+      }
+      std::vector<std::pair<int64_t, int64_t>> want;
+      for (auto& [id, v] : tab) {
+        if (!filtered || pred(id)) want.emplace_back(id, v);
+      }
+      if (got.rows.size() != want.size()) {
+        std::cout << "FAIL fuzz-sql/select-size step=" << step << " got="
+                  << got.rows.size() << " want=" << want.size() << "\n";
+        return false;
+      }
+      for (size_t i = 0; i < want.size(); ++i) {
+        auto* gi = std::get_if<int64_t>(&got.rows[i][0]);
+        auto* gv = std::get_if<int64_t>(&got.rows[i][1]);
+        if (!gi || !gv || *gi != want[i].first || *gv != want[i].second) {
+          std::cout << "FAIL fuzz-sql/select-content step=" << step << " row=" << i
+                    << "\n";
+          return false;
+        }
+      }
+    } else if (r < 90) {
+      // Aggregate gegen Modell (SUM NULL bei leer).
+      std::function<bool(int64_t)> pred;
+      const bool filtered = (rng() % 2 == 0);
+      const std::string w = filtered ? gen_where(&pred) : "";
+      Result got;
+      if (!exec_ok("SELECT SUM(val), COUNT(*) FROM t" +
+                       (filtered ? " WHERE " + w : ""),
+                   &got)) {
+        std::cout << "FAIL fuzz-sql/agg step=" << step << "\n";
+        return false;
+      }
+      int64_t n = 0;
+      int64_t sum = 0;
+      for (auto& [id, v] : tab) {
+        if (!filtered || pred(id)) {
+          ++n;
+          sum += v;
+        }
+      }
+      if (got.rows.size() != 1 || got.rows[0].size() != 2) {
+        std::cout << "FAIL fuzz-sql/agg-shape step=" << step << "\n";
+        return false;
+      }
+      const Value& s0 = got.rows[0][0];
+      const Value& s1 = got.rows[0][1];
+      auto* cn = std::get_if<int64_t>(&s1);
+      if (!cn || *cn != n) {
+        std::cout << "FAIL fuzz-sql/agg-count step=" << step << "\n";
+        return false;
+      }
+      if (n == 0) {
+        if (!dbengine::sql::valueIsNull(s0)) {
+          std::cout << "FAIL fuzz-sql/agg-sum-null step=" << step << "\n";
+          return false;
+        }
+      } else {
+        int64_t got_sum = 0;
+        if (auto* sv = std::get_if<int64_t>(&s0)) {
+          got_sum = *sv;
+        } else if (auto* dv = std::get_if<double>(&s0)) {
+          got_sum = static_cast<int64_t>(std::llround(*dv));
+        } else {
+          std::cout << "FAIL fuzz-sql/agg-sum-type step=" << step << "\n";
+          return false;
+        }
+        if (got_sum != sum) {
+          std::cout << "FAIL fuzz-sql/agg-sum step=" << step << " got=" << got_sum
+                    << " want=" << sum << "\n";
+          return false;
+        }
+      }
+    } else if (r < 93) {
+      if (!exec_ok("DROP TABLE t")) {
+        std::cout << "FAIL fuzz-sql/drop step=" << step << "\n";
+        return false;
+      }
+      exists = false;
+      tab.clear();
+    } else if (r < 96) {
+      if (!exec_ok("VACUUM")) {
+        std::cout << "FAIL fuzz-sql/vacuum step=" << step << "\n";
+        return false;
+      }
+    } else {
+      // Invalides SQL muss werfen; Engine danach weiter nutzbar.
+      if (exec_ok("SELEC * FRM t WHER")) {
+        std::cout << "FAIL fuzz-sql/invalid-accepted step=" << step << "\n";
+        return false;
+      }
+      Result probe;
+      const bool want_ok = exists;
+      if (exec_ok("SELECT COUNT(*) FROM t", &probe) != want_ok) {
+        std::cout << "FAIL fuzz-sql/post-error-usable step=" << step << "\n";
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 int main(int argc, char** argv) {
   unsigned seed = 42;
   for (int i = 1; i + 1 < argc; ++i) {
@@ -506,6 +737,7 @@ int main(int argc, char** argv) {
   Check(FuzzBTree(seed), "fuzz-btree-model");
   Check(FuzzWal(seed), "fuzz-wal-model");
   Check(FuzzMvcc(seed), "fuzz-mvcc-model");
+  Check(FuzzSql(seed), "fuzz-sql-model");
   if (g_fail == 0) {
     std::cout << "FUZZ TESTS PASSED (seed " << seed << ")\n";
     return 0;
