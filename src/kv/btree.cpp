@@ -324,15 +324,12 @@ std::vector<std::pair<std::string, std::string>> BTreeKV::ScanRange(
   std::vector<std::pair<std::string, std::string>> out;
   if (!open_ || limit == 0) return out;
   if (!to.empty() && to < from) return out;
-  std::vector<std::pair<std::string, std::string>> all;
-  all.reserve(static_cast<std::size_t>(count_));
-  InOrder(root_, &all);
-  for (auto& kv : all) {
-    if (kv.first < from) continue;
-    if (!to.empty() && !(kv.first < to)) break;  // sortiert => Abbruch
-    out.push_back(std::move(kv));
-    if (out.size() >= limit) break;
-  }
+  // s115: kein Full-Walk mehr — Abbruch bei Limit/to, Pruning vor `from`.
+  VisitRange(root_, from, !to.empty(), to,
+             [&](const std::string& k, const std::string& v) {
+               out.emplace_back(k, v);
+               return out.size() < limit;
+             });
   return out;
 }
 
@@ -341,20 +338,15 @@ std::vector<std::pair<std::string, std::string>> BTreeKV::Scan(
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<std::pair<std::string, std::string>> out;
   if (!open_ || limit == 0) return out;
-  std::vector<std::pair<std::string, std::string>> all;
-  all.reserve(static_cast<std::size_t>(count_));
-  InOrder(root_, &all);
-  auto it = prefix.empty()
-                ? all.begin()
-                : std::lower_bound(all.begin(), all.end(), prefix,
-                                   [](const auto& kv, const std::string& p) {
-                                     return kv.first < p;
-                                   });
-  for (; it != all.end(); ++it) {
-    if (!prefix.empty() && !HasPrefix(it->first, prefix)) break;
-    out.emplace_back(it->first, it->second);
-    if (out.size() >= limit) break;
-  }
+  // s115: kein Full-Walk mehr. Prefix-Keys liegen sortiert zusammenhaengend
+  // ab `prefix`: alles < prefix wird geprunt/geskippt, beim ersten Key >=
+  // prefix ohne Prefix ist der Bereich zu Ende (fn=false).
+  VisitRange(root_, prefix, false, "",
+             [&](const std::string& k, const std::string& v) {
+               if (!prefix.empty() && !HasPrefix(k, prefix)) return false;
+               out.emplace_back(k, v);
+               return out.size() < limit;
+             });
   return out;
 }
 
@@ -412,16 +404,14 @@ std::unique_ptr<BTreeKV::Iterator> BTreeKV::NewIterator(
   std::lock_guard<std::mutex> lock(mutex_);
   std::vector<std::pair<std::string, std::string>> data;
   if (open_) {
-    data.reserve(static_cast<std::size_t>(count_));
-    InOrder(root_, &data);
-    if (!prefix.empty()) {
-      std::vector<std::pair<std::string, std::string>> filt;
-      filt.reserve(data.size());
-      for (auto& kv : data) {
-        if (HasPrefix(kv.first, prefix)) filt.push_back(std::move(kv));
-      }
-      data = std::move(filt);
-    }
+    // s115: nur Treffer materialisieren (kein Full-Walk + Filter danach).
+    // Stabile Kopie-Sicht bleibt (Iterator immun gegen spaetere Writes).
+    VisitRange(root_, prefix, false, "",
+               [&](const std::string& k, const std::string& v) {
+                 if (!prefix.empty() && !HasPrefix(k, prefix)) return false;
+                 data.emplace_back(k, v);
+                 return true;
+               });
   }
   return std::unique_ptr<Iterator>(new Iterator(std::move(data)));
 }
@@ -723,6 +713,45 @@ void BTreeKV::InOrder(
     out->emplace_back(node.keys[i], node.vals[i]);
   }
   InOrder(node.childs.back(), out);
+}
+
+// s115: wie InOrder, aber mit [from, to)-Fenster, Subtree-Pruning und
+// fn-Abbruch. Invarianten: Kind childs[i] haelt Keys < keys[i];
+// childs.back() haelt Keys > keys.back(). Pruning ist exakt:
+// - childs[i] ueberspringen wenn keys[i] <= from (alle Keys darin < from,
+//   denn < keys[i] <= from). Gleichheit zaehlt: Keys < keys[i]==from sind < from.
+// - nach dem Fenster (key >= to) sofort false (sortiert: alles Weitere >= to).
+// - leeres Blatt: nichts zu tun (true). Leerer innerer Knoten ohne Keys:
+//   defensiv Kind 0 besuchen falls vorhanden (darf nicht vorkommen).
+bool BTreeKV::VisitRange(
+    std::uint64_t id, const std::string& from, bool has_to,
+    const std::string& to,
+    const std::function<bool(const std::string&, const std::string&)>& fn) const {
+  const Node& node = nodes_.at(id);
+  if (node.leaf) {
+    for (std::size_t i = 0; i < node.keys.size(); ++i) {
+      const std::string& k = node.keys[i];
+      if (k < from) continue;
+      if (has_to && !(k < to)) return false;
+      if (!fn(k, node.vals[i])) return false;
+    }
+    return true;
+  }
+  if (node.keys.empty()) {
+    if (!node.childs.empty()) return VisitRange(node.childs[0], from, has_to, to, fn);
+    return true;
+  }
+  for (std::size_t i = 0; i < node.keys.size(); ++i) {
+    if (from < node.keys[i]) {
+      if (!VisitRange(node.childs[i], from, has_to, to, fn)) return false;
+    }
+    const std::string& k = node.keys[i];
+    if (k < from) continue;
+    if (has_to && !(k < to)) return false;
+    if (!fn(k, node.vals[i])) return false;
+  }
+  if (has_to && !(node.keys.back() < to)) return false;
+  return VisitRange(node.childs.back(), from, has_to, to, fn);
 }
 
 // ---- Persistenz (Shadow-Paging) --------------------------------------------

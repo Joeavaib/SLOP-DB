@@ -60,6 +60,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -201,6 +202,17 @@ class BTreeKV {
   std::pair<std::string, std::string> MinOf(std::uint64_t id) const;
   void InOrder(std::uint64_t id,
                std::vector<std::pair<std::string, std::string>>* out) const;
+  // s115: sortierter Besuch mit Early-Stop + Subtree-Pruning. `from` = inkl.
+  // Untergrenze ("" = alles), `has_to`/`to` = exkl. Obergrenze. fn(key,val)
+  // liefert false bei Abbruchwunsch (Limit erreicht). Rueckgabe false =
+  // abgebrochen (Limit oder to erreicht), true = Teilbaum vollstaendig.
+  // Pruning: Kind-Teilbaeume, deren Keys alle < from sind, werden gar nicht
+  // betreten; nach `to` wird nicht weiter abgestiegen. Semantik identisch zu
+  // gefiltertem InOrder (gleiche Reihenfolge, gleiche Menge bis Abbruch).
+  bool VisitRange(std::uint64_t id, const std::string& from, bool has_to,
+                  const std::string& to,
+                  const std::function<bool(const std::string&,
+                                           const std::string&)>& fn) const;
 
   // Persistenz (Shadow-Paging ueber Pager-Hull).
   bool LoadAll();  // Superblock + Knoten laden, Waisen-GC

@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "DBEngine Korrektheits-Welle: adversarial Befunde schließen (WAL-LSN, Batch-Atomarität, BTree-Rollback, MVCC-Identity, Pager-Count, CRC-Threadsafety). Alles verifiziert."
+  statement: "DBEngine Perf-Welle: kein Full-Scan trotz Limit (BTree-Visitor), kein Full-Replay trotz CDC-Limit (Offset-Index), kein Riesen-Stream beim Pager-Load. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -954,3 +954,29 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"wal|chaos\" --output-on-failure"
     engine: implement
     want: "CRC-Tabellen thread-safe: magic-static const Array statt check-then-act Bool (3 Stellen), Multithread-Regressionstest, alte Tests gruene"
+  - id: s115-scanstop
+    title: s115-scanstop
+    paths:
+      - src/kv/btree.cpp
+      - tests/test_btree.cpp
+      - include/dbengine/kv/btree.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R btreekv --output-on-failure
+    engine: implement
+    want: "BTree-Scans mit Early-Stop: Visitor bricht bei Limit/Prefix-Ende ab (Scan, ScanRange, Iterator), kein Full-Walk, Test mit 50k+Limit=1, alte Tests gruene"
+  - id: s116-cdcindex
+    title: s116-cdcindex
+    paths:
+      - src/storage/wal.cpp
+      - include/dbengine/storage/wal.h
+      - tests/test_wal.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"wal|chaos\" --output-on-failure"
+    engine: implement
+    want: "WAL Offset-Index: LSN->Dateioffset bei open/scan+append gepflegt, read_from seekts direkt (kein Full-Replay), Checkpoint kappt Index, Test mit Limit=1 auf großem WAL, alte Tests gruene"
+  - id: s117-pagerstream
+    title: s117-pagerstream
+    paths:
+      - src/storage/pager.cpp
+      - tests/test_pager.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"pager|btreekv\" --output-on-failure"
+    engine: implement
+    want: "Pager-Load ohne Riesen-Stream: Records inkrementell pro Page mit Carry parsen (max 1 Page + 1 Record im Speicher), Test mit großer Datei, alte Tests gruene"

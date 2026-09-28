@@ -115,7 +115,10 @@
     "s111-btreerollback",
     "s112-mvccmove",
     "s113-pagercount",
-    "s114-crconce"
+    "s114-crconce",
+    "s115-scanstop",
+    "s116-cdcindex",
+    "s117-pagerstream"
   ],
   "verified": [
     "s07-index",
@@ -233,16 +236,19 @@
     "s111-btreerollback",
     "s112-mvccmove",
     "s113-pagercount",
-    "s114-crconce"
+    "s114-crconce",
+    "s115-scanstop",
+    "s116-cdcindex",
+    "s117-pagerstream"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s114-crconce-1790618577",
-    "step_id": "s114-crconce",
-    "commit": "679786746c0e87b8ff0469db680d12d2cc22091e",
+    "id": "cp-s117-pagerstream-1790619867",
+    "step_id": "s117-pagerstream",
+    "commit": "1efb372acea2f67e374343e8ae10740f71dcfb22",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T18:02:57.864389+00:00"
+    "created_at": "2026-09-28T18:24:27.165101+00:00"
   },
   "checkpoints": [
     {
@@ -1014,6 +1020,27 @@
       "commit": "679786746c0e87b8ff0469db680d12d2cc22091e",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T18:02:57.864389+00:00"
+    },
+    {
+      "id": "cp-s115-scanstop-1790619413",
+      "step_id": "s115-scanstop",
+      "commit": "992948eec73c6536eae4a90619ff15049bb45043",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T18:16:53.694862+00:00"
+    },
+    {
+      "id": "cp-s116-cdcindex-1790619694",
+      "step_id": "s116-cdcindex",
+      "commit": "64110365313608984265472b8af4f12884e9499c",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T18:21:34.174270+00:00"
+    },
+    {
+      "id": "cp-s117-pagerstream-1790619867",
+      "step_id": "s117-pagerstream",
+      "commit": "1efb372acea2f67e374343e8ae10740f71dcfb22",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T18:24:27.165101+00:00"
     }
   ],
   "claim_step": "",
@@ -1039,7 +1066,10 @@
     "s111-btreerollback",
     "s112-mvccmove",
     "s113-pagercount",
-    "s114-crconce"
+    "s114-crconce",
+    "s115-scanstop",
+    "s116-cdcindex",
+    "s117-pagerstream"
   ],
   "claims": {}
 }

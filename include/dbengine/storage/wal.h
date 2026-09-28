@@ -188,6 +188,9 @@ class Wal {
   // Scannt Datei, gibt (records, gueltige_bytes, max_lsn) zurueck.
   struct ScanResult {
     std::vector<WalRecord> records;
+    // s116: Record-Start-Offsets (Dateibyteoffset je records[i]), parallel
+    // zu records — Basis des LSN-Offset-Index (read_from ohne Full-Replay).
+    std::vector<int64_t> offsets;
     int64_t valid_bytes = 0;
     uint64_t max_lsn = 0;
     // Stop-Grund vor gueltigem EOF: GCM-Record ohne Schluessel gesehen
@@ -203,6 +206,11 @@ class Wal {
   /// replay_file() nutzt immer nullptr (Prefix bis zum ersten GCM-Record,
   /// kappt nie). Instanzmethoden uebergeben den gesetzten Schluessel.
   static ScanResult scan(int fd, const Key32* key);
+  /// s116: Scan ab Dateioffset `start` mit Record-Limit (0 = alle). Basis
+  /// fuer read_from ohne Full-Replay. Offsets in ScanResult sind absolute
+  /// Dateioffsets. scan(fd[,key]) delegiert mit start=0, Limit 0.
+  static ScanResult scan_at(int fd, const Key32* key, int64_t start,
+                            size_t max_records);
   static int64_t file_size(int fd);
   /// Schreibt einen GCM-Record (Nonce frisch, AAD=magic+lsn+len, CRC ueber
   /// Chiffre). Nur mit Schluessel aufrufen; wirft runtime_error bei
@@ -216,6 +224,14 @@ class Wal {
   uint64_t durable_lsn_ = 0;
   uint64_t appends_ = 0;
   uint64_t flushes_ = 0;
+  // s116: LSN-Offset-Index (lsn -> Record-Startoffset, streng steigend,
+  // parallel zum Dateiinhalt). Unter mu_. Aufbau bei open/checkpoint aus
+  // scan-Offsets, Fortfuehrung bei jedem append. read_from seekts per
+  // lower_bound direkt an die Position (kein Full-Replay); Indexfehler
+  // fallen nur auf leere/kuerzere Ergebnisse zurueck, nie auf falsche.
+  std::vector<std::pair<uint64_t, int64_t>> lsn_index_;
+  // Append-Endposition (== Dateigroesse nach Truncate/Rebuild). Unter mu_.
+  int64_t end_offset_ = 0;
   // At-rest-Key (Single-Key-Modell, nur via setEncryptionKey/clear).
   // Unter mu_, ausserhalb nie kopieren/loggen.
   bool enc_enabled_ = false;

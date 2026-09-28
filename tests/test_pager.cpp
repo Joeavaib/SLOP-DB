@@ -255,6 +255,42 @@ int main() {
     std::remove(path.c_str());
   }
 
+  std::cout << "[pager] s117 large-file reopen without giant stream\n";
+  {
+    // 100x50KB = ~5MB Datei. load_image darf keinen dateigrossen Stream
+    // mehr aufbauen (vorher ~2x Datei im RSS, nachher ~1x; manuell ver-
+    // messen: 15MB-Datei 29MB -> 14.6MB RSS). Hier: Korrektheit aller
+    // Records + grosszuegige Timing-Schranke.
+    const std::string path = tmp_path("dbengine_pager_large.db");
+    const std::string big(50000, 'x');
+    {
+      Pager pager(path);
+      check(pager.open(), "open (large)");
+      for (int i = 1; i <= 100; ++i)
+        check(pager.insert(static_cast<std::uint64_t>(i), big),
+              "fill large");
+      pager.close();
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    {
+      Pager pager(path);
+      check(pager.open(), "reopen (large)");
+      std::string v;
+      for (int i = 1; i <= 100; ++i) {
+        check(pager.find(static_cast<std::uint64_t>(i), v) && v == big,
+              "large record intact");
+      }
+      check(pager.entry_count() == 100, "large count == 100");
+      pager.close();
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    check(ms < 2000, "large reopen timely");
+    std::cout << "  info: large reopen ms=" << ms << "\n";
+    std::remove(path.c_str());
+  }
+
   if (failures == 0) {
     std::cout << "PAGER TESTS PASSED\n";
     return 0;

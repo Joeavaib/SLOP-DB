@@ -494,8 +494,49 @@ void TestPersistFailureRollback() {
   std::filesystem::remove_all(dir, ec);
 }
 
-int main() {
-  TestOpenEmpty();
+// s115: Early-Stop — limit=1 auf 100k-Baum darf keinen Full-Walk machen
+// (vorher ~5 ms Vollmaterialisierung, jetzt µs). Korrektheit exakt:
+// Range-Bounds, Prefix-Ende, Iterator-Vergleich.
+void TestScanEarlyStop() {
+  const std::string path = TmpPath("scanstop");
+  BTreeKV db;
+  Check(db.Open(path), "scanstop/open");
+  char k[32];
+  for (int i = 0; i < 100000; ++i) {
+    std::snprintf(k, sizeof k, "p:%06d", i);
+    Check(db.Put(k, "v"), "scanstop/fill");
+  }
+  Check(db.Flush(), "scanstop/flush");
+  auto t0 = std::chrono::steady_clock::now();
+  auto r1 = db.Scan("p:000000", 1);
+  auto t1 = std::chrono::steady_clock::now();
+  Check(r1.size() == 1 && r1[0].first == "p:000000", "scanstop/limit1-exact");
+  const auto us1 =
+      std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+  Check(us1 < 1000, "scanstop/limit1-no-fullwalk");
+  auto rr = db.ScanRange("p:050000", "p:050010", 100);
+  Check(rr.size() == 10, "scanstop/range-count");
+  for (int i = 0; i < 10; ++i) {
+    std::snprintf(k, sizeof k, "p:%06d", 50000 + i);
+    Check(rr[static_cast<size_t>(i)].first == k, "scanstop/range-exact");
+  }
+  // Prefix-Ende: Treffer muessen exakt bei Prefix-Grenze aufhoeren.
+  auto rp = db.Scan("p:00000", 100000);
+  Check(rp.size() == 10, "scanstop/prefix-count");
+  // Leerer Prefix + Limit 0 Verhalten unveraendert.
+  Check(db.Scan("p:", 0).empty(), "scanstop/limit0-empty");
+  Check(db.Scan("zzz", 5).empty(), "scanstop/miss-empty");
+  // Iterator ueber Prefix sieht dieselbe Menge.
+  auto it = db.NewIterator("p:00000");
+  std::size_t m = 0;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) ++m;
+  Check(m == 10, "scanstop/iterator-prefix-count");
+  std::cout << "  info: scanstop limit1 us=" << us1 << "\n";
+  db.Close();
+  Cleanup(path);
+}
+
+int main() {  TestOpenEmpty();
   TestBasicCrud();
   TestPuts10k();
   TestScanRange();
@@ -506,6 +547,7 @@ int main() {
   TestOversize();
   TestIterator();
   TestPersistFailureRollback();
+  TestScanEarlyStop();
 
   if (g_failures == 0) {
     std::cout << "ALL BTREE TESTS PASSED\n";

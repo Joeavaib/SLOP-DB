@@ -304,6 +304,66 @@ int main() {
     std::cout << "[wal] crc/init parallel ok\n";
   }
 
+  // 7. s116: Offset-Index — read_from ohne Full-Replay.
+  {
+    const std::string p = tmp_path("dbengine_test_wal_cdcidx");
+    constexpr int kN = 100000;
+    {
+      Wal w(p);
+      w.open();
+      for (int i = 0; i < kN; ++i) w.append("cdc-" + std::to_string(i));
+      w.flush();
+      // Differential gegen replay(): viele (from,max)-Kombos exakt gleich.
+      auto ref = w.replay();
+      check(ref.size() == static_cast<size_t>(kN), "cdc ref size");
+      const uint64_t probes[][2] = {{1, 0}, {1, 1}, {2, 5}, {50000, 10},
+                                    {99999, 0}, {100000, 1}, {100001, 0},
+                                    {100001, 5}, {75000, 100000}};
+      for (auto [from, mx] : probes) {
+        auto got = w.read_from(from, static_cast<size_t>(mx));
+        std::vector<WalRecord> want;
+        for (auto& r : ref) {
+          if (r.lsn < from) continue;
+          want.push_back(r);
+          if (mx && want.size() >= mx) break;
+        }
+        check(got.size() == want.size(), "cdc differential size");
+        for (size_t i = 0; i < got.size(); ++i) {
+          check(got[i].lsn == want[i].lsn, "cdc differential lsn");
+          check(got[i].data == want[i].data, "cdc differential payload");
+        }
+      }
+      // Tail-Limit=1 muss schnell sein (vorher Full-Replay ~300ms/200k).
+      auto t0 = std::chrono::steady_clock::now();
+      auto tail = w.read_from(static_cast<uint64_t>(kN), 1);
+      auto t1 = std::chrono::steady_clock::now();
+      check(tail.size() == 1 && tail[0].lsn == static_cast<uint64_t>(kN),
+            "cdc tail exact");
+      const auto us =
+          std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+      check(us < 30000, "cdc tail no full-replay");
+      std::cout << "[wal] cdc tail1 us=" << us << '\n';
+      // Checkpoint kappt Index: nur noch 60001.. lesbar (read_from(1)
+      // liefert per Definition lsn>=1, also den Rest — wie replay+Filter).
+      w.checkpoint(60000);
+      auto gone = w.read_from(1, 0);
+      check(gone.size() == static_cast<size_t>(kN - 60000) &&
+                gone.front().lsn == 60001,
+            "cdc post-checkpoint old gone");
+      auto rest = w.read_from(60001, 0);
+      check(rest.size() == static_cast<size_t>(kN - 60000), "cdc post-checkpoint rest");
+      check(rest.front().lsn == 60001 && rest.back().lsn == static_cast<uint64_t>(kN),
+            "cdc post-checkpoint bounds");
+      // Append nach Checkpoint wird fortgefuehrt.
+      w.append("cdc-new");
+      auto n = w.read_from(static_cast<uint64_t>(kN) + 1, 0);
+      check(n.size() == 1 && n[0].data == "cdc-new", "cdc append-after-checkpoint");
+      w.close();
+    }
+    std::filesystem::remove(p);
+    std::cout << "[wal] cdc offset-index ok\n";
+  }
+
 #if defined(__linux__)
   // Echter Kill-9-Harness (Linux only, fork/kill/waitpid/SIGKILL + Pipes).
   // N=2000, deterministische Payloads "rec-<i>" (i=0..N-1, LSN=i+1).

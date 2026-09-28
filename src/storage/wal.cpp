@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -458,11 +459,17 @@ int64_t Wal::file_size(int fd) {
 Wal::ScanResult Wal::scan(int fd) { return scan(fd, nullptr); }
 
 Wal::ScanResult Wal::scan(int fd, const Key32* key) {
+  return scan_at(fd, key, 0, 0);
+}
+
+Wal::ScanResult Wal::scan_at(int fd, const Key32* key, int64_t start,
+                             size_t max_records) {
   ScanResult out;
-  if (::lseek(fd, 0, SEEK_SET) < 0)
+  if (::lseek(fd, start, SEEK_SET) < 0)
     throw std::runtime_error(std::string("WAL lseek: ") + std::strerror(errno));
-  int64_t pos = 0;
+  int64_t pos = start;
   for (;;) {
+    const int64_t rec_off = pos;  // s116: Record-Start fuer Offset-Index
     char hdr[4 + 8 + 4 + 4];
     if (!read_full(fd, hdr, sizeof(hdr))) break;  // EOF / torn header -> stop
     if (get_u32le(hdr) != kMagic) break;          // Korrupt -> torn tail, stop
@@ -486,6 +493,8 @@ Wal::ScanResult Wal::scan(int fd, const Key32* key) {
       pos += static_cast<int64_t>(sizeof(hdr) + len);
       out.valid_bytes = pos;
       out.records.push_back(WalRecord{lsn, std::move(payload)});
+      out.offsets.push_back(rec_off);  // s116
+      if (max_records && out.records.size() >= max_records) break;
       continue;
     }
     // GCM-Pfad: stored = Cipher+Tag-Bytes, Nonce folgt dem Header.
@@ -515,6 +524,8 @@ Wal::ScanResult Wal::scan(int fd, const Key32* key) {
     pos += static_cast<int64_t>(sizeof(hdr) + sizeof(nonce) + stored);
     out.valid_bytes = pos;
     out.records.push_back(WalRecord{lsn, std::move(plain)});
+    out.offsets.push_back(rec_off);  // s116
+    if (max_records && out.records.size() >= max_records) break;
 #else
     out.need_key = true;  // ohne TLS nie entschluesselbar
     break;
@@ -561,6 +572,12 @@ void Wal::open() {
   }
   next_lsn_ = s.max_lsn + 1;
   durable_lsn_ = s.max_lsn;  // nach Truncate+fsync ist Dateiinhalt dauerhaft
+  // s116: Offset-Index aus Scan-Offsets aufbauen (parallel zu records).
+  lsn_index_.clear();
+  lsn_index_.reserve(s.records.size());
+  for (std::size_t i = 0; i < s.records.size(); ++i)
+    lsn_index_.emplace_back(s.records[i].lsn, s.offsets[i]);
+  end_offset_ = s.valid_bytes;
   // Append-Position ans Ende.
   if (::lseek(fd, 0, SEEK_END) < 0) {
     ::close(fd);
@@ -609,6 +626,10 @@ uint64_t Wal::append(std::string_view payload) {
   uint64_t lsn = next_lsn_++;
   if (enc_enabled_) {
     append_encrypted(fd_, enc_key_, lsn, payload.data(), payload.size());
+    // s116: enc-Record = hdr(20) + nonce(12) + payload + tag(16).
+    lsn_index_.emplace_back(lsn, end_offset_);
+    end_offset_ +=
+        static_cast<int64_t>(20 + kNonceLen + payload.size() + kTagLen);
     ++appends_;
     return lsn;
   }
@@ -620,6 +641,9 @@ uint64_t Wal::append(std::string_view payload) {
   put_u32le(hdr + 16, record_crc(lsn, len, payload.data()));
   write_record(fd_, hdr, payload.data(), len);
   // KEIN fsync hier — flush() macht Group-Commit (Performance).
+  // s116: plain-Record = hdr(20) + payload.
+  lsn_index_.emplace_back(lsn, end_offset_);
+  end_offset_ += static_cast<int64_t>(20 + len);
   ++appends_;
   return lsn;
 }
@@ -635,6 +659,8 @@ std::vector<uint64_t> Wal::append_many(
     uint64_t lsn = next_lsn_++;
     if (enc_enabled_) {
       append_encrypted(fd_, enc_key_, lsn, p.data(), p.size());
+      lsn_index_.emplace_back(lsn, end_offset_);  // s116
+      end_offset_ += static_cast<int64_t>(20 + kNonceLen + p.size() + kTagLen);
       ++appends_;
       out.push_back(lsn);
       continue;
@@ -646,6 +672,8 @@ std::vector<uint64_t> Wal::append_many(
     put_u32le(hdr + 12, len);
     put_u32le(hdr + 16, record_crc(lsn, len, p.data()));
     write_record(fd_, hdr, p.data(), len);
+    lsn_index_.emplace_back(lsn, end_offset_);  // s116
+    end_offset_ += static_cast<int64_t>(20 + len);
     ++appends_;
     out.push_back(lsn);
   }
@@ -740,6 +768,16 @@ void Wal::checkpoint(uint64_t checkpoint_lsn) {
   next_lsn_ = max_kept + 1;
   if (next_lsn_ == 0) next_lsn_ = 1;
   if (max_kept + 1 == next_lsn_) durable_lsn_ = max_kept;
+  // s116: Datei neu geschrieben -> Index neu aufbauen (Offsets haben sich
+  // komplett geaendert). Ein Scan bei checkpoint (selten) ist ok.
+  {
+    ScanResult s2 = scan(fd_, key);
+    lsn_index_.clear();
+    lsn_index_.reserve(s2.records.size());
+    for (std::size_t i = 0; i < s2.records.size(); ++i)
+      lsn_index_.emplace_back(s2.records[i].lsn, s2.offsets[i]);
+    end_offset_ = s2.valid_bytes;
+  }
   g.unlock();
   cv_.notify_all();
 }
@@ -750,6 +788,8 @@ void Wal::close() {
     ::close(fd_);
     fd_ = -1;
   }
+  lsn_index_.clear();  // s116: kein stale Index ueber close hinweg
+  end_offset_ = 0;
 }
 
 uint64_t Wal::next_lsn() const {
@@ -780,16 +820,19 @@ bool Wal::wait_for_lsn(uint64_t target, int timeout_ms) const {
 }
 
 std::vector<WalRecord> Wal::read_from(uint64_t from_lsn, size_t max_records) {
-  // replay() lockt intern; hier nicht halten (kein Double-Lock).
-  std::vector<WalRecord> all = replay();
-  std::vector<WalRecord> out;
-  out.reserve(all.size());
-  for (auto& r : all) {
-    if (r.lsn < from_lsn) continue;
-    out.push_back(std::move(r));
-    if (max_records && out.size() >= max_records) break;
-  }
-  return out;
+  // s116: per Offset-Index direkt an die Position seeken (kein Full-Replay).
+  // scan_at lockt nicht selbst; hier halten (kein replay()-Double-Lock).
+  std::lock_guard<std::mutex> g(mu_);
+  ensure_open();
+  auto it = std::lower_bound(
+      lsn_index_.begin(), lsn_index_.end(), from_lsn,
+      [](const std::pair<uint64_t, int64_t>& e, uint64_t v) { return e.first < v; });
+  if (it == lsn_index_.end()) return {};  // jenseits max_lsn: kein I/O
+  const Key32* key = enc_enabled_ ? &enc_key_ : nullptr;
+  ScanResult s = scan_at(fd_, key, it->second, max_records);
+  if (::lseek(fd_, 0, SEEK_END) < 0)
+    throw std::runtime_error(std::string("WAL lseek-end: ") + std::strerror(errno));
+  return std::move(s.records);
 }
 
 uint64_t Wal::append_audit(std::string_view actor, std::string_view action,

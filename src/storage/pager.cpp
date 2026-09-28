@@ -385,50 +385,75 @@ bool Pager::load_image() {
   // den gueltigen Datensatz (key=0, value="") als LETZTEN Record vom
   // Zero-Padding ununterscheidbar -> stiller Restart-Datenverlust.
   const std::uint32_t want_records = decode_u32_le(hdr.data() + 16);
-  // Linear scan of the record stream starting at page 1.
-  std::vector<std::uint8_t> stream;
-  stream.reserve(static_cast<std::size_t>(page_count_ > 1 ? page_count_ - 1 : 0) * kPageSize);
+  // s117: Inkrementelles Parsen pro Page mit Carry statt Riesen-Stream.
+  // Vorher lag die komplette Datei (N×16 KiB) ZUSAETZLICH zu entries_ im
+  // Speicher (Datei/mmap + Stream + entries_ + Value-Kopien). Jetzt: max
+  // 1 Page + 1 Record Carry (<= kPageSize + kMaxValueBytes + 12) + entries_.
+  // Fehlerfaelle exakt wie vorher (Count-Modell s113): zu wenige Records,
+  // korrupte Laengen, torn Payload, non-zero Rest nach allen Records.
+  std::vector<std::uint8_t> buf;
+  buf.reserve(static_cast<std::size_t>(kPageSize) + kMaxValueBytes + 12);
+  std::size_t head = 0;  // Parse-Offset in buf (kompaktiert ab 1 Page)
+  std::uint64_t got_records = 0;
   PageBuffer page{};
+  auto compact = [&]() {
+    if (head > kPageSize) {
+      buf.erase(buf.begin(), buf.begin() + static_cast<std::ptrdiff_t>(head));
+      head = 0;
+    }
+  };
+  // Parst alle VOLLSTAENDIGEN Records in buf[head..]. last=true: strikte
+  // Endpruefung (keine weiteren Pages). Rueckgabe false = korrupt.
+  auto parse_avail = [&](bool last) -> bool {
+    for (;;) {
+      if (got_records >= want_records) break;
+      const std::size_t avail = buf.size() - head;
+      if (avail < 12) {
+        if (last) {
+          if (avail == 0) break;  // exakt aufgebraucht
+          entries_.clear();
+          return false;  // truncated header vor Count
+        }
+        break;  // Carry: naechste Page abwarten
+      }
+      const std::uint64_t key = decode_u64_le(buf.data() + head);
+      const std::uint32_t len = decode_u32_le(buf.data() + head + 8);
+      if (len > kMaxValueBytes) {
+        entries_.clear();
+        return false;  // korrupt (Padding nur NACH allen Records legal)
+      }
+      if (avail < 12 + len) {
+        if (last) {
+          entries_.clear();
+          return false;  // torn payload: Record laenger als Datei-Rest
+        }
+        break;  // Carry
+      }
+      entries_[key] = std::vector<std::uint8_t>(
+          buf.begin() + static_cast<std::ptrdiff_t>(head + 12),
+          buf.begin() + static_cast<std::ptrdiff_t>(head + 12 + len));
+      head += 12 + len;
+      ++got_records;
+    }
+    return true;
+  };
   for (PageId p = 1; p < page_count_; ++p) {
     if (!read_exact(static_cast<std::int64_t>(p) * static_cast<std::int64_t>(kPageSize), page.data(),
                     kPageSize)) {
       entries_.clear();
       return false;
     }
-    stream.insert(stream.end(), page.begin(), page.end());
+    buf.insert(buf.end(), page.begin(), page.end());
+    if (!parse_avail(false)) return false;
+    compact();
   }
-  std::size_t off = 0;
-  std::uint64_t got_records = 0;
-  while (off < stream.size() && got_records < want_records) {
-    if (off + 12 > stream.size()) {
-      entries_.clear();
-      return false;  // truncated record header before count reached
-    }
-    const std::uint64_t key = decode_u64_le(stream.data() + off);
-    const std::uint32_t len = decode_u32_le(stream.data() + off + 8);
-    if (len > kMaxValueBytes) {
-      entries_.clear();
-      return false;  // corrupt length before count reached (padding is
-                     // only legal AFTER all records)
-    }
-    off += 12;
-    if (off + len > stream.size()) {
-      entries_.clear();
-      return false;  // torn payload: record claims more bytes than file
-    }
-    // Kein (0,0)-Sentinel mehr: (key=0, value="") ist ein normaler Record
-    // (s113). Das Ende ergibt sich aus want_records.
-    entries_[key] = std::vector<std::uint8_t>(stream.begin() + static_cast<std::ptrdiff_t>(off),
-                                              stream.begin() + static_cast<std::ptrdiff_t>(off + len));
-    off += len;
-    ++got_records;
-  }
+  if (!parse_avail(true)) return false;
   if (got_records != want_records) {
     entries_.clear();
     return false;  // fewer records than header count -> torn/truncated
   }
   // Nach allen Records darf nur noch Zero-Padding folgen.
-  if (off != stream.size() && !is_all_zero(stream.data() + off, stream.size() - off)) {
+  if (head != buf.size() && !is_all_zero(buf.data() + head, buf.size() - head)) {
     entries_.clear();
     return false;  // trailing garbage after last record -> corrupt, not EOF
   }
