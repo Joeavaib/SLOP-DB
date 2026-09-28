@@ -118,7 +118,8 @@
     "s114-crconce",
     "s115-scanstop",
     "s116-cdcindex",
-    "s117-pagerstream"
+    "s117-pagerstream",
+    "s118-fuzzstate"
   ],
   "verified": [
     "s07-index",
@@ -239,16 +240,17 @@
     "s114-crconce",
     "s115-scanstop",
     "s116-cdcindex",
-    "s117-pagerstream"
+    "s117-pagerstream",
+    "s118-fuzzstate"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s117-pagerstream-1790619867",
-    "step_id": "s117-pagerstream",
-    "commit": "1efb372acea2f67e374343e8ae10740f71dcfb22",
+    "id": "cp-s118-fuzzstate-1790626296",
+    "step_id": "s118-fuzzstate",
+    "commit": "5282b19b105d02378b4665acdc53329b40635ac9",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T18:24:27.165101+00:00"
+    "created_at": "2026-09-28T20:11:36.394913+00:00"
   },
   "checkpoints": [
     {
@@ -1041,6 +1043,13 @@
       "commit": "1efb372acea2f67e374343e8ae10740f71dcfb22",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T18:24:27.165101+00:00"
+    },
+    {
+      "id": "cp-s118-fuzzstate-1790626296",
+      "step_id": "s118-fuzzstate",
+      "commit": "5282b19b105d02378b4665acdc53329b40635ac9",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T20:11:36.394913+00:00"
     }
   ],
   "claim_step": "",
@@ -1069,7 +1078,8 @@
     "s114-crconce",
     "s115-scanstop",
     "s116-cdcindex",
-    "s117-pagerstream"
+    "s117-pagerstream",
+    "s118-fuzzstate"
   ],
   "claims": {}
 }

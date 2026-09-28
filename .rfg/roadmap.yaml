@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "DBEngine Perf-Welle: kein Full-Scan trotz Limit (BTree-Visitor), kein Full-Replay trotz CDC-Limit (Offset-Index), kein Riesen-Stream beim Pager-Load. Alles verifiziert."
+  statement: "DBEngine Härte-Welle: deterministischer stateful Fuzzer (Modell-Vergleich + Crash-Reopens) für WAL/Pager/BTree. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -980,3 +980,11 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"pager|btreekv\" --output-on-failure"
     engine: implement
     want: "Pager-Load ohne Riesen-Stream: Records inkrementell pro Page mit Carry parsen (max 1 Page + 1 Record im Speicher), Test mit großer Datei, alte Tests gruene"
+  - id: s118-fuzzstate
+    title: s118-fuzzstate
+    paths:
+      - tests/test_fuzz.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ctest --test-dir build -R fuzz --output-on-failure
+    engine: implement
+    want: "Stateful Fuzzer: deterministischer Op-Mix (BTree/Pager/WAL) gegen std::map-Modell mit Reopens + Checkpoint, Seed-Flag, ctest fuzz gruen"
