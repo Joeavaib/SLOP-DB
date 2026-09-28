@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 23: Q6-Speed messbar + schneller (Baseline, Fast-Path, Doku). Alles verifiziert."
+  statement: "C++ DB Engine Welle 24: Q6-Decode ohne Allokationen (from_chars) + Rematch. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -884,3 +884,10 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure && ./build/q6bench --selfcheck"
     engine: implement
     want: "Q6-Fast-Path: WHERE-Spaltenindizes einmal pro SELECT cachen (gleiche Fehlersemantik), gleiche Summen, Tests gruene"
+  - id: s106-decodefast
+    title: s106-decodefast
+    paths:
+      - src/sql/executor.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor\" --output-on-failure && ./build/q6bench --selfcheck"
+    engine: implement
+    want: "Decode ohne Allokation: I/F via from_chars auf string_view mit stoll/stod-Fallback, gleiche Semantik/Fehler, Tests gruene"

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
@@ -624,12 +625,39 @@ std::vector<Value> decodeRowSelected(const std::string& s, std::size_t ncols,
       case 'N':
         out.emplace_back(std::monostate{});
         break;
-      case 'I':
-        out.emplace_back(static_cast<int64_t>(std::stoll(std::string(pay))));
+      case 'I': {
+        // s106: from_chars auf string_view (kein Tmp-String, keine Locale).
+        // Fallback auf stoll bei Nischen (Hex/octo/ws), Fehlersemantik gleich
+        // (korrupt -> SqlError via Fallback-Throw wie vorher).
+        int64_t v = 0;
+        const char* beg = p + 2;
+        const char* end = p + len;
+        auto fc = std::from_chars(beg, end, v);
+        if (fc.ec != std::errc() || fc.ptr != end) {
+          try {
+            v = static_cast<int64_t>(std::stoll(std::string(pay)));
+          } catch (...) {
+            throw SqlError("Korrupte Row-Kodierung");
+          }
+        }
+        out.emplace_back(v);
         break;
-      case 'F':
-        out.emplace_back(std::stod(std::string(pay)));
+      }
+      case 'F': {
+        double d = 0.0;
+        const char* beg = p + 2;
+        const char* end = p + len;
+        auto fc = std::from_chars(beg, end, d);
+        if (fc.ec != std::errc() || fc.ptr != end) {
+          try {
+            d = std::stod(std::string(pay));
+          } catch (...) {
+            throw SqlError("Korrupte Row-Kodierung");
+          }
+        }
+        out.emplace_back(d);
         break;
+      }
       case 'S':
         if (needf) {
           out.emplace_back(unescapeView(pay));
