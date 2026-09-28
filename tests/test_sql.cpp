@@ -75,6 +75,60 @@ int main() {
   auto r6 = db.execute("SeLeCT * FrOm T WhErE A = 2");
   CHECK(r6.rows.size() == 1);
 
+  // ---- s124: DATE-Literale + Interval + Literal-Arithmetik (WHERE) ----
+  auto rd = db.execute("CREATE TABLE d (d INT, x DOUBLE)");
+  CHECK(rd.message == "CREATE TABLE");
+  auto rdi = db.execute(
+      "INSERT INTO d VALUES (19970101, 0.06), (19980101, 0.05), (19961231, 0.07)");
+  CHECK(rdi.affected == 3);
+  // date-Literal -> INT, Intervall +1 Jahr, BETWEEN-Arithmetik.
+  auto rq = db.execute(
+      "SELECT d FROM d WHERE d >= date '1997-01-01' AND d < date '1997-01-01' "
+      "+ interval '1' year AND x BETWEEN 0.06 - 0.01 AND 0.06 + 0.01 ORDER BY d");
+  CHECK(rq.rows.size() == 1);
+  CHECK(valueToString(rq.rows[0][0]) == "19970101");
+  // -91 Tage Intervall + Monats-Clamping (Jan31 + 1 Monat = Feb28/29).
+  auto rq2 = db.execute(
+      "SELECT d FROM d WHERE d >= date '1998-01-01' - interval '91' day");
+  CHECK(rq2.rows.size() == 1);  // nur 19980101 (19971002 waere Schwelle)
+  auto rq3 = db.execute(
+      "SELECT d FROM d WHERE d < date '1997-02-28' + interval '3' month");
+  CHECK(rq3.rows.size() == 2);  // 19961231 + 19970101 (< 19970528)
+  // Fehlerfaelle: falsches Datum, unbekannte Einheit, Intervall ohne Datum.
+  bool threw = false;
+  try {
+    db.execute("SELECT d FROM d WHERE d = date '1997-13-01'");
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+  threw = false;
+  try {
+    db.execute("SELECT d FROM d WHERE d = date '1997-01-01' + interval '1' eon");
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+  threw = false;
+  try {
+    db.execute("SELECT d FROM d WHERE d = 'x' + interval '1' year");
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+  // IN-Liste mit Arithmetik.
+  auto rq4 = db.execute("SELECT d FROM d WHERE d IN (19970101, 19961231 + 0)");
+  CHECK(rq4.rows.size() == 2);
+  // Monats-Clamping: Jan31 + 13 Monate = Feb28 Folgejahr (PG-Semantik).
+  auto rq5 = db.execute(
+      "SELECT d FROM d WHERE d = date '1997-01-31' + interval '13' month");
+  CHECK(rq5.rows.empty());  // 19980228 nicht in Testdaten
+  auto rqi = db.execute("INSERT INTO d VALUES (19980228, 0.01)");
+  CHECK(rqi.affected == 1);
+  rq5 = db.execute(
+      "SELECT d FROM d WHERE d = date '1997-01-31' + interval '13' month");
+  CHECK(rq5.rows.size() == 1);
+
   // ---- PGWire-Stub ----
   using namespace dbengine::pgwire;
   // Startup roundtrip

@@ -1027,3 +1027,11 @@ steps:
     verify: cmake --build build -j4 && python3 tools/tpch/tpchmatrix.py --data /tmp/tpchdata --db /tmp/tpchm.db --queries tools/tpch/queries --out /tmp/matrix.json && test -f docs/TPCH-FULL.md
     engine: implement
     want: "Support-Matrix: Loader CSV->dbengine (Batches, Escapes) + alle 22 kanonischen Queries fahren (OK/FAIL+Hash+ms als JSON), Matrix an TPCH-FULL.md angehängt"
+  - id: s124-datelit
+    title: s124-datelit
+    paths:
+      - src/sql/parser.cpp
+      - tests/test_sql.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "DATE-Literale + Interval-Arithmetik + Literal-Arithmetik in WHERE: date 'YYYY-MM-DD'->INT, +/- interval year/month/day (Kalender), Literal op Literal gefaltet, Tests in test_sql gruen"

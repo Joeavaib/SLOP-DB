@@ -124,7 +124,8 @@
     "s120-fuzzsql",
     "s121-fairbench",
     "s122-tpchkit",
-    "s123-tpchmatrix"
+    "s123-tpchmatrix",
+    "s124-datelit"
   ],
   "verified": [
     "s07-index",
@@ -251,16 +252,17 @@
     "s120-fuzzsql",
     "s121-fairbench",
     "s122-tpchkit",
-    "s123-tpchmatrix"
+    "s123-tpchmatrix",
+    "s124-datelit"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s123-tpchmatrix-1790629396",
-    "step_id": "s123-tpchmatrix",
-    "commit": "0b9e2786bdfc93403f51dc5a7387127638f660c8",
+    "id": "cp-s124-datelit-1790630356",
+    "step_id": "s124-datelit",
+    "commit": "3f9e339368ca4dbeaa9e3de774e2f7eeb067abe4",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T21:03:16.599436+00:00"
+    "created_at": "2026-09-28T21:19:16.709916+00:00"
   },
   "checkpoints": [
     {
@@ -1095,6 +1097,20 @@
       "commit": "0b9e2786bdfc93403f51dc5a7387127638f660c8",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T21:03:16.599436+00:00"
+    },
+    {
+      "id": "cp-s124-datelit-1790630105",
+      "step_id": "s124-datelit",
+      "commit": "97442600d24a79ecbc8bb28e0971592d8ca2cb80",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T21:15:05.016586+00:00"
+    },
+    {
+      "id": "cp-s124-datelit-1790630356",
+      "step_id": "s124-datelit",
+      "commit": "3f9e339368ca4dbeaa9e3de774e2f7eeb067abe4",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T21:19:16.709916+00:00"
     }
   ],
   "claim_step": "",
@@ -1129,7 +1145,8 @@
     "s120-fuzzsql",
     "s121-fairbench",
     "s122-tpchkit",
-    "s123-tpchmatrix"
+    "s123-tpchmatrix",
+    "s124-datelit"
   ],
   "claims": {}
 }

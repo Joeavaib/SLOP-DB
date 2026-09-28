@@ -827,8 +827,7 @@ class Parser {
     }
   }
 
-  Value parseLiteral() {
-    const Token& t = peek();
+  Value parseLiteral() {    const Token& t = peek();
     if (t.kind == TokKind::Param)
       throw SqlError(
           "Prepared-Statement-Parameter ($1) erst ab V2 (Extended Protocol)");
@@ -872,6 +871,236 @@ class Parser {
       throw SqlError("Unerwartetes Keyword als Literal: " + u.text);
     }
     throw SqlError("Erwartet Literal (Zahl, String, NULL, TRUE/FALSE)");
+  }
+
+  // s124: skalare WHERE-Werte mit Faltung zur Parse-Zeit: DATE-Literale,
+  // Interval-Arithmetik und Literal-Rechenausdruecke. Alles wird auf einen
+  // Value gefaltet (keine Laufzeit-Semantikänderung, IEEE-vergleichbar mit
+  // allen Engines, da identische double-Operationen in identischer Reihenfolge).
+  static bool isLeapYear(int y) {
+    return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+  }
+  static int daysInMonth(int y, int m) {
+    static const int kDays[12] = {31, 28, 31, 30, 31, 30,
+                                  31, 31, 30, 31, 30, 31};
+    if (m == 2 && isLeapYear(y)) return 29;
+    return kDays[m - 1];
+  }
+  // Strikte YYYY-MM-DD-Pruefung (10 Zeichen, gueltiges Kalenderdatum).
+  static bool parseYmd(const std::string& s, int& y, int& m, int& d) {
+    if (s.size() != 10 || s[4] != '-' || s[7] != '-') return false;
+    for (int i : {0, 1, 2, 3, 5, 6, 8, 9})
+      if (s[i] < '0' || s[i] > '9') return false;
+    y = (s[0] - '0') * 1000 + (s[1] - '0') * 100 + (s[2] - '0') * 10 +
+        (s[3] - '0');
+    m = (s[5] - '0') * 10 + (s[6] - '0');
+    d = (s[8] - '0') * 10 + (s[9] - '0');
+    if (y < 1 || y > 9999 || m < 1 || m > 12) return false;
+    return d >= 1 && d <= daysInMonth(y, m);
+  }
+  // Tage seit 1970-01-01 (Hinnant-Algorithmus, proleptisch-gregorianisch).
+  static int64_t daysFromCivil(int y, int m, int d) {
+    y -= (m <= 2) ? 1 : 0;
+    const int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const int uu = static_cast<int>(static_cast<unsigned>(y) - era * 400);
+    const int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const int doe = uu * 365 + uu / 4 - uu / 100 + doy;
+    return era * 146097 + static_cast<int64_t>(doe) - 719468;
+  }
+  static void civilFromDays(int64_t z, int& y, int& m, int& d) {
+    // Howard Hinnant civil_from_days (proleptisch-gregorianisch), exakt.
+    z += 719468;
+    const int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    const int dou =
+        static_cast<int>(static_cast<unsigned long long>(z) - era * 146097);
+    const int yoe = (dou - dou / 1460 + dou / 36524 - dou / 146096) / 365;
+    y = yoe + static_cast<int>(era) * 400;
+    const int doy = dou - (365 * yoe + yoe / 4 - yoe / 100);
+    const int mp = (5 * doy + 2) / 153;
+    d = doy - (153 * mp + 2) / 5 + 1;
+    m = mp + (mp < 10 ? 3 : -9);
+    y += (m <= 2) ? 1 : 0;
+  }
+  // INT yyyymmdd -> Datum; false wenn kein gueltiges Datum.
+  static bool intToYmd(int64_t v, int& y, int& m, int& d) {
+    if (v < 10101 || v > 99991231) return false;
+    y = static_cast<int>(v / 10000);
+    m = static_cast<int>((v / 100) % 100);
+    d = static_cast<int>(v % 100);
+    if (y < 1 || y > 9999 || m < 1 || m > 12) return false;
+    return d >= 1 && d <= daysInMonth(y, m);
+  }
+  // date-INT +/- Intervall (year/month/day, Kalender-korrekt, Tag-Clamping).
+  static Value addDateInterval(int64_t base, bool plus, int64_t n,
+                               const std::string& unit) {
+    int y, m, d;
+    if (!intToYmd(base, y, m, d))
+      throw SqlError("INTERVAL braucht gueltiges YYYYMMDD-Datum");
+    std::string u = toLower(unit);
+    if (u == "year" || u == "years") {
+      y += static_cast<int>(plus ? n : -n);
+    } else if (u == "month" || u == "months") {
+      int64_t total =
+          static_cast<int64_t>(y) * 12 + (m - 1) + (plus ? n : -n);
+      y = static_cast<int>(total / 12);
+      m = static_cast<int>(total % 12) + 1;
+      if (m <= 0) {
+        m += 12;
+        --y;
+      }
+    } else if (u == "day" || u == "days") {
+      int64_t z = daysFromCivil(y, m, d) + (plus ? n : -n);
+      civilFromDays(z, y, m, d);
+    } else {
+      throw SqlError("Unbekannte INTERVAL-Einheit: " + unit +
+                     " (year/month/day erwartet)");
+    }
+    if (y < 1 || y > 9999 || m < 1 || m > 12)
+      throw SqlError("INTERVAL-Ergebnis ausserhalb 0001..9999");
+    if (d > daysInMonth(y, m)) d = daysInMonth(y, m);  // Clamping (z.B. Jan31+1M)
+    return Value{static_cast<int64_t>(y) * 10000 + m * 100 + d};
+  }
+  // Numerische Faltung (IEEE-identisch ueberall): int+int->int (geprueft),
+  // Division und double-Beteiligung -> double, /0 -> NULL (Laufzeit-Semantik).
+  static Value foldNumOp(const Value& a, char op, const Value& b) {
+    auto* ai = std::get_if<int64_t>(&a);
+    auto* bi = std::get_if<int64_t>(&b);
+    if (ai && bi && op != '/') {
+      __int128 r = 0;
+      if (op == '+')
+        r = static_cast<__int128>(*ai) + *bi;
+      else if (op == '-')
+        r = static_cast<__int128>(*ai) - *bi;
+      else if (op == '*')
+        r = static_cast<__int128>(*ai) * *bi;
+      else
+        throw SqlError("Unbekannter Operator in Ausdruck");
+      if (r >= -9223372036854775807LL - 1 && r <= 9223372036854775807LL)
+        return Value{static_cast<int64_t>(r)};
+      return Value{static_cast<double>(r)};
+    }
+    double x, y2;
+    if (auto* xd = std::get_if<double>(&a))
+      x = *xd;
+    else if (auto* xi = std::get_if<int64_t>(&a))
+      x = static_cast<double>(*xi);
+    else
+      throw SqlError("Arithmetik braucht numerische Operanden");
+    if (auto* yd = std::get_if<double>(&b))
+      y2 = *yd;
+    else if (auto* yi = std::get_if<int64_t>(&b))
+      y2 = static_cast<double>(*yi);
+    else
+      throw SqlError("Arithmetik braucht numerische Operanden");
+    if (op == '/' && y2 == 0.0) return Value{std::monostate{}};  // NULL wie Laufzeit
+    double r = 0.0;
+    if (op == '+')
+      r = x + y2;
+    else if (op == '-')
+      r = x - y2;
+    else if (op == '*')
+      r = x * y2;
+    else if (op == '/')
+      r = x / y2;
+    else
+      throw SqlError("Unbekannter Operator in Ausdruck");
+    return Value{r};
+  }
+  // DATE-Literal oder normaler Literal-Start? (peek, ohne Konsum)
+  bool peekDateLiteral() const {
+    if (peek().kind != TokKind::Ident) return false;
+    if (toUpper(peek().text) != "DATE") return false;
+    return peek(1).kind == TokKind::String;
+  }
+  // date 'YYYY-MM-DD' -> INT yyyymmdd (strikt validiert).
+  Value parseDateLiteral() {
+    (void)next();  // DATE
+    std::string s = next().text;
+    int y, m, d;
+    if (!parseYmd(s, y, m, d))
+      throw SqlError("Ungueltiges DATE-Literal (YYYY-MM-DD erwartet): " + s);
+    return Value{static_cast<int64_t>(y) * 10000 + m * 100 + d};
+  }
+  // [+-] interval 'N' unit direkt nach einem Datumswert?
+  Value parseIntervalSuffix(Value base) {
+    bool plus = true;
+    if (peek().kind == TokKind::Symbol &&
+        (peek().text == "+" || peek().text == "-")) {
+      plus = (peek().text == "+");
+      ++pos_;
+    } else {
+      return base;  // kein Suffix
+    }
+    if (!(peek().kind == TokKind::Ident &&
+          toUpper(peek().text) == "INTERVAL")) {
+      throw SqlError("Erwartet INTERVAL nach +|- bei Datum");
+    }
+    ++pos_;
+    if (peek().kind != TokKind::String)
+      throw SqlError("INTERVAL braucht String-Menge ('N')");
+    std::string ns = next().text;
+    if (peek().kind != TokKind::Ident)
+      throw SqlError("INTERVAL braucht Einheit (year/month/day)");
+    std::string unit = next().text;
+    // strikte Ganzzahl (optional Vorzeichen, sonst nur Ziffern).
+    std::size_t i = (ns.size() && (ns[0] == '+' || ns[0] == '-')) ? 1 : 0;
+    if (i >= ns.size()) throw SqlError("Ungueltige INTERVAL-Menge: " + ns);
+    for (std::size_t k = i; k < ns.size(); ++k)
+      if (ns[k] < '0' || ns[k] > '9')
+        throw SqlError("Ungueltige INTERVAL-Menge: " + ns);
+    int64_t n = 0;
+    try {
+      n = std::stoll(ns);
+    } catch (...) {
+      throw SqlError("Ungueltige INTERVAL-Menge: " + ns);
+    }
+    auto* iv = std::get_if<int64_t>(&base);
+    if (!iv) throw SqlError("INTERVAL braucht Datum als Basis");
+    const int64_t eff = plus ? n : -n;
+    return addDateInterval(*iv, eff >= 0, eff >= 0 ? eff : -eff, unit);
+  }
+  // Voller skalarer WHERE-Wert: Datum/Intervall oder Literal-Arithmetik
+  // (Praezedenz */ vor +-, links-assoziativ), alles zur Parse-Zeit gefaltet.
+  Value parseScalarMul() {
+    Value v;
+    if (peekDateLiteral()) {
+      v = parseDateLiteral();
+      v = parseIntervalSuffix(std::move(v));
+    } else {
+      v = parseLiteral();
+      // Intervall-Suffix auch nach INT-Datum (yyyymmdd) erlauben.
+      if (auto* iv = std::get_if<int64_t>(&v)) {
+        if (peek().kind == TokKind::Symbol &&
+            (peek().text == "+" || peek().text == "-") &&
+            peek(1).kind == TokKind::Ident &&
+            toUpper(peek(1).text) == "INTERVAL") {
+          int y, m, d;
+          if (intToYmd(*iv, y, m, d)) v = parseIntervalSuffix(std::move(v));
+        }
+      }
+    }
+    return v;
+  }
+  Value parseScalar() {
+    Value v = parseScalarMul();
+    while (peek().kind == TokKind::Symbol &&
+           (peek().text == "+" || peek().text == "-")) {
+      char op = peek().text[0];
+      ++pos_;
+      Value rhs = parseScalarMul();
+      // Numerik falten; nicht-numerisch (String/Bool/NULL) -> Fehler wie Laufzeit.
+      if (std::holds_alternative<std::string>(v) ||
+          std::holds_alternative<std::string>(rhs) ||
+          std::holds_alternative<bool>(v) ||
+          std::holds_alternative<bool>(rhs))
+        throw SqlError("Arithmetik braucht numerische Operanden");
+      if (valueIsNull(v) || valueIsNull(rhs)) {
+        v = Value{std::monostate{}};
+        continue;
+      }
+      v = foldNumOp(v, op, rhs);
+    }
+    return v;
   }
 
   static bool isAggFuncName(const std::string& name) {
@@ -1381,14 +1610,14 @@ class Parser {
       std::string kw = toUpper(t.text);
       if (kw == "LIKE" || kw == "ILIKE") {
         c.op = neg ? ("NOT " + kw) : kw;
-        c.value = parseLiteral();
+        c.value = parseScalar();
         return c;
       }
       if (kw == "BETWEEN") {
         c.op = neg ? "NOT BETWEEN" : "BETWEEN";
-        c.value = parseLiteral();
+        c.value = parseScalar();
         expectKeyword("AND");
-        c.second = parseLiteral();
+        c.second = parseScalar();
         return c;
       }
       if (kw == "IN") {
@@ -1415,7 +1644,7 @@ class Parser {
         if (peek().kind == TokKind::Symbol && peek().text == ")")
           throw SqlError("IN-Liste darf nicht leer sein");
         while (true) {
-          c.list.push_back(parseLiteral());
+          c.list.push_back(parseScalar());
           if (matchSymbol(",")) continue;
           break;
         }
@@ -1468,7 +1697,7 @@ class Parser {
         c.subquery = std::make_shared<SelectStmt>(std::move(sub));
         return c;
       }
-      c.value = parseLiteral();
+      c.value = parseScalar();
       return c;
     }
     throw SqlError("Erwartet Operator nach Spaltenname");
