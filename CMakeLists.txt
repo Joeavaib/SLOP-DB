@@ -356,3 +356,10 @@ target_include_directories(dummy_app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
 target_link_libraries(dummy_app PRIVATE dbengine_kv dbengine_vector executor dbengine_mvcc sql)
 target_compile_options(dummy_app PRIVATE -Wall -Wextra -Wpedantic)
 add_test(NAME dummy_app COMMAND dummy_app --selfcheck)
+
+# s104-q6bench: Q6-Microbench 100k deterministisch (STL-only)
+add_executable(q6bench tools/q6bench.cpp)
+target_include_directories(q6bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(q6bench PRIVATE dbengine_kv executor dbengine_mvcc sql)
+target_compile_options(q6bench PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME q6bench COMMAND q6bench --selfcheck)

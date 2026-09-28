@@ -1639,6 +1639,87 @@ bool evalWhere(const Table& t, const std::vector<Value>& row,
   return true;
 }
 
+// s105-q6fast: Index-cached WHERE-Auswertung (gleiche Semantik wie
+// evalCondition/evalWhere, nur ohne colIndex-Stringsuche pro Zeile).
+// Indizes werden einmal pro execSelect aufgebaut (Reihenfolge = Parser-
+// Reihenfolge, Fehlermeldung byte-identisch). Fallback: evalWhere.
+bool evalConditionIdx(const Table& t, const std::vector<Value>& row,
+                      const Condition& c, int idx) {
+  if (c.subquery)
+    throw SqlError("Subquery ohne Ausfuehrungskontext (interner Fehler)");
+  if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
+  const Value& v = row[(std::size_t)idx];
+  if (c.op == "IS NULL") return valueIsNull(v);
+  if (c.op == "IS NOT NULL") return !valueIsNull(v);
+  if (c.op == "IN" || c.op == "NOT IN") {
+    if (valueIsNull(v)) return false;
+    bool has_null = false;
+    for (auto& e : c.list) {
+      if (valueIsNull(e)) {
+        has_null = true;
+        continue;
+      }
+      if (compareValues(v, e) == 0) return (c.op == "IN");
+    }
+    if (c.op == "IN") return false;
+    return !has_null;
+  }
+  if (valueIsNull(v) || valueIsNull(c.value)) return false;
+  if (c.op == "BETWEEN" || c.op == "NOT BETWEEN") {
+    if (valueIsNull(c.second)) return false;
+    int lo = compareValues(v, c.value);
+    int hi = compareValues(v, c.second);
+    if (lo == -2 || hi == -2) return false;
+    bool in = (lo >= 0 && hi <= 0);
+    return (c.op == "BETWEEN") ? in : !in;
+  }
+  if (c.op == "LIKE" || c.op == "ILIKE" || c.op == "NOT LIKE" ||
+      c.op == "NOT ILIKE") {
+    auto* vs = std::get_if<std::string>(&v);
+    auto* ps = std::get_if<std::string>(&c.value);
+    if (!vs || !ps)
+      throw SqlError(c.op + " braucht TEXT-Operanden");
+    bool m = likeMatch(*vs, *ps, c.op == "ILIKE" || c.op == "NOT ILIKE");
+    return (c.op == "LIKE" || c.op == "ILIKE") ? m : !m;
+  }
+  int cmp = compareValues(v, c.value);
+  if (cmp == -2) return false;
+  if (c.op == "=") return cmp == 0;
+  if (c.op == "<>") return cmp != 0;
+  if (c.op == "<") return cmp < 0;
+  if (c.op == "<=") return cmp <= 0;
+  if (c.op == ">") return cmp > 0;
+  if (c.op == ">=") return cmp >= 0;
+  throw SqlError("Unbekannter Operator: " + c.op);
+}
+
+bool evalWhereIdx(const Table& t, const std::vector<Value>& row,
+                  const SelectStmt& s, const std::vector<int>& whereIdx,
+                  const std::vector<std::vector<int>>& groupsIdx) {
+  if (!s.where_groups.empty()) {
+    for (std::size_t gi = 0; gi < s.where_groups.size(); ++gi) {
+      const auto& conj = s.where_groups[gi];
+      const auto& idxs =
+          gi < groupsIdx.size() ? groupsIdx[gi] : std::vector<int>{};
+      bool ok = true;
+      for (std::size_t i = 0; i < conj.size(); ++i) {
+        int idx = i < idxs.size() ? idxs[i] : -1;
+        if (!evalConditionIdx(t, row, conj[i], idx)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return true;
+    }
+    return false;
+  }
+  for (std::size_t i = 0; i < s.where.size(); ++i) {
+    int idx = i < whereIdx.size() ? whereIdx[i] : -1;
+    if (!evalConditionIdx(t, row, s.where[i], idx)) return false;
+  }
+  return true;
+}
+
 // 3-Wege-Vergleich fuer ORDER BY (Richtung + NULLs bereits
 // aufgeloest). NULL vs. non-NULL via nulls_first, non-NULL via compareValues
 // (numerisch tolerant, bestehende Vergleichssemantik).
@@ -3833,12 +3914,51 @@ Result Database::execSelect(const SelectStmt& s) {
   requirePriv(s.table, "SELECT");
   const Table& t = it->second;
   const std::string normS = foldIdent(s.table);
+  // s105-fast-path: WHERE-Spaltenindizes einmal cachen (statt colIndex-
+  // Stringsuche pro Zeile × Bedingung). Nur Single-Table ohne Subqueries;
+  // Fehlersemantik byte-identisch (unbekannte Spalte wirft wie evalCondition).
+  // Join/Subquery/RLS-Pfade unveraendert (Fallback evalWhere/evalWhereSub).
+  bool useIdx = subs.empty() && !s.has_join;
+  std::vector<int> whereIdx;
+  std::vector<std::vector<int>> groupsIdx;
+  if (useIdx) {
+    try {
+      whereIdx.reserve(s.where.size());
+      for (const auto& c : s.where) {
+        int idx = t.colIndex(c.column);
+        if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
+        whereIdx.push_back(idx);
+      }
+      groupsIdx.reserve(s.where_groups.size());
+      for (const auto& conj : s.where_groups) {
+        std::vector<int> ids;
+        ids.reserve(conj.size());
+        for (const auto& c : conj) {
+          int idx = t.colIndex(c.column);
+          if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
+          ids.push_back(idx);
+        }
+        groupsIdx.push_back(std::move(ids));
+      }
+    } catch (...) {
+      // Unbekannte Spalte: Fallback auf Altpfad (wirft dort pro Zeile wie
+      // vorher; bei leerer Tabelle wie vorher kein Fehler).
+      useIdx = false;
+      whereIdx.clear();
+      groupsIdx.clear();
+    }
+  }
   // Filter (AND bzw. DNF bei OR; ohne Subqueries exakt der Altpfad) + RLS.
   std::vector<std::vector<Value>> kept;
   for (auto& row : t.rows) {
-    bool ok = subs.empty()
-                  ? evalWhere(t, row, s)
-                  : evalWhereSub(t, row, s.where, s.where_groups, subs);
+    bool ok = false;
+    if (!subs.empty()) {
+      ok = evalWhereSub(t, row, s.where, s.where_groups, subs);
+    } else if (useIdx) {
+      ok = evalWhereIdx(t, row, s, whereIdx, groupsIdx);
+    } else {
+      ok = evalWhere(t, row, s);
+    }
     if (!ok) continue;
     if (!rowPassesRls(t, row, normS, "SELECT")) continue;  // unsichtbar
     kept.push_back(row);

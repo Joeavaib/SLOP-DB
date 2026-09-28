@@ -104,7 +104,9 @@
     "s100-ckptwarn",
     "s101-netsandbox",
     "s102-dummyapp",
-    "s103-sandboxduell"
+    "s103-sandboxduell",
+    "s104-q6bench",
+    "s105-q6fast"
   ],
   "verified": [
     "s07-index",
@@ -211,16 +213,18 @@
     "s100-ckptwarn",
     "s101-netsandbox",
     "s102-dummyapp",
-    "s103-sandboxduell"
+    "s103-sandboxduell",
+    "s104-q6bench",
+    "s105-q6fast"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s103-sandboxduell-1790615381",
-    "step_id": "s103-sandboxduell",
-    "commit": "135942a27ff76ded5e914dc36b696c8a65665ca2",
+    "id": "cp-s105-q6fast-1790616157",
+    "step_id": "s105-q6fast",
+    "commit": "a04f056d9d5196364cb7bf2bbbb317f6c4d339c2",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T17:09:41.637016+00:00"
+    "created_at": "2026-09-28T17:22:37.447050+00:00"
   },
   "checkpoints": [
     {
@@ -915,6 +919,20 @@
       "commit": "135942a27ff76ded5e914dc36b696c8a65665ca2",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T17:09:41.637016+00:00"
+    },
+    {
+      "id": "cp-s104-q6bench-1790615703",
+      "step_id": "s104-q6bench",
+      "commit": "60231167eb356cd90bf7a5f06b46840d184a8303",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:15:03.591572+00:00"
+    },
+    {
+      "id": "cp-s105-q6fast-1790616157",
+      "step_id": "s105-q6fast",
+      "commit": "a04f056d9d5196364cb7bf2bbbb317f6c4d339c2",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:22:37.447050+00:00"
     }
   ],
   "claim_step": "",
@@ -929,7 +947,9 @@
     "s100-ckptwarn",
     "s101-netsandbox",
     "s102-dummyapp",
-    "s103-sandboxduell"
+    "s103-sandboxduell",
+    "s104-q6bench",
+    "s105-q6fast"
   ],
   "claims": {}
 }

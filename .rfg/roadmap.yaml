@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 22: Virtuelle L2/L3-Sandbox + Dummy-App-Load + Stabilitäts/Speed-Duell. Alles verifiziert."
+  statement: "C++ DB Engine Welle 23: Q6-Speed messbar + schneller (Baseline, Fast-Path, Doku). Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -868,3 +868,19 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R bench --output-on-failure && test -f docs/NETSANDBOX-DUELL.md
     engine: implement
     want: "Sandbox-Duellbericht: Dummy-App vs SQLite unter Partition/Heal, Methodik + Zahlen + ehrliches Urteil in docs/NETSANDBOX-DUELL.md"
+  - id: s104-q6bench
+    title: s104-q6bench
+    paths:
+      - tools/q6bench.cpp
+      - CMakeLists.txt
+    verify: cmake --build build -j4 && ./build/q6bench --selfcheck
+    engine: implement
+    want: "Q6-Microbench: 100k lineitem deterministisch, SUM korrekt + p95-Druck, q6bench-Binary mit --selfcheck"
+  - id: s105-q6fast
+    title: s105-q6fast
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure && ./build/q6bench --selfcheck"
+    engine: implement
+    want: "Q6-Fast-Path: WHERE-Spaltenindizes einmal pro SELECT cachen (gleiche Fehlersemantik), gleiche Summen, Tests gruene"
