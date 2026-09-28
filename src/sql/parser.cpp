@@ -221,7 +221,16 @@ class Parser {
     }
     if (matchKeyword("ALTER")) return parseAlterRls();
     if (matchKeyword("INSERT")) return parseInsert();
-    if (matchKeyword("SELECT")) return parseSelect();
+    if (matchKeyword("SELECT")) {
+      SelectStmt s = parseSelect();
+      // s126: kein stillschweigendes Verwerfen von Rest-Tokens (z.B. wurde
+      // `FROM a, b WHERE ...` als `FROM a` gelesen). Subqueries rufen
+      // parseSelect() direkt und brauchen kein EOF.
+      if (peek().kind != TokKind::Eof)
+        throw SqlError("Unerwarteter Rest nach SELECT-Anweisung: " +
+                       peek().text);
+      return s;
+    }
     if (matchKeyword("UPDATE")) return parseUpdate();
     if (matchKeyword("DELETE")) return parseDelete();
     if (matchKeyword("DROP")) return parseDropTable();
@@ -1412,6 +1421,12 @@ class Parser {
           "FROM (SELECT ...) wird nicht unterstuetzt (keine Derived Tables)");
     s.table = parseIdent();
     s.table_alias = parseOptAlias();
+    // s126: Komma-Join (FROM a, b) wird LAUT abgelehnt statt stillschweigend
+    // nur die erste Tabelle zu lesen und Rest (inkl. WHERE) zu verwerfen.
+    if (peek().kind == TokKind::Symbol && peek().text == ",")
+      throw SqlError(
+          "Komma-Join wird nicht unterstuetzt (explizites INNER JOIN mit ON "
+          "nutzen)");
     // Genau ein optionaler INNER JOIN: [INNER] JOIN u [AS y] ON ... [AND ...].
     if (peekJoinStart()) {
       if (peekKeyword("INNER")) {

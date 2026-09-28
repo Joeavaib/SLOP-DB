@@ -1035,3 +1035,19 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
     engine: implement
     want: "DATE-Literale + Interval-Arithmetik + Literal-Arithmetik in WHERE: date 'YYYY-MM-DD'->INT, +/- interval year/month/day (Kalender), Literal op Literal gefaltet, Tests in test_sql gruen"
+  - id: s125-tpchvalid
+    title: s125-tpchvalid
+    paths:
+      - tools/tpch/tpchvalid.py
+      - docs/TPCH-FULL.md
+    verify: cmake --build build -j4 && python3 tools/tpch/tpchvalid.py --data /tmp/tpchdata --db /tmp/tpchm2.db --out /tmp/valid.json && test -f docs/TPCH-FULL.md
+    engine: implement
+    want: "Ergebnis-Validierung q01/q06/q19/q20: dbengine vs DuckDB/SQLite mit Typ-Regeln (exakt/1e-6/DECIMAL-Ausnahme dokumentiert), JSON + Matrix-Update in TPCH-FULL.md"
+  - id: s126-silentdrop
+    title: s126-silentdrop
+    paths:
+      - src/sql/parser.cpp
+      - tests/test_sql.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "Kein stilles Falsches mehr: Komma-Join nach FROM wirft laut, SELECT verlangt Dateiende (Trailing-Garbage wirft), Tests in test_sql gruen"

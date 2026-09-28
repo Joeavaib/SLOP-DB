@@ -61,3 +61,25 @@ Stand: **2/22 laufen durch (Korrektheit ungeprüft), 20/22 scheitern**,
 gruppiert in ~7 Fehlerklassen. Nächste Schritte: INT-Date-Adaptation
 (q01/q04/q06-Kandidaten), GROUP-BY-Erkennung, CASE, Multi-Join —
 jeweils mit Ergebnis-Validierung gegen DuckDB (OK ≠ korrekt).
+
+## 5. Validierung der laufenden Queries (s125, SF0.01)
+
+`tools/tpch/tpchvalid.py`: dbengine-CLI vs. Referenz mit Typ-Regeln
+(INT/COUNT/Gruppen/Keys exakt; DOUBLE rel-Tol. 1e-5 wegen ~6-stelligem
+Display; q06 gegen SQLite wegen gleicher DOUBLE-Grenzsemantik).
+
+- q01 vs. DuckDB: OK (4 Gruppen, Counts/Sums exakt bzw. in Tol.).
+- q06 vs. SQLite: OK (800 Rows, Summe 771253.5606 exakt).
+- q06 vs. DuckDB: dokumentierte DECIMAL-Ausnahme (1195 vs. 800 Rows an
+  der 0.07-Grenze — Typ-Semantik, kein Bug).
+- q19/q20: seit s126 LAUT abgelehnt (Komma-Join) statt still-falsch —
+  als `EXPECTED_OPEN` im Skript markiert (Gate bleibt für den Rest scharf).
+
+## 6. Silent-wrong-Fund und Fix (s126)
+
+Befund: `SELECT x FROM a, b WHERE <beliebig>` lieferte rc=0 mit
+ungefilterten Zeilen (Komma-Rest inkl. WHERE still verworfen); ebenso
+wurde Trailing-Garbage nach SELECT ignoriert. Dadurch waren q19/q20-
+"OK"s falsch-positiv. Fix: Komma nach FROM wirft
+("Komma-Join wird nicht unterstützt"), SELECT verlangt Dateiende.
+Matrix-Stand danach: 2/22 VALIDIERT (q01, q06), Rest FAILt laut.

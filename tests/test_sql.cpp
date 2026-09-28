@@ -75,7 +75,34 @@ int main() {
   auto r6 = db.execute("SeLeCT * FrOm T WhErE A = 2");
   CHECK(r6.rows.size() == 1);
 
-  // ---- s124: DATE-Literale + Interval + Literal-Arithmetik (WHERE) ----
+  // ---- s126: kein stilles Falsches ----
+  // Komma-Join muss LAUT scheitern (frueher: nur erste Tabelle gelesen,
+  // Rest inkl. WHERE still verworfen).
+  bool threw = false;
+  try {
+    db.execute("SELECT a FROM t, docs WHERE a = 1");
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+  // Trailing-Garbage nach gueltigem SELECT muss werfen.
+  threw = false;
+  try {
+    db.execute("SELECT * FROM t WHERE a = 1 GARBAGE");
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+  threw = false;
+  try {
+    db.execute("SELECT * FROM t UNION SELECT * FROM t");
+  } catch (...) {
+    threw = true;
+  }
+  CHECK(threw);
+  // Gueltige Statements weiter ok (EOF-Check greift nicht bei Subqueries).
+  auto rok = db.execute("SELECT a FROM t WHERE a IN (SELECT a FROM t WHERE a > 1)");
+  CHECK(rok.rows.size() == 1);
   auto rd = db.execute("CREATE TABLE d (d INT, x DOUBLE)");
   CHECK(rd.message == "CREATE TABLE");
   auto rdi = db.execute(
@@ -95,7 +122,7 @@ int main() {
       "SELECT d FROM d WHERE d < date '1997-02-28' + interval '3' month");
   CHECK(rq3.rows.size() == 2);  // 19961231 + 19970101 (< 19970528)
   // Fehlerfaelle: falsches Datum, unbekannte Einheit, Intervall ohne Datum.
-  bool threw = false;
+  threw = false;
   try {
     db.execute("SELECT d FROM d WHERE d = date '1997-13-01'");
   } catch (...) {
