@@ -494,11 +494,16 @@ void collectNodeRefs(NeededMap& need,
     if (scope.hasRight && scope.rSch != nullptr)
       needMarkAll(need, scope.rNorm, *scope.rSch);
   } else {
+    auto needCondCols = [&](const Condition& c) {
+      needAddRef(need, scope, c.column);
+      // s128: Spalten-RHS (`a = b`) ebenfalls markieren (sonst NULL).
+      if (!c.value_col.empty()) needAddRef(need, scope, c.value_col);
+    };
     for (const auto& c : q.columns) needAddRef(need, scope, c);
     for (const auto& a : q.aggregates) needAggArg(need, scope, a.arg);
-    for (const auto& c : q.where) needAddRef(need, scope, c.column);
+    for (const auto& c : q.where) needCondCols(c);
     for (const auto& gr : q.where_groups)
-      for (const auto& c : gr) needAddRef(need, scope, c.column);
+      for (const auto& c : gr) needCondCols(c);
     for (const auto& g : q.group_by) needAddRef(need, scope, g);
     std::vector<std::string> outNames;
     outNames.reserve(q.columns.size() + q.aggregates.size());

@@ -118,6 +118,44 @@ int main() {
     threw = true;
   }
   CHECK(threw);
+  // ---- s128: EXISTS / NOT EXISTS (korreliert per Semi-Join) ----
+  auto re = db.execute("CREATE TABLE o (id INT)");
+  CHECK(re.message == "CREATE TABLE");
+  auto rl = db.execute("CREATE TABLE l (oid INT, x INT)");
+  CHECK(rl.message == "CREATE TABLE");
+  auto rei = db.execute("INSERT INTO o VALUES (1), (2), (3)");
+  CHECK(rei.affected == 3);
+  auto rli = db.execute("INSERT INTO l VALUES (1, 10), (1, 20), (3, 30)");
+  CHECK(rli.affected == 3);
+  auto rex = db.execute("SELECT id FROM o WHERE EXISTS (SELECT * FROM l WHERE oid = id)");
+  CHECK(rex.rows.size() == 2);
+  CHECK(valueToString(rex.rows[0][0]) == "1");
+  CHECK(valueToString(rex.rows[1][0]) == "3");
+  auto rnx = db.execute("SELECT id FROM o WHERE NOT EXISTS (SELECT * FROM l WHERE oid = id)");
+  CHECK(rnx.rows.size() == 1);
+  CHECK(valueToString(rnx.rows[0][0]) == "2");
+  // Unkorreliert: leer -> keine Zeilen; voll -> alle.
+  auto rue = db.execute("SELECT id FROM o WHERE EXISTS (SELECT * FROM l WHERE x > 100)");
+  CHECK(rue.rows.empty());
+  auto ruf = db.execute("SELECT id FROM o WHERE EXISTS (SELECT * FROM l WHERE x > 5)");
+  CHECK(ruf.rows.size() == 3);
+  // Inner-inner Spaltenvergleich als Rest-Bedingung.
+  auto rum = db.execute(
+      "SELECT id FROM o WHERE EXISTS (SELECT * FROM l WHERE x > 5 AND oid = oid)");
+  CHECK(rum.rows.size() == 3);
+  // Laut statt still: nicht-equi Korrelation, OR-Korrelation, JOIN innen.
+  for (const char* bad :
+       {"SELECT id FROM o WHERE EXISTS (SELECT * FROM l WHERE oid > id)",
+        "SELECT id FROM o WHERE EXISTS (SELECT * FROM l WHERE oid = id OR x > 1)",
+        "SELECT id FROM o WHERE EXISTS (SELECT * FROM l JOIN o ON oid = id)"}) {
+    bool t = false;
+    try {
+      db.execute(bad);
+    } catch (...) {
+      t = true;
+    }
+    CHECK(t);
+  }
   // Trailing-Garbage nach gueltigem SELECT muss werfen.
   threw = false;
   try {

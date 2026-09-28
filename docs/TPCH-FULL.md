@@ -83,3 +83,14 @@ wurde Trailing-Garbage nach SELECT ignoriert. Dadurch waren q19/q20-
 "OK"s falsch-positiv. Fix: Komma nach FROM wirft
 ("Komma-Join wird nicht unterstützt"), SELECT verlangt Dateiende.
 Matrix-Stand danach: 2/22 VALIDIERT (q01, q06), Rest FAILt laut.
+
+## 7. Validierungsstand (s125/s128, SF0.01)
+
+`tools/tpch/tpchvalid.py` (Typ-Regeln §5): q01 vs. DuckDB OK, q06 vs.
+SQLite OK (800 Rows / 771253.5606 exakt; DuckDB-DECIMAL-Ausnahme 1195
+dokumentiert), **q04 vs. DuckDB OK** (5 Gruppen 105/97/103/91/105 exakt).
+q19/q20 seit s126 LAUT abgelehnt (Komma-Join) statt still-falsch —
+`EXPECTED_OPEN` im Skript (Gate bleibt scharf).
+Offen (laut, nicht still): CASE-Skalar-Arithmetik über Aggregaten
+(q14-Ratio), Multi-Join, Derived Tables, CASE-in-WHERE, unkorrelierte
+EXISTS mit Aggregaten.

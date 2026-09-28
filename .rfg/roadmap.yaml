@@ -1061,3 +1061,16 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
     engine: implement
     want: "CASE-WHEN in Aggregat-Argumenten: WHEN-DNF via Condition-Eval, THEN/ELSE rekursiv, Index-Aufloesung + Pushdown-Verdrahtung, Tests in test_sql gruen"
+  - id: s128-exists
+    title: s128-exists
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+      - tests/test_sql.cpp
+      - src/sql/executor.cpp
+      - tests/test_executor.cpp
+      - tools/tpch/tpchvalid.py
+      - docs/TPCH-FULL.md
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure && python3 tools/tpch/tpchvalid.py --data /tmp/tpchdata --db /tmp/tpchm2.db --out /tmp/valid.json"
+    engine: implement
+    want: "Korreliertes EXISTS per Hash-Semi-Join (q04 validiert): EXISTS/NOT EXISTS, equi-Korrelation, value_col-RHS, Pushdown-Markierung, Tests + Validierung gruen"

@@ -114,12 +114,21 @@ struct Condition {
   Value value;              // Einzel-Literal bzw. BETWEEN-Untergrenze
   Value second;             // BETWEEN-Obergrenze (sonst NULL)
   std::vector<Value> list;  // IN-Wertliste (sonst leer)
+  // s128: Spalten-Referenz als Vergleichs-RHS (`a = b`, z.B. fuer
+  // EXISTS-Korrelation). Leer = Literal in value/second (wie bisher).
+  // Nur bei Vergleichs-Ops (=,<>,<,<=,>,>=); Rest wirft laut.
+  std::string value_col;
   // Unkorrelierte Subquery (nullptr = Literal/Liste):
   // - "IN"/"NOT IN" + subquery = IN-Subquery (genau 1 Spalte, 0..n Zeilen,
   //   einmal ausgefuehrt, NULL-Semantik wie IN-Liste).
   // - Vergleichs-Op (=,<>,<,<=,>,>=) + subquery = Skalar (genau 1 Spalte,
   //   0 Zeilen -> NULL, >1 Zeile -> SqlError).
   std::shared_ptr<SelectStmt> subquery;
+  // s128: EXISTS/NOT EXISTS (op = "EXISTS"/"NOT EXISTS", column leer).
+  // Korreliert NUR als equi `innen.spalte = aussen.spalte` (+ unkorrelierte
+  // Rest-Bedingungen) -> Hash-Semi-Join; alles andere wirft laut.
+  // Unkorreliert: einmal auswerten (Zeilen vorhanden?).
+  bool exists_pred = false;
   // RLS (CREATE POLICY ... USING): current_user/current_role/session_user als
   // dynamischer Vergleich gegen die aktuelle Rolle (s. CreatePolicyStmt).
   // value_is_current/second_is_current: jeweiliger Vergleichswert ist die

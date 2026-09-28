@@ -131,6 +131,44 @@ int main() {
     wal2.close();
   }
 
+  // ---- s128: EXISTS ueber Executor (Pushdown-Pfad mit Masken) --------------
+  // TEXT-Spalten in EXISTS duerfen nicht NULL-dekodiert werden (stille 0).
+  {
+    dbengine::kv::KVStore kv;
+    dbengine::txn::MvccStore mvcc;
+    Executor ex(kv, mvcc, nullptr);
+    CHECK(ex.execute("CREATE TABLE o (id INT)").message == "CREATE TABLE");
+    CHECK(ex.execute("CREATE TABLE l (oid INT, tag TEXT)").message ==
+          "CREATE TABLE");
+    CHECK(ex.execute("INSERT INTO o VALUES (1), (2), (3)").affected == 3);
+    CHECK(ex.execute("INSERT INTO l VALUES (1, 'a'), (3, 'b')").affected == 2);
+    // TEXT-Praedikat innen (deckt needMarkAll fuer innere Tabellen ab).
+    auto r1 = ex.execute(
+        "SELECT id FROM o WHERE EXISTS (SELECT * FROM l WHERE oid = id AND "
+        "tag = 'a')");
+    CHECK(r1.rows.size() == 1);
+    CHECK(valueToString(r1.rows[0][0]) == "1");
+    // Spalten-RHS im Rest (inner-inner TEXT-Vergleich).
+    auto r2 = ex.execute(
+        "SELECT id FROM o WHERE EXISTS (SELECT * FROM l WHERE oid = id AND "
+        "tag = tag)");
+    CHECK(r2.rows.size() == 2);
+  }
+
+  // ---- s128: Spalten-RHS ueber Executor (Pushdown markiert value_col) -----
+  // Ohne Markierung wuerde die RHS-TEXT-Spalte NULL-dekodiert (stille 0 Rows).
+  {
+    dbengine::kv::KVStore kv;
+    dbengine::txn::MvccStore mvcc;
+    Executor ex(kv, mvcc, nullptr);
+    CHECK(ex.execute("CREATE TABLE t (a TEXT, b TEXT)").message == "CREATE TABLE");
+    CHECK(ex.execute("INSERT INTO t VALUES ('x', 'x'), ('x', 'y'), ('y', 'x')").affected ==
+          3);
+    auto r = ex.execute("SELECT a FROM t WHERE a = b");
+    CHECK(r.rows.size() == 1);
+    CHECK(valueToString(r.rows[0][0]) == "x");
+  }
+
   std::error_code ec;
   std::filesystem::remove(path, ec);
 

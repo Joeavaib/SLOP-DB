@@ -7,6 +7,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <limits>
 #include <map>
@@ -1652,8 +1653,46 @@ class Parser {
     }
   }
 
+  // s128: EXISTS (SELECT ...) parsen (Korrelationspruefung zur Laufzeit im
+  // Semi-Join-Aufbau; unkorreliert/nicht-equi jenseits des Musters wirft laut).
+  std::shared_ptr<SelectStmt> parseExistsSubquery() {
+    expectSymbol("(");
+    if (!peekKeyword("SELECT"))
+      throw SqlError("EXISTS braucht (SELECT ...)");
+    expectKeyword("SELECT");
+    if (subdepth_ >= kMaxSubqueryDepth)
+      throw SqlError("Subquery-Tiefe ueberschritten (max 8)");
+    ++subdepth_;
+    SelectStmt sub;
+    try {
+      sub = parseSelect();
+    } catch (...) {
+      --subdepth_;
+      throw;
+    }
+    --subdepth_;
+    expectSymbol(")");
+    return std::make_shared<SelectStmt>(std::move(sub));
+  }
+
   Condition parseCondition() {
     Condition c;
+    // s128: EXISTS / NOT EXISTS als eigenstaendiges Praedikat (kein Spalten-LHS).
+    if (peekKeyword("EXISTS")) {
+      ++pos_;
+      c.exists_pred = true;
+      c.op = "EXISTS";
+      c.subquery = parseExistsSubquery();
+      return c;
+    }
+    if (peekKeyword("NOT") && peekKeyword("EXISTS", 1)) {
+      ++pos_;
+      ++pos_;
+      c.exists_pred = true;
+      c.op = "NOT EXISTS";
+      c.subquery = parseExistsSubquery();
+      return c;
+    }
     c.column = parseColRef();
     // Optionales NOT-Praefix: NOT BETWEEN / NOT IN / NOT LIKE / NOT ILIKE.
     bool neg = false;
@@ -1753,7 +1792,41 @@ class Parser {
         c.subquery = std::make_shared<SelectStmt>(std::move(sub));
         return c;
       }
-      c.value = parseScalar();
+      // s128: blosser Identifier als RHS -> Spalten-Referenz (`a = b`, z.B.
+      // EXISTS-Korrelation). Nur wenn danach ein Klausel-Terminator folgt
+      // (AND/OR/)/,/EOF); TRUE/FALSE/NULL/DATE bleiben Literale.
+      // Unbekannte Spalten werfen spaet zur Laufzeit laut (wie bisher).
+      bool rhs_is_col = false;
+      {
+        const Token& r0 = peek();
+        const Token& r1 = peek(1);
+        const bool is_ident =
+            r0.kind == TokKind::Ident || r0.kind == TokKind::QuotedIdent;
+        // Qualifiziert (`t.c`) ist immer eine Spalten-Referenz.
+        if (is_ident && r1.kind == TokKind::Symbol && r1.text == ".") {
+          rhs_is_col = true;
+        } else {
+        std::string up =
+            (r0.kind == TokKind::Ident) ? toUpper(r0.text) : "";
+        const bool lit_kw =
+            (up == "TRUE" || up == "FALSE" || up == "NULL");
+        const bool is_date =
+            (up == "DATE" && r1.kind == TokKind::String);
+        const bool term =
+            (r1.kind == TokKind::Eof) ||
+            (r1.kind == TokKind::Symbol &&
+             (r1.text == ")" || r1.text == ",")) ||
+            (r1.kind == TokKind::Ident &&
+             (toUpper(r1.text) == "AND" || toUpper(r1.text) == "OR"));
+        rhs_is_col = is_ident && !lit_kw && !is_date && term;
+        }
+      }
+      if (rhs_is_col) {
+        c.value_col = parseColRef();
+        c.value = Value{std::monostate{}};
+      } else {
+        c.value = parseScalar();
+      }
       return c;
     }
     throw SqlError("Erwartet Operator nach Spaltenname");
@@ -1855,6 +1928,25 @@ bool evalCondition(const Table& t, const std::vector<Value>& row,
   int idx = t.colIndex(c.column);
   if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
   const Value& v = row[(std::size_t)idx];
+  // s128: Spalten-RHS (`a = b`): zweite Spalte aufloesen, Werte vergleichen.
+  // Nur Vergleichs-Ops; NULL auf einer Seite -> false (wie Literale).
+  if (!c.value_col.empty()) {
+    if (c.op != "=" && c.op != "<>" && c.op != "<" && c.op != "<=" &&
+        c.op != ">" && c.op != ">=")
+      throw SqlError("Spaltenvergleich nur mit Vergleichs-Operator");
+    int jdx = t.colIndex(c.value_col);
+    if (jdx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.value_col);
+    const Value& w = row[(std::size_t)jdx];
+    if (valueIsNull(v) || valueIsNull(w)) return false;
+    int cmp = compareValues(v, w);
+    if (cmp == -2) return false;
+    if (c.op == "=") return cmp == 0;
+    if (c.op == "<>") return cmp != 0;
+    if (c.op == "<") return cmp < 0;
+    if (c.op == "<=") return cmp <= 0;
+    if (c.op == ">") return cmp > 0;
+    return cmp >= 0;  // ">="
+  }
   if (c.op == "IS NULL") return valueIsNull(v);
   if (c.op == "IS NOT NULL") return !valueIsNull(v);
   if (c.op == "IN" || c.op == "NOT IN") {
@@ -1905,13 +1997,88 @@ bool evalCondition(const Table& t, const std::vector<Value>& row,
 
 // WHERE als DNF: ohne OR gilt where (AND), mit OR gelten where_groups
 // (OR von AND-Konjunktionen, AND bindet staerker).
+// s128: EXISTS-Ausfuehrung per Hash-Semi-Join. Pro WHERE-Condition mit
+// exists_pred haelt der Plan (einmal aufgebaut) die Treffermenge;
+// pro aeusserer Zeile nur ein Hash-Lookup.
+struct ExistsPlan {
+  bool is_not = false;
+  bool uncorrelated = false;  // kein equi: einmalig ausgewertet
+  bool unc_result = false;
+  std::vector<int> outer_idxs;  // Spaltenindizes in aeusserer Tabelle
+  std::unordered_set<std::string> keys;  // kodierte innere Keys
+};
+
+// Eindeutige Typ+Laengen-Kodierung (keine Kollisions-Anfaelligkeit durch
+// Trennzeichen in TEXT). NULL kommt hier nie an (Aufrufer filtert).
+std::string encodeExistsKey(const std::vector<Value>& vals) {
+  std::string o;
+  for (const auto& v : vals) {
+    if (auto* i = std::get_if<int64_t>(&v)) {
+      o += 'I';
+      uint64_t u = static_cast<uint64_t>(*i);
+      for (int k = 7; k >= 0; --k)
+        o += static_cast<char>((u >> (k * 8)) & 0xFF);
+    } else if (auto* d = std::get_if<double>(&v)) {
+      o += 'F';
+      uint64_t u = 0;
+      std::memcpy(&u, d, sizeof(u));
+      for (int k = 7; k >= 0; --k)
+        o += static_cast<char>((u >> (k * 8)) & 0xFF);
+    } else if (auto* s = std::get_if<std::string>(&v)) {
+      o += 'S';
+      uint64_t n = s->size();
+      for (int k = 7; k >= 0; --k)
+        o += static_cast<char>((n >> (k * 8)) & 0xFF);
+      o += *s;
+    } else if (auto* b = std::get_if<bool>(&v)) {
+      o += *b ? 'T' : 'B';
+    } else {
+      o += 'N';  // defensiv (NULL wird vorher gefiltert)
+    }
+  }
+  return o;
+}
+
+// s128: eine WHERE-Condition auswerten (EXISTS via Plan, Rest wie bisher).
+// Ohne Plan (nullptr/fehlend) wirft EXISTS laut statt still-falsch.
+bool evalExistsCond(const Table& t, const std::vector<Value>& row,
+                    const Condition& c,
+                    const std::map<const Condition*, ExistsPlan>* eplans) {
+  if (!c.exists_pred) return evalCondition(t, row, c);
+  if (eplans == nullptr)
+    throw SqlError("EXISTS wird hier nicht unterstuetzt");
+  auto it = eplans->find(&c);
+  if (it == eplans->end())
+    throw SqlError("EXISTS wird hier nicht unterstuetzt");
+  const ExistsPlan& p = it->second;
+  bool hit = false;
+  if (p.uncorrelated) {
+    hit = p.unc_result;
+  } else {
+    std::vector<Value> key;
+    key.reserve(p.outer_idxs.size());
+    bool has_null = false;
+    for (int oi : p.outer_idxs) {
+      const Value& v = row[static_cast<std::size_t>(oi)];
+      if (valueIsNull(v)) {
+        has_null = true;
+        break;
+      }
+      key.push_back(v);
+    }
+    if (!has_null) hit = p.keys.count(encodeExistsKey(key)) > 0;
+  }
+  return p.is_not ? !hit : hit;
+}
+
 bool evalWhere(const Table& t, const std::vector<Value>& row,
-               const SelectStmt& s) {
+               const SelectStmt& s,
+               const std::map<const Condition*, ExistsPlan>* eplans = nullptr) {
   if (!s.where_groups.empty()) {
     for (auto& conj : s.where_groups) {
       bool ok = true;
       for (auto& c : conj) {
-        if (!evalCondition(t, row, c)) {
+        if (!evalExistsCond(t, row, c, eplans)) {
           ok = false;
           break;
         }
@@ -1921,7 +2088,7 @@ bool evalWhere(const Table& t, const std::vector<Value>& row,
     return false;
   }
   for (auto& c : s.where)
-    if (!evalCondition(t, row, c)) return false;
+    if (!evalExistsCond(t, row, c, eplans)) return false;
   return true;
 }
 
@@ -1930,11 +2097,32 @@ bool evalWhere(const Table& t, const std::vector<Value>& row,
 // Indizes werden einmal pro execSelect aufgebaut (Reihenfolge = Parser-
 // Reihenfolge, Fehlermeldung byte-identisch). Fallback: evalWhere.
 bool evalConditionIdx(const Table& t, const std::vector<Value>& row,
-                      const Condition& c, int idx) {
+                      const Condition& c, int idx, int vidx = -1) {
   if (c.subquery)
     throw SqlError("Subquery ohne Ausfuehrungskontext (interner Fehler)");
   if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
   const Value& v = row[(std::size_t)idx];
+  // s128: Spalten-RHS (Index-Variante).
+  if (!c.value_col.empty()) {
+    if (c.op != "=" && c.op != "<>" && c.op != "<" && c.op != "<=" &&
+        c.op != ">" && c.op != ">=")
+      throw SqlError("Spaltenvergleich nur mit Vergleichs-Operator");
+    if (vidx < 0) {
+      int j = t.colIndex(c.value_col);
+      if (j < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.value_col);
+      vidx = j;
+    }
+    const Value& w = row[(std::size_t)vidx];
+    if (valueIsNull(v) || valueIsNull(w)) return false;
+    int cmp = compareValues(v, w);
+    if (cmp == -2) return false;
+    if (c.op == "=") return cmp == 0;
+    if (c.op == "<>") return cmp != 0;
+    if (c.op == "<") return cmp < 0;
+    if (c.op == "<=") return cmp <= 0;
+    if (c.op == ">") return cmp > 0;
+    return cmp >= 0;  // ">="
+  }
   if (c.op == "IS NULL") return valueIsNull(v);
   if (c.op == "IS NOT NULL") return !valueIsNull(v);
   if (c.op == "IN" || c.op == "NOT IN") {
@@ -1981,16 +2169,30 @@ bool evalConditionIdx(const Table& t, const std::vector<Value>& row,
 
 bool evalWhereIdx(const Table& t, const std::vector<Value>& row,
                   const SelectStmt& s, const std::vector<int>& whereIdx,
-                  const std::vector<std::vector<int>>& groupsIdx) {
+                  const std::vector<std::vector<int>>& groupsIdx,
+                  const std::vector<int>& whereVIdx = {},
+                  const std::vector<std::vector<int>>& groupsVIdx = {},
+                  const std::map<const Condition*, ExistsPlan>* eplans = nullptr) {
   if (!s.where_groups.empty()) {
     for (std::size_t gi = 0; gi < s.where_groups.size(); ++gi) {
       const auto& conj = s.where_groups[gi];
       const auto& idxs =
           gi < groupsIdx.size() ? groupsIdx[gi] : std::vector<int>{};
+      const auto& vidxs =
+          gi < groupsVIdx.size() ? groupsVIdx[gi] : std::vector<int>{};
       bool ok = true;
       for (std::size_t i = 0; i < conj.size(); ++i) {
+        const Condition& c = conj[i];
+        if (c.exists_pred) {
+          if (!evalExistsCond(t, row, c, eplans)) {
+            ok = false;
+            break;
+          }
+          continue;
+        }
         int idx = i < idxs.size() ? idxs[i] : -1;
-        if (!evalConditionIdx(t, row, conj[i], idx)) {
+        int vidx = i < vidxs.size() ? vidxs[i] : -1;
+        if (!evalConditionIdx(t, row, c, idx, vidx)) {
           ok = false;
           break;
         }
@@ -2000,8 +2202,14 @@ bool evalWhereIdx(const Table& t, const std::vector<Value>& row,
     return false;
   }
   for (std::size_t i = 0; i < s.where.size(); ++i) {
+    const Condition& c = s.where[i];
+    if (c.exists_pred) {
+      if (!evalExistsCond(t, row, c, eplans)) return false;
+      continue;
+    }
     int idx = i < whereIdx.size() ? whereIdx[i] : -1;
-    if (!evalConditionIdx(t, row, s.where[i], idx)) return false;
+    int vidx = i < whereVIdx.size() ? whereVIdx[i] : -1;
+    if (!evalConditionIdx(t, row, c, idx, vidx)) return false;
   }
   return true;
 }
@@ -3169,11 +3377,19 @@ bool evalConditionSub(const Table& t, const std::vector<Value>& row,
 bool evalWhereSub(const Table& t, const std::vector<Value>& row,
                   const std::vector<Condition>& where,
                   const std::vector<std::vector<Condition>>& groups,
-                  const SubMap& m) {
+                  const SubMap& m,
+                  const std::map<const Condition*, ExistsPlan>* eplans = nullptr) {
   if (!groups.empty()) {
     for (auto& conj : groups) {
       bool ok = true;
       for (auto& c : conj) {
+        if (c.exists_pred) {
+          if (!evalExistsCond(t, row, c, eplans)) {
+            ok = false;
+            break;
+          }
+          continue;
+        }
         if (!evalConditionSub(t, row, c, m)) {
           ok = false;
           break;
@@ -3183,8 +3399,13 @@ bool evalWhereSub(const Table& t, const std::vector<Value>& row,
     }
     return false;
   }
-  for (auto& c : where)
+  for (auto& c : where) {
+    if (c.exists_pred) {
+      if (!evalExistsCond(t, row, c, eplans)) return false;
+      continue;
+    }
     if (!evalConditionSub(t, row, c, m)) return false;
+  }
   return true;
 }
 
@@ -4128,7 +4349,7 @@ Result Database::execUpdate(const UpdateStmt& s) {
   ScopeGuard guard;
   SubMap subs;
   auto resolve = [&](const Condition& c) {
-    if (!c.subquery) return;
+    if (!c.subquery || c.exists_pred) return;  // s128: EXISTS eigener Pfad
     if (subs.count(c.subquery.get())) return;
     Result r = execSelect(*c.subquery);
     if (r.columns.size() != 1)
@@ -4199,7 +4420,7 @@ Result Database::execDelete(const DeleteStmt& s) {
   ScopeGuard guard;
   SubMap subs;
   auto resolve = [&](const Condition& c) {
-    if (!c.subquery) return;
+    if (!c.subquery || c.exists_pred) return;  // s128: EXISTS eigener Pfad
     if (subs.count(c.subquery.get())) return;
     Result r = execSelect(*c.subquery);
     if (r.columns.size() != 1)
@@ -4261,6 +4482,116 @@ Result Database::execDrop(const DropTableStmt& s) {
   return { {}, {}, "DROP TABLE", 0 };
 }
 
+// s128: EXISTS-Semi-Join-Aufbau (einmal pro execSelect, nicht pro Zeile).
+// Erlaubt: Single-Table-Innenquery ohne Aggregate/GROUP BY/LIMIT/OFFSET/
+// Subqueries, Korrelation NUR als equi `innen.spalte = aussen.spalte`
+// (+ unkorrelierte Rest-Bedingungen). Alles andere wirft laut.
+std::map<const Condition*, ExistsPlan> buildExistsPlans(
+    const std::map<std::string, Table>& tables, const Table& outer,
+    const std::vector<Condition>& where,
+    const std::vector<std::vector<Condition>>& groups) {
+  std::map<const Condition*, ExistsPlan> out;
+  auto fail = [](const std::string& w) -> std::map<const Condition*, ExistsPlan> {
+    throw SqlError(w);
+  };
+  std::vector<const Condition*> ecs;
+  for (auto& c : where)
+    if (c.exists_pred) ecs.push_back(&c);
+  for (auto& gr : groups)
+    for (auto& c : gr)
+      if (c.exists_pred) ecs.push_back(&c);
+  for (const Condition* cp : ecs) {
+    const Condition& c = *cp;
+    if (!c.subquery) throw SqlError("EXISTS ohne Subquery (interner Fehler)");
+    const SelectStmt& sub = *c.subquery;
+    if (sub.has_join)
+      return fail("EXISTS mit JOIN wird nicht unterstuetzt");
+    if (!sub.aggregates.empty() || sub.count_star || !sub.group_by.empty())
+      return fail("EXISTS mit Aggregaten/GROUP BY wird nicht unterstuetzt");
+    if (sub.has_limit || sub.has_offset)
+      return fail("EXISTS mit LIMIT/OFFSET wird nicht unterstuetzt");
+    auto it = tables.find(foldIdent(sub.table));
+    if (it == tables.end())
+      return fail("Tabelle unbekannt: " + sub.table);
+    const Table& inner = it->second;
+    if (!sub.where_groups.empty())
+      return fail("EXISTS-Korrelation nur in AND-Kette (kein OR)");
+    ExistsPlan p;
+    p.is_not = (c.op == "NOT EXISTS");
+    std::vector<Condition> rest;          // unkorrelierte Rest-Bedingungen
+    std::vector<std::pair<int, int>> equi;  // (innen-idx, aussen-idx)
+    for (const auto& ic : sub.where) {
+      if (ic.subquery || ic.exists_pred)
+        return fail("Geschachtelte Subquery in EXISTS wird nicht unterstuetzt");
+      const bool col_in = inner.colIndex(ic.column) >= 0;
+      if (ic.value_col.empty()) {
+        if (!col_in)
+          return fail("Unbekannte Spalte in WHERE: " + ic.column);
+        rest.push_back(ic);
+        continue;
+      }
+      const bool v_in = inner.colIndex(ic.value_col) >= 0;
+      const bool col_out = outer.colIndex(ic.column) >= 0;
+      const bool v_out = outer.colIndex(ic.value_col) >= 0;
+      if (col_in && v_in) {
+        rest.push_back(ic);  // inner-inner Vergleich, keine Korrelation
+      } else if (col_in && v_out && !v_in && ic.op == "=") {
+        equi.emplace_back(inner.colIndex(ic.column),
+                          outer.colIndex(ic.value_col));
+      } else if (v_in && col_out && !col_in && ic.op == "=") {
+        equi.emplace_back(inner.colIndex(ic.value_col),
+                          outer.colIndex(ic.column));
+      } else if (ic.op != "=" &&
+                 ((col_in && v_out) || (v_in && col_out))) {
+        return fail(
+            "EXISTS-Korrelation nur als Gleichheit (kein Vergleichs-Op)");
+      } else {
+        return fail("Unbekannte Spalte in WHERE: " +
+                    (!col_in && !col_out ? ic.column : ic.value_col));
+      }
+    }
+    if (equi.empty()) {
+      // Unkorreliert: einmal auswerten (Zeilen vorhanden?).
+      SelectStmt f;
+      f.where = rest;
+      bool any = false;
+      for (auto& row : inner.rows) {
+        if (evalWhere(inner, row, f)) {
+          any = true;
+          break;
+        }
+      }
+      p.uncorrelated = true;
+      p.unc_result = any;
+    } else {
+      SelectStmt f;
+      f.where = rest;
+      for (auto& row : inner.rows) {
+        if (!evalWhere(inner, row, f)) continue;
+        std::vector<Value> key;
+        key.reserve(equi.size());
+        bool has_null = false;
+        for (auto& [ii, oi] : equi) {
+          (void)oi;
+          const Value& v = row[static_cast<std::size_t>(ii)];
+          if (valueIsNull(v)) {
+            has_null = true;
+            break;
+          }
+          key.push_back(v);
+        }
+        if (!has_null) p.keys.insert(encodeExistsKey(key));
+      }
+      for (auto& [ii, oi] : equi) {
+        (void)ii;
+        p.outer_idxs.push_back(oi);
+      }
+    }
+    out[cp] = std::move(p);
+  }
+  return out;
+}
+
 Result Database::execSelect(const SelectStmt& s) {
   if (g_scopes.size() >= static_cast<std::size_t>(kMaxSubqueryDepth))
     throw SqlError("Subquery-Tiefe ueberschritten (max 8)");
@@ -4271,7 +4602,7 @@ Result Database::execSelect(const SelectStmt& s) {
   // WHERE-Subqueries je einmal ausfuehren (IN -> Menge, Skalar -> Wert).
   SubMap subs;
   auto resolve = [&](const Condition& c) {
-    if (!c.subquery) return;
+    if (!c.subquery || c.exists_pred) return;  // s128: EXISTS eigener Pfad
     if (subs.count(c.subquery.get())) return;
     Result r = execSelect(*c.subquery);
     if (r.columns.size() != 1)
@@ -4350,27 +4681,59 @@ Result Database::execSelect(const SelectStmt& s) {
   // Stringsuche pro Zeile × Bedingung). Nur Single-Table ohne Subqueries;
   // Fehlersemantik byte-identisch (unbekannte Spalte wirft wie evalCondition).
   // Join/Subquery/RLS-Pfade unveraendert (Fallback evalWhere/evalWhereSub).
+  // s128: EXISTS-Bedingungen (leere Spalte) ueberspringen (Plan statt Index).
   bool useIdx = subs.empty() && !s.has_join;
   std::vector<int> whereIdx;
   std::vector<std::vector<int>> groupsIdx;
+  std::vector<int> whereVIdx;
+  std::vector<std::vector<int>> groupsVIdx;
   if (useIdx) {
     try {
       whereIdx.reserve(s.where.size());
+      whereVIdx.reserve(s.where.size());
       for (const auto& c : s.where) {
+        if (c.exists_pred) {
+          whereIdx.push_back(-1);
+          whereVIdx.push_back(-1);
+          continue;
+        }
         int idx = t.colIndex(c.column);
         if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
         whereIdx.push_back(idx);
+        int vidx = -1;
+        if (!c.value_col.empty()) {
+          vidx = t.colIndex(c.value_col);
+          if (vidx < 0)
+            throw SqlError("Unbekannte Spalte in WHERE: " + c.value_col);
+        }
+        whereVIdx.push_back(vidx);
       }
       groupsIdx.reserve(s.where_groups.size());
+      groupsVIdx.reserve(s.where_groups.size());
       for (const auto& conj : s.where_groups) {
         std::vector<int> ids;
+        std::vector<int> vids;
         ids.reserve(conj.size());
+        vids.reserve(conj.size());
         for (const auto& c : conj) {
+          if (c.exists_pred) {
+            ids.push_back(-1);
+            vids.push_back(-1);
+            continue;
+          }
           int idx = t.colIndex(c.column);
           if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
           ids.push_back(idx);
+          int vidx = -1;
+          if (!c.value_col.empty()) {
+            vidx = t.colIndex(c.value_col);
+            if (vidx < 0)
+              throw SqlError("Unbekannte Spalte in WHERE: " + c.value_col);
+          }
+          vids.push_back(vidx);
         }
         groupsIdx.push_back(std::move(ids));
+        groupsVIdx.push_back(std::move(vids));
       }
     } catch (...) {
       // Unbekannte Spalte: Fallback auf Altpfad (wirft dort pro Zeile wie
@@ -4378,6 +4741,23 @@ Result Database::execSelect(const SelectStmt& s) {
       useIdx = false;
       whereIdx.clear();
       groupsIdx.clear();
+      whereVIdx.clear();
+      groupsVIdx.clear();
+    }
+  }
+  // s128: EXISTS-Plaene einmalig (JOIN+EXISTS wirft laut, s. Builder).
+  std::map<const Condition*, ExistsPlan> eplans;
+  {
+    bool any_exists = false;
+    for (auto& c : s.where)
+      if (c.exists_pred) any_exists = true;
+    for (auto& gr : s.where_groups)
+      for (auto& c : gr)
+        if (c.exists_pred) any_exists = true;
+    if (any_exists) {
+      if (s.has_join)
+        throw SqlError("EXISTS mit JOIN wird nicht unterstuetzt");
+      eplans = buildExistsPlans(tables_, t, s.where, s.where_groups);
     }
   }
   // Filter (AND bzw. DNF bei OR; ohne Subqueries exakt der Altpfad) + RLS.
@@ -4385,11 +4765,12 @@ Result Database::execSelect(const SelectStmt& s) {
   for (auto& row : t.rows) {
     bool ok = false;
     if (!subs.empty()) {
-      ok = evalWhereSub(t, row, s.where, s.where_groups, subs);
+      ok = evalWhereSub(t, row, s.where, s.where_groups, subs, &eplans);
     } else if (useIdx) {
-      ok = evalWhereIdx(t, row, s, whereIdx, groupsIdx);
+      ok = evalWhereIdx(t, row, s, whereIdx, groupsIdx, whereVIdx, groupsVIdx,
+                        &eplans);
     } else {
-      ok = evalWhere(t, row, s);
+      ok = evalWhere(t, row, s, &eplans);
     }
     if (!ok) continue;
     if (!rowPassesRls(t, row, normS, "SELECT")) continue;  // unsichtbar

@@ -18,7 +18,7 @@ import subprocess
 import sys
 from decimal import Decimal
 
-QUERIES = ["q01", "q06", "q19", "q20"]
+QUERIES = ["q01", "q04", "q06", "q19", "q20"]
 # s126: q19/q20 nutzen Komma-Joins -> seit s126 LAUT abgelehnt (vorher
 # stillschweigend falsch!). Als dokumentiert-offen markiert: sie duerfen
 # (nur sie) mit Feature-Fehler scheitern, ohne das Gate zu schwaechen.
