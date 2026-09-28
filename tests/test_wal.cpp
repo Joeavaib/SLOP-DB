@@ -6,16 +6,20 @@
 // Misst Recovery-Zeit (replay ms) und gibt sie aus.
 
 #include <cassert>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "dbengine/storage/wal.h"
 
 #if defined(__linux__)
+#include <sched.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -159,6 +163,145 @@ int main() {
     check(r.size() == 3, "torn tail -> prefix 3");
     check(r[2].data == "c", "torn tail payload");
     std::filesystem::remove(p3);
+  }
+
+  // 5. s109: CRC-korrekte Dup-/Rueckschritt-LSN -> Prefix-Stop.
+  // Records manuell gebaut (Format s. wal.h: magic4 + lsn8 + len4 + crc4 +
+  // payload; CRC deckt lsn||len||payload, OHNE Magic — wie record_crc).
+  // CRC ueber die Konkatenation in einem crc32-Aufruf (Standard-CRC linear,
+  // aequivalent zur zweistufigen record_crc-Verkettung).
+  {
+    auto put_le32 = [](std::string& o, uint32_t v) {
+      o.push_back(static_cast<char>(v & 0xFF));
+      o.push_back(static_cast<char>((v >> 8) & 0xFF));
+      o.push_back(static_cast<char>((v >> 16) & 0xFF));
+      o.push_back(static_cast<char>((v >> 24) & 0xFF));
+    };
+    auto put_le64 = [&](std::string& o, uint64_t v) {
+      put_le32(o, static_cast<uint32_t>(v & 0xFFFFFFFFu));
+      put_le32(o, static_cast<uint32_t>((v >> 32) & 0xFFFFFFFFu));
+    };
+    auto emit = [&](std::string& o, uint64_t lsn, const std::string& pay) {
+      std::string covered;
+      put_le64(covered, lsn);
+      put_le32(covered, static_cast<uint32_t>(pay.size()));
+      const std::string blob = covered + pay;
+      const uint32_t c = Wal::crc32(blob.data(), blob.size());
+      put_le32(o, Wal::kMagic);
+      o += covered;
+      put_le32(o, c);
+      o += pay;
+    };
+    auto write_file = [&](const std::string& p, const std::string& bytes) {
+      std::ofstream f(p, std::ios::binary | std::ios::trunc);
+      check(static_cast<bool>(f), "dup testdatei schreibbar");
+      f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+      f.close();
+    };
+    // Sanity: manuell gebauter Einzel-Record wird akzeptiert (CRC-Rekonstruktion stimmt).
+    {
+      const std::string p = tmp_path("dbengine_test_wal_dup_sanity");
+      std::string b;
+      emit(b, 1, "a");
+      write_file(p, b);
+      auto r = Wal::replay_file(p);
+      check(r.size() == 1 && r[0].lsn == 1 && r[0].data == "a", "dup sanity single");
+      std::filesystem::remove(p);
+    }
+    // Angriff aus dem Review: [1:a][1:b][2:c] -> nur Prefix [(1,a)].
+    {
+      const std::string p = tmp_path("dbengine_test_wal_dup");
+      std::string b;
+      emit(b, 1, "a");
+      emit(b, 1, "b");
+      emit(b, 2, "c");
+      write_file(p, b);
+      auto r = Wal::replay_file(p);
+      check(r.size() == 1, "dup-LSN -> prefix 1");
+      check(r[0].lsn == 1 && r[0].data == "a", "dup-LSN prefix payload");
+      std::filesystem::remove(p);
+    }
+    // Rueckschritt: [2:x][1:y] -> nur [(2,x)].
+    {
+      const std::string p = tmp_path("dbengine_test_wal_regress");
+      std::string b;
+      emit(b, 2, "x");
+      emit(b, 1, "y");
+      write_file(p, b);
+      auto r = Wal::replay_file(p);
+      check(r.size() == 1, "regress-LSN -> prefix 1");
+      check(r[0].lsn == 2 && r[0].data == "x", "regress-LSN prefix payload");
+      std::filesystem::remove(p);
+    }
+    std::cout << "[wal] dup/regress-LSN prefix-stop ok\n";
+  }
+
+  // 6. s114: parallele Erstnutzung der CRC-Tabelle (Magic-Static, kein
+  // check-then-act-Race). Barrieren-Start maximiert gleichzeitigen Erst-
+  // zugriff; Ergebnisse muessen single-thread-identisch sein. Zusaetzlich
+  // parallele Wal-Instanzen mit appends (crc32 im Write-Pfad).
+  {
+    constexpr int kThreads = 8;
+    constexpr int kIters = 2000;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> bad{0};
+    std::vector<std::thread> th;
+    for (int t = 0; t < kThreads; ++t) {
+      th.emplace_back([&, t] {
+        ++ready;
+        while (!go.load(std::memory_order_acquire)) {
+#if defined(__linux__)
+          ::sched_yield();
+#endif
+        }
+        for (int i = 0; i < kIters; ++i) {
+          const std::string pay =
+              "crc-race-t" + std::to_string(t) + "-i" + std::to_string(i);
+          if (Wal::crc32(pay.data(), pay.size()) !=
+              Wal::crc32(pay.data(), pay.size())) {
+            ++bad;  // inkonsistent innerhalb eines Threads -> Tabelle korrupt
+          }
+        }
+        // Referenzwert (IEEE, bekannt): muss immer stimmen.
+        const char* v = "123456789";
+        if (Wal::crc32(v, 9) != 0xCBF43926u) ++bad;
+      });
+    }
+    while (ready.load() < kThreads) {
+#if defined(__linux__)
+      ::sched_yield();
+#endif
+    }
+    go.store(true);
+    for (auto& x : th) x.join();
+    check(bad.load() == 0, "crc parallel konsistent");
+    // Parallele Wal-Instanzen (eigene Dateien, crc32 im append-Pfad).
+    std::vector<std::thread> wth;
+    std::atomic<int> wbad{0};
+    for (int t = 0; t < 4; ++t) {
+      wth.emplace_back([&, t] {
+        const std::string p = tmp_path("dbengine_test_wal_par_" + std::to_string(t));
+        Wal w(p);
+        w.open();
+        for (int i = 0; i < 200; ++i) w.append("par-" + std::to_string(i));
+        w.flush();
+        auto r = w.replay();
+        if (r.size() != 200) ++wbad;
+        for (size_t i = 0; i < r.size(); ++i) {
+          if (r[i].lsn != i + 1 ||
+              r[i].data != "par-" + std::to_string(i)) {
+            ++wbad;
+            break;
+          }
+        }
+        w.close();
+        std::filesystem::remove(p);
+      });
+    }
+    for (auto& x : wth) x.join();
+    check(wbad.load() == 0, "wal parallel instanzen konsistent");
+    std::cout << "[wal] crc/init parallel ok\n";
   }
 
 #if defined(__linux__)

@@ -203,6 +203,58 @@ int main() {
     std::remove(path.c_str());
   }
 
+  std::cout << "[pager] s110 insert_batch all-or-nothing\n";
+  {
+    const std::string path = tmp_path("dbengine_pager_batch_atomic.db");
+    Pager pager(path);
+    check(pager.open(), "open (batch atomic)");
+    check(pager.insert(9, "nine"), "insert pre-existing 9");
+    // Angriff aus dem Review: gueltig + oversize -> false UND keine Teilmutation.
+    const std::vector<std::pair<std::uint64_t, std::string>> bad{
+        {1, "ok"},
+        {2, std::string(dbengine::storage::kMaxValueBytes + 1, 'x')},
+    };
+    check(!pager.insert_batch(bad), "oversize batch fails");
+    check(!pager.contains(1), "no partial mutation (key 1 absent)");
+    check(pager.entry_count() == 1, "only pre-existing entry remains");
+    std::string v;
+    check(pager.find(9, v) && v == "nine", "pre-existing intact");
+    // Positiv: gueltiger Batch geht vollständig durch.
+    const std::vector<std::pair<std::uint64_t, std::string>> good{
+        {1, "one"},
+        {2, "two"},
+    };
+    check(pager.insert_batch(good), "valid batch commits");
+    check(pager.find(1, v) && v == "one", "batch key 1");
+    check(pager.find(2, v) && v == "two", "batch key 2");
+    pager.close();
+    std::remove(path.c_str());
+  }
+
+  std::cout << "[pager] s113 zero-key-empty-value survives restart\n";
+  {
+    // (0,"") als EINZIGER (= letzter) Record: die Map ist key-sortiert,
+    // also ist 0 nur dann physisch letzter Record, wenn nichts groesseres
+    // folgt. Genau dann fraß der alte (0,0)-Sentinel den Datensatz.
+    const std::string path = tmp_path("dbengine_pager_zero.db");
+    {
+      Pager pager(path);
+      check(pager.open(), "open (zero)");
+      check(pager.insert(0, ""), "insert (0, empty) only record");
+      pager.close();
+    }
+    {
+      Pager pager(path);
+      check(pager.open(), "reopen (zero)");
+      std::string v;
+      bool found = pager.find(0, v);
+      check(found && v.empty(), "zero-key empty value survives");
+      check(pager.entry_count() == 1, "entry count == 1");
+      pager.close();
+    }
+    std::remove(path.c_str());
+  }
+
   if (failures == 0) {
     std::cout << "PAGER TESTS PASSED\n";
     return 0;

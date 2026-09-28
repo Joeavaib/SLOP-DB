@@ -9,6 +9,8 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "dbengine/txn/mvcc.h"
@@ -198,8 +200,7 @@ static bool t_delete_and_purge() {
   return true;
 }
 
-static bool t_read_only_needs_no_writer_lock() {
-  MvccStore s;
+static bool t_read_only_needs_no_writer_lock() {  MvccStore s;
   auto w = s.TryBeginWrite();
   CHECK(w.has_value());
   // Reads parallel zum aktiven Writer muessen gehen.
@@ -208,6 +209,37 @@ static bool t_read_only_needs_no_writer_lock() {
   CHECK(!s.Read(r, "x").has_value());  // Snapshot vor Commit
   CHECK(s.Commit(*w));
   CHECK(s.Commit(r));
+  return true;
+}
+
+static bool t_move_semantics() {
+  using dbengine::txn::Transaction;
+  static_assert(!std::is_copy_constructible_v<Transaction>, "move-only");
+  static_assert(!std::is_copy_assignable_v<Transaction>, "move-only");
+  static_assert(std::is_move_constructible_v<Transaction>, "movable");
+  MvccStore s;
+  {
+    auto w = s.TryBeginWrite();
+    CHECK(w.has_value());
+    CHECK(s.Write(*w, "k", "v1"));
+    CHECK(s.Commit(*w));
+  }
+  // Angriff aus dem Review (jetzt per Move): Snapshot-Schutz muss am
+  // Move-Ziel haengen bleiben, die Quelle wird inert.
+  auto r = s.BeginRead();  // Snapshot sieht v1
+  dbengine::txn::Transaction m = std::move(r);
+  CHECK(!s.Read(r, "k").has_value());  // Quelle inert
+  CHECK(!s.Commit(r));                 // Quelle nicht committbar
+  {
+    auto w2 = s.TryBeginWrite();
+    CHECK(w2.has_value());
+    CHECK(s.Write(*w2, "k", "v2"));
+    CHECK(s.Commit(*w2));
+  }
+  s.Purge();  // darf v1 NICHT raeumen: m haelt den Snapshot
+  auto got = s.Read(m, "k");
+  CHECK(got.has_value() && *got == "v1");  // Snapshot-Schutz ueberlebt Move
+  CHECK(s.Commit(m));
   return true;
 }
 
@@ -222,6 +254,7 @@ int main() {
       {"read_own_writes_and_abort", t_read_own_writes_and_abort},
       {"delete_and_purge", t_delete_and_purge},
       {"read_only_parallel", t_read_only_needs_no_writer_lock},
+      {"move_semantics", t_move_semantics},
   };
   int fail = 0;
   for (auto& [name, fn] : cases) {

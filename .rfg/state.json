@@ -108,7 +108,14 @@
     "s104-q6bench",
     "s105-q6fast",
     "s106-decodefast",
-    "s107-aggfast"
+    "s107-aggfast",
+    "s108-rematch2",
+    "s109-wallsn",
+    "s110-pagerbatch",
+    "s111-btreerollback",
+    "s112-mvccmove",
+    "s113-pagercount",
+    "s114-crconce"
   ],
   "verified": [
     "s07-index",
@@ -219,16 +226,23 @@
     "s104-q6bench",
     "s105-q6fast",
     "s106-decodefast",
-    "s107-aggfast"
+    "s107-aggfast",
+    "s108-rematch2",
+    "s109-wallsn",
+    "s110-pagerbatch",
+    "s111-btreerollback",
+    "s112-mvccmove",
+    "s113-pagercount",
+    "s114-crconce"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s107-aggfast-1790617068",
-    "step_id": "s107-aggfast",
-    "commit": "576d86e05faa974a78e669ae992ed3354f428030",
+    "id": "cp-s114-crconce-1790618577",
+    "step_id": "s114-crconce",
+    "commit": "679786746c0e87b8ff0469db680d12d2cc22091e",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T17:37:48.993258+00:00"
+    "created_at": "2026-09-28T18:02:57.864389+00:00"
   },
   "checkpoints": [
     {
@@ -951,6 +965,55 @@
       "commit": "576d86e05faa974a78e669ae992ed3354f428030",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T17:37:48.993258+00:00"
+    },
+    {
+      "id": "cp-s108-rematch2-1790617273",
+      "step_id": "s108-rematch2",
+      "commit": "59d05c2e9c5d663cdb3418bbe24bcd7d851ff813",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:41:13.165148+00:00"
+    },
+    {
+      "id": "cp-s109-wallsn-1790617540",
+      "step_id": "s109-wallsn",
+      "commit": "ae8a25ebd68ea589e7599c0bf78851c156df37d5",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:45:40.438884+00:00"
+    },
+    {
+      "id": "cp-s110-pagerbatch-1790617619",
+      "step_id": "s110-pagerbatch",
+      "commit": "8d15694bd1582e979d0ad6bea16aa0cd97717c06",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:46:59.805755+00:00"
+    },
+    {
+      "id": "cp-s111-btreerollback-1790617940",
+      "step_id": "s111-btreerollback",
+      "commit": "a88144ce93847840b9714a8d281fd9831c43c6b4",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:52:20.593544+00:00"
+    },
+    {
+      "id": "cp-s112-mvccmove-1790618143",
+      "step_id": "s112-mvccmove",
+      "commit": "beefc8baafaedb17186c1590de4e409a863f7790",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:55:43.348616+00:00"
+    },
+    {
+      "id": "cp-s113-pagercount-1790618359",
+      "step_id": "s113-pagercount",
+      "commit": "270008c209671b5d5112dfcacdd304468d1e3ac9",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:59:19.592951+00:00"
+    },
+    {
+      "id": "cp-s114-crconce-1790618577",
+      "step_id": "s114-crconce",
+      "commit": "679786746c0e87b8ff0469db680d12d2cc22091e",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T18:02:57.864389+00:00"
     }
   ],
   "claim_step": "",
@@ -969,7 +1032,14 @@
     "s104-q6bench",
     "s105-q6fast",
     "s106-decodefast",
-    "s107-aggfast"
+    "s107-aggfast",
+    "s108-rematch2",
+    "s109-wallsn",
+    "s110-pagerbatch",
+    "s111-btreerollback",
+    "s112-mvccmove",
+    "s113-pagercount",
+    "s114-crconce"
   ],
   "claims": {}
 }

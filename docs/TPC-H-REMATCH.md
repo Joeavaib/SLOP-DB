@@ -187,3 +187,29 @@ nahezu linear (dbengine Q6 ×10, Q1 ×11). Der Scan-Replika-Pfad liefert
 in diesem Rematch keinen belegbaren Sprung; für einen isolierten
 vorher/nachher-Nachweis braucht es weiter die Baseline mit
 abgeschalteter Replika auf gleichem Stand.
+
+## Rematch s108 (nach s105 WHERE-Index-Cache, s106 from_chars-Decode, s107 Agg-Index)
+
+Stand: 2026-09-28, gleiche Maschine/tmpfs, je 1 Lauf à 5 Reps (kein 2. Lauf —
+Einzellauf-Rauschen beachten, q6bench-Schwankung 55–90 ms beobachtet).
+Befehl: `./build/dbbench --tpch 100000` / `--tpch 1000000`.
+
+| N | Query | dbengine p95 (s108) | s84-Stand | Delta |
+| --- | --- | --- | --- | --- |
+| 100k | Q6 | 56,86–66,09 ms (2 Läufe) | 102,92 / 104,45 ms | ~-40% (echt, über Rauschen) |
+| 100k | Q1 | 84,56 / 95,10 ms | 163,43 / 154,39 ms | ~-42% (echt) |
+| 1M | Q6 | 791,56 ms | 1034,67 / 1015,39 ms | ~-23% (echt) |
+| 1M | Q1 | 1335,91 ms | 1768,74 / 1847,54 ms | ~-25% (echt) |
+
+Korrektheit: Summen/Hashes **byte-identisch** zu s84 (100k Q6
+`c5703609095017c7` sum=180650,160300; Q1 `4625bd4e25bdc907` groups=6
+counted=100000; 1M Q6 `f0bd39a16c88de01` sum=1783190,382600; Q1
+`f02f69cd1e273cb0` groups=6 counted=1000000). Die drei Optimierungen
+ändern nur Stringsuche/Parsing-Overhead (WHERE-colIndex, stoll/stod-Tmp,
+Agg-colIndex), keine Semantik.
+
+Urteil: Erster echter Sprung seit s84 (kein Rauschen: Richtung konsistent
+über Q1/Q6 × 100k/1M, Größenordnung passt zu q6bench 111→55 ms).
+Abstand bleibt: Q6 ~11× hinter SQLite (~73 ms), ~260× hinter DuckDB (~3 ms);
+Q1 ~1,7× hinter SQLite, ~390× hinter DuckDB. Nächster dominanter Rest:
+Snapshot-Materialisierung + Filter-Dispatch (s. Welle 25+).

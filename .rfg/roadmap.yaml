@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 24: Q6-Decode ohne Allokationen (from_chars) + Rematch. Alles verifiziert."
+  statement: "DBEngine Korrektheits-Welle: adversarial Befunde schließen (WAL-LSN, Batch-Atomarität, BTree-Rollback, MVCC-Identity, Pager-Count, CRC-Threadsafety). Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -898,3 +898,59 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor\" --output-on-failure && ./build/q6bench --selfcheck"
     engine: implement
     want: "Aggregat-Fast-Path: AggExpr-Spaltenindizes einmal pro computeAggregate auflösen (gleiche Fehler/NULL-Semantik, leerer Set unverändert), Tests gruene"
+  - id: s108-rematch2
+    title: s108-rematch2
+    paths:
+      - docs/TPC-H-REMATCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R bench --output-on-failure && test -f docs/TPC-H-REMATCH.md
+    engine: implement
+    want: "TPC-H-Rematch nach s105-107: 100k + 1M Q1/Q6 je 1 Lauf, Zahlen + ehrliches Delta zum Stand s84 in docs/TPC-H-REMATCH.md"
+  - id: s109-wallsn
+    title: s109-wallsn
+    paths:
+      - src/storage/wal.cpp
+      - tests/test_wal.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R wal --output-on-failure
+    engine: implement
+    want: "WAL Dup-LSN abweisen: scan stoppt bei lsn <= max_lsn (Prefix), Regressionstest mit CRC-korrekter Dup-Datei, alte Tests gruene"
+  - id: s110-pagerbatch
+    title: s110-pagerbatch
+    paths:
+      - src/storage/pager.cpp
+      - tests/test_pager.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R pager --output-on-failure
+    engine: implement
+    want: "Pager insert_batch atomar: erst voll validieren, dann mutieren; Regressionstest Oversize-in-Batch, alte Tests gruene"
+  - id: s111-btreerollback
+    title: s111-btreerollback
+    paths:
+      - src/kv/btree.cpp
+      - tests/test_btree.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R btreekv --output-on-failure
+    engine: implement
+    want: "BTreeKV Write-Rollback: bei Persist-Fehlschlag In-Memory auf durable Stand zurück (Reload), false == kein Commit, Test via read-only Trick, alte Tests gruene"
+  - id: s112-mvccmove
+    title: s112-mvccmove
+    paths:
+      - src/txn/mvcc.cpp
+      - include/dbengine/txn/mvcc.h
+      - tests/test_mvcc.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"mvcc|executor\" --output-on-failure"
+    engine: implement
+    want: "MVCC Transaction move-only: Copy löschen (Lifetime-Bug: Kopie-Commit deregistriert fremden Snapshot + Mutex-UB), Call-Sites anpassen, Regressionstest, alte Tests gruene"
+  - id: s113-pagercount
+    title: s113-pagercount
+    paths:
+      - src/storage/pager.cpp
+      - tests/test_pager.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R pager --output-on-failure
+    engine: implement
+    want: "Pager load_image via Header-Count: exakt N Records statt (0,0)-Sentinel, (0,leer) am Ende überlebt Restart, Regressionstest, alte Tests gruene"
+  - id: s114-crconce
+    title: s114-crconce
+    paths:
+      - src/storage/wal.cpp
+      - tests/test_wal.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"wal|chaos\" --output-on-failure"
+    engine: implement
+    want: "CRC-Tabellen thread-safe: magic-static const Array statt check-then-act Bool (3 Stellen), Multithread-Regressionstest, alte Tests gruene"

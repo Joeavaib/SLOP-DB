@@ -221,7 +221,19 @@ bool BTreeKV::Open(const std::string& path) {
 
 bool BTreeKV::Flush() {
   std::lock_guard<std::mutex> lock(mutex_);
-  return Persist();
+  if (!Persist()) {
+    // s111: wie Write — kein sichtbarer Teil-Commit nach I/O-Fehler.
+    if (pager_) {
+      pager_->close();
+      if (!pager_->open() || !LoadAll()) {
+        open_ = false;
+      }
+    } else {
+      open_ = false;
+    }
+    return false;
+  }
+  return true;
 }
 
 void BTreeKV::Close() {
@@ -375,7 +387,24 @@ bool BTreeKV::Write(const std::vector<Op>& ops) {
   ShrinkRoot();
   MarkDirty(root_);
   // 3. Commit: dauerhaft flushen.
-  return Persist();
+  if (!Persist()) {
+    // s111: Memory-vs-durable-Split heilen — nodes_ enthalten die neue
+    // Version, der Superblock zeigt auf die alte. false muss "kein Commit"
+    // bedeuten (weder sichtbar noch haltbar): Pager + Baum auf Datei-Stand
+    // zuruecksetzen (nur Fehlerpfad, kostet im Normalfall nichts).
+    // Scheitert der Reload (oder kein Pager vorhanden), ist das Handle
+    // defekt (open_=false).
+    if (pager_) {
+      pager_->close();
+      if (!pager_->open() || !LoadAll()) {
+        open_ = false;
+      }
+    } else {
+      open_ = false;
+    }
+    return false;
+  }
+  return true;
 }
 
 std::unique_ptr<BTreeKV::Iterator> BTreeKV::NewIterator(

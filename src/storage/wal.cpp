@@ -313,27 +313,43 @@ bool audit_unescape(std::string_view in, std::string& out) {
 
 }  // namespace
 
+// s114: EINZIGE CRC-Tabelle als Magic-Static (C++11 garantiert thread-safe
+// Initialisierung). Ersetzt 3× `static bool init` check-then-act (Data-Race
+// bei parallelen Wal-Instanzen: gleichzeitiges Schreiben in dieselbe Tabelle).
+namespace {
+const std::array<uint32_t, 256>& crc_table() {
+  static const std::array<uint32_t, 256> t = [] {
+    std::array<uint32_t, 256> a{};
+    for (uint32_t i = 0; i < 256; ++i) {
+      uint32_t c = i;
+      for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+      a[i] = c;
+    }
+    return a;
+  }();
+  return t;
+}
+
+inline uint32_t crc_extend(uint32_t raw, const unsigned char* p, size_t n) {
+  const auto& t = crc_table();
+  for (size_t i = 0; i < n; ++i) raw = t[(raw ^ p[i]) & 0xFF] ^ (raw >> 8);
+  return raw;
+}
+}  // namespace
+
 Wal::Wal(std::string path) : path_(std::move(path)) {}
 Wal::~Wal() { close(); }
 
 void Wal::crc32_table_init(uint32_t t[256]) {
-  for (uint32_t i = 0; i < 256; ++i) {
-    uint32_t c = i;
-    for (int k = 0; k < 8; ++k) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-    t[i] = c;
-  }
+  // s114: Delegiert an die thread-safe Magic-Static-Tabelle (kein eigenes
+  // check-then-act mehr); bleibt als private API erhalten.
+  const auto& tab = crc_table();
+  for (uint32_t i = 0; i < 256; ++i) t[i] = tab[i];
 }
 
 uint32_t Wal::crc32(const void* data, size_t n, uint32_t seed) {
-  static uint32_t table[256];
-  static bool init = false;
-  if (!init) {
-    crc32_table_init(table);
-    init = true;
-  }
   uint32_t c = ~seed;
-  const auto* p = static_cast<const unsigned char*>(data);
-  for (size_t i = 0; i < n; ++i) c = table[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+  c = crc_extend(c, static_cast<const unsigned char*>(data), n);
   return ~c;
 }
 
@@ -353,16 +369,9 @@ uint32_t Wal::record_crc(uint64_t lsn, uint32_t len, const char* payload) {
     // exakt — deshalb berechnen wir hier explizit ueber kopierten Puffer nur
     // fuer kleine Records direkt; fuer grosse chunkweise mit raw-State.
     // Einfachste korrekte Variante: CRC ueber hdr, dann weiter mit payload
-    // im selben ~c-Raum:
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-      crc32_table_init(table);
-      init = true;
-    }
+    // im selben ~c-Raum (s114: gemeinsame Magic-Static-Tabelle, thread-safe).
     uint32_t raw = ~c;  // zurueck in Arbeitsraum
-    const auto* p = reinterpret_cast<const unsigned char*>(payload);
-    for (uint32_t i = 0; i < len; ++i) raw = table[(raw ^ p[i]) & 0xFF] ^ (raw >> 8);
+    raw = crc_extend(raw, reinterpret_cast<const unsigned char*>(payload), len);
     return ~raw;
   }
   return c;
@@ -379,16 +388,8 @@ uint32_t Wal::enc_record_crc(uint64_t lsn, uint32_t raw_len,
   std::memcpy(pre + 12, nonce, kNonceLen);
   uint32_t c = crc32(pre, sizeof(pre), 0);
   if (blob_len && blob) {
-    static uint32_t table[256];
-    static bool init = false;
-    if (!init) {
-      crc32_table_init(table);
-      init = true;
-    }
     uint32_t raw = ~c;
-    const auto* p = reinterpret_cast<const unsigned char*>(blob);
-    for (uint32_t i = 0; i < blob_len; ++i)
-      raw = table[(raw ^ p[i]) & 0xFF] ^ (raw >> 8);
+    raw = crc_extend(raw, reinterpret_cast<const unsigned char*>(blob), blob_len);
     return ~raw;
   }
   return c;
@@ -473,7 +474,10 @@ Wal::ScanResult Wal::scan(int fd, const Key32* key) {
     if (!enc) {
       // Plain-Pfad: byte-identisch zu V1 (unveraendert).
       if (len > kMaxPayload) break;  // Korrupt -> stop
-      if (lsn == 0 || lsn < out.max_lsn) break;  // LSN muss steigen
+      // s109: streng monoton (Duplikat/Rueckschritt -> Prefix-Stop). Vorher
+      // `<` akzeptierte CRC-korrekte Dup-LSNs als valide; Spruenge bleiben
+      // toleriert (nur kein Stillstand/Rueckschritt).
+      if (lsn == 0 || lsn <= out.max_lsn) break;  // LSN muss steigen
       std::string payload;
       payload.resize(len);
       if (len && !read_full(fd, payload.data(), len)) break;  // torn payload
@@ -486,7 +490,7 @@ Wal::ScanResult Wal::scan(int fd, const Key32* key) {
     }
     // GCM-Pfad: stored = Cipher+Tag-Bytes, Nonce folgt dem Header.
     if (stored < kTagLen || stored - kTagLen > kMaxPayload) break;  // korrupt
-    if (lsn == 0 || lsn < out.max_lsn) break;  // LSN muss steigen
+    if (lsn == 0 || lsn <= out.max_lsn) break;  // LSN muss steigen (s. s109)
     unsigned char nonce[kNonceLen];
     if (!read_full(fd, nonce, sizeof(nonce))) break;  // torn nonce -> stop
     std::string blob;

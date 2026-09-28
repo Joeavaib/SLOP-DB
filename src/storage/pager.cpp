@@ -313,8 +313,13 @@ bool Pager::insert_batch(
     const std::vector<std::pair<std::uint64_t, std::string>>& kvs) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!open_) return false;
+  // s110: All-or-Nothing — erst VOLL validieren, dann mutieren. Vorher blieb
+  // bei Oversize mitten im Batch eine Teilmutation in entries_ zurueck.
   for (const auto& [key, value] : kvs) {
+    (void)key;
     if (value.size() > kMaxValueBytes) return false;
+  }
+  for (const auto& [key, value] : kvs) {
     entries_[key] =
         std::vector<std::uint8_t>(value.begin(), value.end());
   }
@@ -375,6 +380,11 @@ bool Pager::load_image() {
   if (header_pages != 0 && header_pages > page_count_) {
     return false;  // file shorter than header claims -> torn/truncated
   }
+  // s113: exakte Record-Zahl aus dem Header (Offset 16, seit Welle 1 bei
+  // jedem store_image geschrieben) statt (0,0)-Sentinel. Der Sentinel machte
+  // den gueltigen Datensatz (key=0, value="") als LETZTEN Record vom
+  // Zero-Padding ununterscheidbar -> stiller Restart-Datenverlust.
+  const std::uint32_t want_records = decode_u32_le(hdr.data() + 16);
   // Linear scan of the record stream starting at page 1.
   std::vector<std::uint8_t> stream;
   stream.reserve(static_cast<std::size_t>(page_count_ > 1 ? page_count_ - 1 : 0) * kPageSize);
@@ -388,47 +398,37 @@ bool Pager::load_image() {
     stream.insert(stream.end(), page.begin(), page.end());
   }
   std::size_t off = 0;
-  while (off < stream.size()) {
+  std::uint64_t got_records = 0;
+  while (off < stream.size() && got_records < want_records) {
     if (off + 12 > stream.size()) {
-      // Truncated record header: only clean if pure zero padding.
-      if (!is_all_zero(stream.data() + off, stream.size() - off)) {
-        entries_.clear();
-        return false;
-      }
-      off = stream.size();
-      break;
+      entries_.clear();
+      return false;  // truncated record header before count reached
     }
-    const std::size_t rec = off;
     const std::uint64_t key = decode_u64_le(stream.data() + off);
     const std::uint32_t len = decode_u32_le(stream.data() + off + 8);
     if (len > kMaxValueBytes) {
-      // Padding tail is zeros; anything else is corruption, not EOF.
-      if (!is_all_zero(stream.data() + rec, stream.size() - rec)) {
-        entries_.clear();
-        return false;
-      }
-      off = stream.size();
-      break;
+      entries_.clear();
+      return false;  // corrupt length before count reached (padding is
+                     // only legal AFTER all records)
     }
     off += 12;
     if (off + len > stream.size()) {
       entries_.clear();
       return false;  // torn payload: record claims more bytes than file
     }
-    // Zero-tail detection: a (0,0) record followed by all zeros ends stream.
-    if (len == 0 && key == 0) {
-      if (is_all_zero(stream.data() + off, stream.size() - off)) {
-        off = stream.size();  // consume zero padding -> clean EOF
-        break;
-      }
-      // Else: legitimate empty value for key 0 (or corrupt framing that
-      // will fail strictly below); record it and keep scanning.
-    }
+    // Kein (0,0)-Sentinel mehr: (key=0, value="") ist ein normaler Record
+    // (s113). Das Ende ergibt sich aus want_records.
     entries_[key] = std::vector<std::uint8_t>(stream.begin() + static_cast<std::ptrdiff_t>(off),
                                               stream.begin() + static_cast<std::ptrdiff_t>(off + len));
     off += len;
+    ++got_records;
   }
-  if (off != stream.size()) {
+  if (got_records != want_records) {
+    entries_.clear();
+    return false;  // fewer records than header count -> torn/truncated
+  }
+  // Nach allen Records darf nur noch Zero-Padding folgen.
+  if (off != stream.size() && !is_all_zero(stream.data() + off, stream.size() - off)) {
     entries_.clear();
     return false;  // trailing garbage after last record -> corrupt, not EOF
   }

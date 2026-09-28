@@ -60,6 +60,41 @@ struct Transaction {
   TxnState state = TxnState::Active;
   Isolation isolation = Isolation::Snapshot;
   bool read_only = false;
+  // s112: move-only (Copy EXPLIZIT geloescht). Grund: MvccStore registriert
+  // aktive Snapshots unter txn.id; eine Kopie teilt id+state, sodass
+  // Commit(Kopie) den Snapshot des Originals deregistriert (Purge loescht
+  // dann fuer das Original sichtbare Versionen) und den Single-Writer-Lock
+  // ohne Ownership freigibt (Mutex-UB). Move uebertraegt Ownership, die
+  // Quelle wird inert (id=0/state=Aborted: Commit=false, Read=nullopt,
+  // Abort=No-Op) und fasst die Registry nie mehr an.
+  Transaction() = default;
+  Transaction(const Transaction&) = delete;
+  Transaction& operator=(const Transaction&) = delete;
+  Transaction(Transaction&& other) noexcept
+      : id(other.id),
+        snapshot(other.snapshot),
+        state(other.state),
+        isolation(other.isolation),
+        read_only(other.read_only),
+        write_set(std::move(other.write_set)) {
+    other.id = 0;
+    other.snapshot = kInvalidTs;
+    other.state = TxnState::Aborted;
+  }
+  Transaction& operator=(Transaction&& other) noexcept {
+    if (this != &other) {
+      id = other.id;
+      snapshot = other.snapshot;
+      state = other.state;
+      isolation = other.isolation;
+      read_only = other.read_only;
+      write_set = std::move(other.write_set);
+      other.id = 0;
+      other.snapshot = kInvalidTs;
+      other.state = TxnState::Aborted;
+    }
+    return *this;
+  }
   // Ungeschriebene (uncommittete) Writes: Undo-/Redo-Puffer.
   // nullopt = Delete-Tombstone im Puffer.
   // HINWEIS (Fast-Path, semantikerhaltend): transparenter Komparator

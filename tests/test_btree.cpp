@@ -19,6 +19,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
 
@@ -442,6 +443,57 @@ void TestIterator() {
 
 }  // namespace
 
+// s111: Persist-Fehlschlag -> false == kein Commit (weder sichtbar noch
+// haltbar). Trick: Verzeichnis read-only (0555) -> Pager tmp+rename schlägt
+// fehl (kein root nötig, uid!=0 vorausgesetzt). Danach alter Stand sichtbar,
+// nach chmod zurück + Reopen ist die DB intakt.
+void TestPersistFailureRollback() {
+  const auto dir =
+      std::filesystem::temp_directory_path() /
+      ("btreekv_rodir_" + std::to_string(static_cast<long long>(::getpid())));
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  std::filesystem::create_directory(dir, ec);
+  if (ec) {
+    std::cout << "SKIP persist-rollback (kein tmp-Verzeichnis)\n";
+    return;
+  }
+  const std::string path = (dir / "t.db").string();
+  BTreeKV db;
+  Check(db.Open(path), "rollback/open");
+  Check(db.Put("stable", "v1"), "rollback/baseline-put");
+  // Baseline erst durable machen (Einzel-Put puffert nur RAM) — der
+  // durable Stand, auf den das Rollback zurueckfallen muss, ist v1.
+  Check(db.Flush(), "rollback/baseline-flush");
+  // Read-only schalten: Dateien anlegen geht nicht mehr (tmp+rename -> EACCES).
+  ::chmod(dir.c_str(), 0555);
+  WriteBatch wb;
+  wb.Put("stable", "v2-poison");
+  wb.Put("ghost", "should-not-exist");
+  const bool ok = db.Write(wb);
+  ::chmod(dir.c_str(), 0755);  // sofort zurück (Cleanup auch bei FAIL)
+  Check(!ok, "rollback/write-fails-on-EACCES");
+  if (db.IsOpen()) {
+    auto g = db.Get("stable");
+    Check(g.has_value() && *g == "v1", "rollback/old-value-visible");
+    Check(!db.Get("ghost").has_value(), "rollback/ghost-absent");
+  } else {
+    Check(false, "rollback/handle-survives-reloadable-failure");
+  }
+  // Nach Entsperren: normale Writes + Reopen intakt.
+  WriteBatch wb2;
+  wb2.Put("stable", "v2");
+  Check(db.Write(wb2), "rollback/write-after-heal");
+  db.Close();
+  BTreeKV db2;
+  Check(db2.Open(path), "rollback/reopen");
+  auto g = db2.Get("stable");
+  Check(g.has_value() && *g == "v2", "rollback/durable-after-heal");
+  Check(!db2.Get("ghost").has_value(), "rollback/ghost-never-persisted");
+  db2.Close();
+  std::filesystem::remove_all(dir, ec);
+}
+
 int main() {
   TestOpenEmpty();
   TestBasicCrud();
@@ -453,6 +505,7 @@ int main() {
   TestDeletesReopen();
   TestOversize();
   TestIterator();
+  TestPersistFailureRollback();
 
   if (g_failures == 0) {
     std::cout << "ALL BTREE TESTS PASSED\n";
