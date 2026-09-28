@@ -1003,3 +1003,11 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R fuzz --output-on-failure
     engine: implement
     want: "SQL-Fuzz: DML/DDL-Mix (INSERT/UPDATE/DELETE/SELECT-Aggregate/DROP/VACUUM) gegen Tabellen-Modell, exakte Result-Vergleiche, deterministisch, ctest fuzz gruen"
+  - id: s121-fairbench
+    title: s121-fairbench
+    paths:
+      - tools/fairbench.py
+      - docs/FAIR-DUELL.md
+    verify: cmake --build build -j4 && python3 tools/fairbench.py --rows 10000 --reps 2 --out /tmp/fair_smoke.json && test -f docs/FAIR-DUELL.md
+    engine: implement
+    want: "Fairer Drei-Wege-Duell: byte-identische Daten (validiert), Warmup+Median/p95, PRAGMA-Offenlegung, JSON + docs/FAIR-DUELL.md mit Methodik aus Recherche"
