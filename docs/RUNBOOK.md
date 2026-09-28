@@ -62,6 +62,16 @@ Persistenzgrenzen: Columnar aktiver Part erst nach `Seal`/`Save` dauerhaft
 (nach s27 inkl. Active-Save); Raft nur nach explizitem `SaveLog`/`SaveSnapshot`
 bzw. Opt-in-Autosave dauerhaft, sonst in-memory — kein Auto-Persist bei `append`.
 
+Container ohne WAL ist leer (s100, ehrlich): `foo.db` ist nur Container
+(Magic+Regionen), Schema+Rows leben in `foo.db.wal` (Wahrheit) + `foo.db.btree`
+(Spiegel, tolerant). Ohne WAL startet die CLI mit leerem Stand + Warnung
+(`WAL '...' fehlt/neu - Container ohne WAL ist leer`); WAL-Verlust =
+Datenverlust.
+Exit-Checkpoint: bei sauberem Exit (Batch-Ende, `.quit`/`.exit`, EOF) laeuft
+`mirrorCheckpoint` (Spiegel aktuell → schnellerer Restart, nur WAL-Tail wird
+replayt). CLI-Hinweis: DB immer mit gleichem Pfad oeffnen, damit `.wal` und
+`.btree` daneben liegen; `dbengine --help` dokumentiert das Persistenz-Modell.
+
 Manuelle Prüfung:
 
 ```sh

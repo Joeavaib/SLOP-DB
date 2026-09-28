@@ -15,6 +15,7 @@
 > Mirror-Batching, Prodsim/pg_stat/DiskANN-Build/TPC-H-Rematch/SCRAM — siehe Kapitel 12.
 > Welle 18–19 (s86–s89, s91–s95): RESP/RLS/At-Rest/TPC-H-SF,
 > Multi-Prozess-Raft/OTLP/Slow-Log/S3-Sidecar/README — siehe Kapitel 13.
+> Welle 20 (s96–s98): Raft-Bind/Membership, VACUUM, Query-Tracing — siehe Kapitel 14.
 
 ## 1. Schichtenmodell
 
@@ -1269,3 +1270,63 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
   `k8s/statefulset.yaml:80-102`); `StageToS3` nur URI-Vorlage, kein Upload.
 - README: Einstieg über `README.md:8-22`, Zahlen nur aus `README.md:38-74`
   zitieren (tmpfs-Caveats beachten), Architektur via `docs/ARCH.md` Kap. 1–13.
+- Kap. 13 „Kap. 1–13" stale nach Welle 20 → korrekt: Kap. 1–14 (dieses Kapitel).
+
+## 14. Welle 20 (s96–s98, alle STL/POSIX-only)
+
+### 14.1 Raft-Bind/Membership — `--bind` + `--join` (`tools/raft_cluster.cpp`, s96)
+
+- CLI (Beleg: `tools/raft_cluster.cpp:12-20`):
+  `raft_cluster --selfcheck [--bind <addr>]`,
+  `raft_cluster --join <file> [--bind <addr>]`.
+- `--bind <addr>`: IPv4-Bindeadresse, Default `127.0.0.1`; gilt fuers Listen
+  und (ohne `--join`) fuers Dialen; mit `--join` wird zum Dialen der Host aus
+  der Membership-Datei verwendet (Beleg: `tools/raft_cluster.cpp:16-18,66-67`).
+- `--join <file>`: Membership-Datei, nur manueller Betrieb (nicht mit
+  `--selfcheck` kombinierbar); Format pro Zeile `id host port`, `#`-Kommentare
+  + Leerzeilen ok (Beleg: `tools/raft_cluster.cpp:19-20,82-85`).
+- `ListenOn(bind,fd,port)` bindet an konfigurierte Adresse via `inet_pton`
+  (Beleg: `tools/raft_cluster.cpp:263-277`); RPC nutzt frische TCP-Verbindung
+  pro Call (Beleg: `tools/raft_cluster.cpp:228-250`).
+- Selfcheck mit 2 Konfigurationen gruen (Default-Loopback + generierte
+  Membership-Datei in `/tmp`, Beleg: `tools/raft_cluster.cpp:24,821-830,927ff`);
+  weiter kein Auto-Split mit Daten-Move, kein k8s-HA/Jepsen.
+
+### 14.2 VACUUM-Verdrahtung — MVCC-Purge (`sql/executor.cpp`, s97)
+
+- Prefix-Parse ohne Parser-Umbau: `VACUUM [VERBOSE] [ANALYZE] [tabelle]`
+  case-insensitiv, ein optionales `;` (Beleg: `src/sql/executor.cpp:31-32`).
+- `Executor::execute` fängt VACUUM als Prefix-Statement ab (global oder pro
+  Tabelle mit Existenz-Guard, Effekt global per MVCC-API, Beleg:
+  `src/sql/executor.cpp:1515-1522`); Rueckgabe `VACUUM <freed>`.
+- `vacuum()` → `mvcc_.Purge()` (Beleg: `src/sql/executor.cpp:2553-2559`),
+  `vacuum(table)` nur Prefix-/Pro-Tabelle-Purge, Effekt global
+  (Beleg: `src/sql/executor.cpp:2566-2573`).
+- Auto-Purge nach Batches: UPDATE obsoletiert je Zeile eine Version
+  (Beleg: `src/sql/executor.cpp:1916-1918`), DELETE/Tombstone
+  (Beleg: `src/sql/executor.cpp:2073-2075`), DROP
+  (Beleg: `src/sql/executor.cpp:2130-2131`); `maybeAutoPurge` best-effort,
+  respektiert aktive Snapshots (Beleg: `src/sql/executor.cpp:2576ff`).
+- Kettenwachstum begrenzt, alte Tests (`sql|executor|mvcc`) gruen.
+
+### 14.3 Query-Tracing — Spans um Q/Extended (`server/pgserver.cpp`, s98)
+
+- Opt-in, Default aus (Beleg: `include/dbengine/server/pgserver.h:102-112`):
+  `setTraceSampleRate(0..1)` (0=aus, 1=alles, dazwischen deterministisch per
+  Counter-Modulo, kein RNG im Hot-Path), `setTraceEndpoint(host,port)`
+  (OTLP/HTTP-Export handgerollt STL/POSIX, `POST /v1/traces`, JSON-Shape wie
+  `OtlpExporter::buildJson`).
+- Overhead bei aus: 1 Branch (`ppm`-Load+Compare, kein `fetch_add`, keine Zeit,
+  Beleg: `src/server/pgserver.cpp:1310-1318`,
+  `include/dbengine/server/pgserver.h:110`).
+- Spans um jeden Q- und Extended-Execute mit Start/Ende, Name
+  `pg.query`/`pg.execute`, Attribute `db.statement` (gekuerzt 256),
+  `rows`, `error` (Beleg: `src/server/pgserver.cpp:1727-1733,1961-1967`,
+  `src/server/pgserver.cpp:1288-1346`).
+- Export minimal-eigen in `pgserver.cpp` (kein `metrics`-Link: `OtlpExporter`
+  lebt im `dbmetrics`-Executable mit `main`, Beleg:
+  `include/dbengine/server/pgserver.h:151-163`); `traceFinish` No-Throw,
+  Best-Effort (bricht Query-Pfad nie, Beleg:
+  `src/server/pgserver.cpp:1320-1352`); ohne Endpoint = verworfen.
+- Alte Tests (`pgserver`) gruen; E2E: Rate 0 → 0 Exports, Rate 1 → OTLP-JSON
+  mit `resourceSpans`/`pg.query`/`db.statement`.

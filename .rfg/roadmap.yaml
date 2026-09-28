@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 20: Raft-Bind/Membership, VACUUM, Query-Tracing, TPC-H-SF10, Doku. Alles verifiziert."
+  statement: "C++ DB Engine Welle 21: Doku Welle 20 + Checkpoint-Härtung + Raft-Membership-Doku. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -830,3 +830,18 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
     engine: implement
     want: "Query-Tracing: Spans um Q/Extended-Executes mit OTLP-Export, Sampling-Rate konfigurierbar, alte Tests gruene"
+  - id: s99-docs2020
+    title: s99-docs2020
+    paths:
+      - docs/ARCH.md
+    verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
+    engine: implement
+    want: "ARCH-Update Welle 20: Raft-Bind/Membership, VACUUM, Query-Tracing; stale korrigiert"
+  - id: s100-ckptwarn
+    title: s100-ckptwarn
+    paths:
+      - src/main.cpp
+      - docs/RUNBOOK.md
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"dbfile|executor\" --output-on-failure"
+    engine: implement
+    want: "Checkpoint-Warnung ehrlich: Container ohne WAL ist leer, Exit-Checkpoint-Doku + CLI-Hinweis, alte Tests gruene"

@@ -99,7 +99,9 @@
     "s95-readme",
     "s96-raftbind",
     "s97-vacuum",
-    "s98-trace"
+    "s98-trace",
+    "s99-docs2020",
+    "s100-ckptwarn"
   ],
   "verified": [
     "s07-index",
@@ -201,16 +203,18 @@
     "s95-readme",
     "s96-raftbind",
     "s97-vacuum",
-    "s98-trace"
+    "s98-trace",
+    "s99-docs2020",
+    "s100-ckptwarn"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s98-trace-1790606719",
-    "step_id": "s98-trace",
-    "commit": "8e2bf6ecc2f0becbfc07f70a8b8a898f81ceea56",
+    "id": "cp-s100-ckptwarn-1790614957",
+    "step_id": "s100-ckptwarn",
+    "commit": "29a5a9666a9b827740ec3a69f19f0192fb213f56",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T14:45:19.497144+00:00"
+    "created_at": "2026-09-28T17:02:37.001446+00:00"
   },
   "checkpoints": [
     {
@@ -870,6 +874,20 @@
       "commit": "8e2bf6ecc2f0becbfc07f70a8b8a898f81ceea56",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T14:45:19.497144+00:00"
+    },
+    {
+      "id": "cp-s99-docs2020-1790614727",
+      "step_id": "s99-docs2020",
+      "commit": "5551fc57ce7f1286b05229db5c0779abe864e018",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T16:58:47.032862+00:00"
+    },
+    {
+      "id": "cp-s100-ckptwarn-1790614957",
+      "step_id": "s100-ckptwarn",
+      "commit": "29a5a9666a9b827740ec3a69f19f0192fb213f56",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T17:02:37.001446+00:00"
     }
   ],
   "claim_step": "",
@@ -879,7 +897,9 @@
     "s10-columnar",
     "s96-raftbind",
     "s97-vacuum",
-    "s98-trace"
+    "s98-trace",
+    "s99-docs2020",
+    "s100-ckptwarn"
   ],
   "claims": {}
 }

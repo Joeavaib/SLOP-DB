@@ -53,6 +53,10 @@ void printHelp(const char* prog) {
       << "    nachgezogen; beim Start wird daraus geladen und nur der\n"
       << "    WAL-Tail (lsn > Spiegel-LSN) replayt. Fehlt/korrupt -> Voll-\n"
       << "    Replay + Warnung (WAL bleibt Wahrheit, kein Datenverlust).\n"
+      << "  - Exit-Checkpoint: bei sauberem Exit (Batch-Ende, .quit/.exit, EOF)\n"
+      << "    laeuft mirrorCheckpoint (Spiegel aktuell -> schnellerer Restart).\n"
+      << "    Container ohne WAL ist leer; Tipp: DB immer mit gleichem Pfad\n"
+      << "    oeffnen, damit <db>.wal und <db>.btree daneben liegen.\n"
       << "\nREPL:\n"
       << "  .quit / .exit beendet, leere Zeilen werden ignoriert, SQL-Fehler\n"
       << "  werden gedruckt und der REPL laeuft weiter, EOF (Ctrl-D) beendet.\n"
@@ -341,6 +345,12 @@ int main(int argc, char** argv) {
   dbengine::kv::KVStore kv;
   dbengine::txn::MvccStore mvcc;
   dbengine::storage::Wal wal(wal_path);
+  // Ehrliche Start-Warnung: Container ohne WAL ist leer (s100).
+  bool wal_existed = false;
+  {
+    std::ifstream probe(wal_path, std::ios::binary);
+    wal_existed = static_cast<bool>(probe);
+  }
   try {
     wal.open();
   } catch (const std::exception& e) {
@@ -371,6 +381,11 @@ int main(int argc, char** argv) {
   }
   try {
     const std::size_t skipped = ex.recover();
+    if (!wal_existed) {
+      std::cerr << prog << ": Warnung: WAL '" << wal_path
+                << "' fehlt/neu - Container ohne WAL ist leer; starte mit "
+                   "leerem SQL-Stand\n";
+    }
     if (skipped != 0) {
       std::cerr << prog << ": Warnung: " << skipped
                 << " WAL-Record(s) beim Replay uebersprungen (korrupt/unbekannt)\n";
