@@ -18,6 +18,7 @@
 #include "dbengine/kv.h"
 #include "dbengine/kv/btree.h"
 #include "dbengine/storage/wal.h"
+#include "dbengine/txn/mvcc.h"
 
 using dbengine::kv::BTreeKV;
 using dbengine::kv::Op;
@@ -327,6 +328,175 @@ bool FuzzWal(unsigned seed) {
 
 }  // namespace
 
+// ---- MVCC vs. Versions-Modell (Snapshot-Isolation + Purge-Schutz) ---------
+// Modell: pro Key Historie (commit#, wert|nullopt=Tombstone), globale
+// Commit-Sequenz. Reader mit Sequenz S sieht je Key den letzten Eintrag mit
+// commit# <= S. Purge darf aktive Snapshots nie brechen (danach ALLE aktiven
+// Reader re-verifizieren = Kern des s112-Lifetime-Themas).
+bool FuzzMvcc(unsigned seed) {
+  using dbengine::txn::MvccStore;
+  using dbengine::txn::Transaction;
+  std::mt19937 rng(seed + 2000);
+  std::uniform_int_distribution<int> key_d(0, 29);
+  std::uniform_int_distribution<int> op_d(0, 99);
+  MvccStore s;
+  // Historie: key -> [(commit#, wert)].
+  std::map<std::string, std::vector<std::pair<uint64_t, std::optional<std::string>>>> hist;
+  uint64_t seq = 0;
+  std::map<int, Transaction> readers;  // move-only: kein Kopieren
+  int next_rid = 1;
+  std::optional<Transaction> writer;
+  std::map<std::string, std::optional<std::string>> pending;  // Writer-Puffer-Modell
+  auto key = [&] {
+    char b[16];
+    std::snprintf(b, sizeof b, "m:%02d", key_d(rng));
+    return std::string(b);
+  };
+  auto expect = [&](uint64_t snap, const std::string& k) -> std::optional<std::string> {
+    auto it = hist.find(k);
+    if (it == hist.end()) return std::nullopt;
+    std::optional<std::string> out;
+    bool any = false;
+    for (auto& [c, v] : it->second) {
+      if (c > snap) break;
+      out = v;
+      any = true;
+    }
+    return any ? out : std::optional<std::string>{};
+  };
+  // Reader-Snapshots merken (Sequenz bei Begin).
+  std::map<int, uint64_t> rsnap;
+  auto verify_reader = [&](int rid) -> bool {
+    auto it = readers.find(rid);
+    if (it == readers.end()) return false;
+    for (int i = 0; i < 5; ++i) {
+      const std::string k = key();
+      auto got = s.Read(it->second, k);
+      if (got != expect(rsnap[rid], k)) {
+        std::cout << "FAIL fuzz-mvcc/read rid=" << rid << " key=" << k << "\n";
+        return false;
+      }
+    }
+    return true;
+  };
+  constexpr int kOps = 7000;
+  for (int step = 0; step < kOps; ++step) {
+    const int r = op_d(rng);
+    if (r < 25) {
+      // Writer beginnen (Single-Writer: zweiter muss scheitern).
+      if (writer.has_value()) {
+        auto dup = s.TryBeginWrite();
+        if (dup.has_value()) {
+          std::cout << "FAIL fuzz-mvcc/single-writer step=" << step << "\n";
+          return false;
+        }
+        continue;
+      }
+      auto w = s.TryBeginWrite();
+      if (!w.has_value()) {
+        std::cout << "FAIL fuzz-mvcc/begin-write step=" << step << "\n";
+        return false;
+      }
+      writer.emplace(std::move(*w));
+      pending.clear();
+    } else if (r < 50) {
+      if (!writer.has_value()) continue;
+      const std::string k = key();
+      if (rng() % 5 == 0) {
+        if (!s.Erase(*writer, k)) {
+          std::cout << "FAIL fuzz-mvcc/erase step=" << step << "\n";
+          return false;
+        }
+        pending[k] = std::nullopt;
+      } else {
+        const std::string v = "w" + std::to_string(step) + "_" + std::to_string(rng() % 100);
+        if (!s.Write(*writer, k, v)) {
+          std::cout << "FAIL fuzz-mvcc/write step=" << step << "\n";
+          return false;
+        }
+        pending[k] = v;
+      }
+    } else if (r < 60) {
+      // Commit oder Abort des Writers.
+      if (!writer.has_value()) continue;
+      if (rng() % 4 == 0) {
+        s.Abort(*writer);
+        writer.reset();
+        pending.clear();
+      } else {
+        if (!s.Commit(*writer)) {
+          std::cout << "FAIL fuzz-mvcc/commit step=" << step << "\n";
+          return false;
+        }
+        writer.reset();
+        ++seq;
+        for (auto& [k, v] : pending) hist[k].emplace_back(seq, v);
+        pending.clear();
+      }
+    } else if (r < 75) {
+      // Reader beginnen (max 4 aktiv).
+      if (readers.size() >= 4) continue;
+      Transaction t = s.BeginRead();
+      const int rid = next_rid++;
+      rsnap[rid] = seq;
+      readers.emplace(rid, std::move(t));
+      if (!verify_reader(rid)) return false;
+    } else if (r < 85) {
+      // Zufälligen Reader lesen + manchmal committen.
+      if (readers.empty()) continue;
+      auto it = readers.begin();
+      std::advance(it, static_cast<long>(rng() % readers.size()));
+      if (!verify_reader(it->first)) return false;
+      if (rng() % 3 == 0) {
+        if (!s.Commit(it->second)) {
+          std::cout << "FAIL fuzz-mvcc/reader-commit step=" << step << "\n";
+          return false;
+        }
+        rsnap.erase(it->first);
+        readers.erase(it);
+      }
+    } else {
+      // Purge — danach ALLE aktiven Reader re-verifizieren (Snapshot-Schutz).
+      s.Purge();
+      for (auto& [rid, txn] : readers) {
+        (void)txn;
+        if (!verify_reader(rid)) {
+          std::cout << "FAIL fuzz-mvcc/post-purge rid=" << rid << " step=" << step << "\n";
+          return false;
+        }
+      }
+    }
+  }
+  // Aufraeumen: Writer aborten, Reader committen, finaler Purge + Neu-Reader.
+  if (writer.has_value()) {
+    s.Abort(*writer);
+    writer.reset();
+  }
+  for (auto& [rid, txn] : readers) {
+    if (!s.Commit(txn)) {
+      std::cout << "FAIL fuzz-mvcc/final-reader-commit\n";
+      return false;
+    }
+  }
+  readers.clear();
+  s.Purge();
+  {
+    Transaction t = s.BeginRead();
+    for (int i = 0; i < 30; ++i) {
+      const std::string k = key();
+      if (s.Read(t, k) != expect(seq, k)) {
+        std::cout << "FAIL fuzz-mvcc/final-read\n";
+        return false;
+      }
+    }
+    if (!s.Commit(t)) {
+      std::cout << "FAIL fuzz-mvcc/final-commit\n";
+      return false;
+    }
+  }
+  return true;
+}
+
 int main(int argc, char** argv) {
   unsigned seed = 42;
   for (int i = 1; i + 1 < argc; ++i) {
@@ -335,6 +505,7 @@ int main(int argc, char** argv) {
   std::cout << "[fuzz] seed=" << seed << "\n";
   Check(FuzzBTree(seed), "fuzz-btree-model");
   Check(FuzzWal(seed), "fuzz-wal-model");
+  Check(FuzzMvcc(seed), "fuzz-mvcc-model");
   if (g_fail == 0) {
     std::cout << "FUZZ TESTS PASSED (seed " << seed << ")\n";
     return 0;

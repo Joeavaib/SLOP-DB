@@ -988,3 +988,10 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R fuzz --output-on-failure
     engine: implement
     want: "Stateful Fuzzer: deterministischer Op-Mix (BTree/Pager/WAL) gegen std::map-Modell mit Reopens + Checkpoint, Seed-Flag, ctest fuzz gruen"
+  - id: s119-fuzzmvcc
+    title: s119-fuzzmvcc
+    paths:
+      - tests/test_fuzz.cpp
+    verify: cmake --build build -j4 && ctest --test-dir build -R fuzz --output-on-failure
+    engine: implement
+    want: "MVCC-Interleaving-Fuzz: Writer/Reader-Verschränkung + Purge gegen Versions-Modell (Snapshot-Schutz nie verletzt), deterministisch, ctest fuzz gruen"
