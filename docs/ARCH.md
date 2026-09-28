@@ -13,6 +13,8 @@
 > Welle 14–17 (s63–s71, s76b/c, s78–s85): Subqueries/TLS/Raft-Timer/Par-Scan,
 > Executor-Streaming/Pushdown, MVCC-Fast-Path, Scan-Replika, ANN-Autotune,
 > Mirror-Batching, Prodsim/pg_stat/DiskANN-Build/TPC-H-Rematch/SCRAM — siehe Kapitel 12.
+> Welle 18–19 (s86–s89, s91–s95): RESP/RLS/At-Rest/TPC-H-SF,
+> Multi-Prozess-Raft/OTLP/Slow-Log/S3-Sidecar/README — siehe Kapitel 13.
 
 ## 1. Schichtenmodell
 
@@ -982,3 +984,288 @@ Hybrid (`src/search/hybrid.cpp`, unabhängig von s08):
   `.btree.tmp`-Rest nach Kill → Voll-Replay (Heilung ausstehend).
 - Vektor-Gross: `N>=50k` IVF (`prefer_ivf_over_hnsw`), DiskANN-Build
   `<=16000` exakt / darüber ANN (`DiskAnnIndex::build`).
+
+## 13. Welle 18–19 (s86–s89, s91–s95, alle STL/POSIX-only ausser TLS/SCRAM/GCM-Opt-in)
+
+### 13.1 RESP-Befehle — Redis-Protokoll auf KV (`server/resp.h`, `src/server/resp.cpp`)
+
+- `RespServer` hält einen `KVStore` (Strings only, kein WRONGTYPE), bindet
+  `127.0.0.1:port` (`0` = ephemeral), listen + Accept-Thread, je Connection ein
+  detached Thread, persistent bis `QUIT`/close
+  (`include/dbengine/server/resp.h:4-10,20-47`,
+  `src/server/resp.cpp:309-342,356-367`).
+- Eingabe Inline (`SET foo bar\r\n`) oder Multibulk (`*3\r\n$3\r\nSET\r\n...`),
+  Befehle case-insensitiv (`src/server/resp.cpp:110-211`); Antworten RESP2
+  (`+/-/:/$/*`, nil = `$-1`), unbekannt → `-ERR unknown command`
+  (`src/server/resp.cpp:53-59,300-302`).
+- Befehle auf `KVStore` (`include/dbengine/server/resp.h:9`,
+  `src/server/resp.cpp:220-302`): `PING [msg]` (`+PONG`/`$msg`,
+  `src/server/resp.cpp:227-236`), `SET k v` (`+OK`, `232-245`),
+  `GET k` (Bulk / `$-1` bei Miss, `246-258`), `DEL k...` (`:n` gelöschte,
+  `259-270`), `EXISTS k...` (`:n` Treffer via `Get`, `271-282`),
+  `KEYS [prefix]` (`*n` + Bulk-Keys via `Scan(prefix)`, `""` = alle,
+  `283-294`), `QUIT` (`+OK` + close, `295-299`).
+- Binary `dbresp` (`CMakeLists.txt:331-335`, `src/server/resp.cpp:604-635`):
+  `--selfcheck` (ephemeral + Socket-Client + Asserts SET/GET/EXISTS/KEYS/DEL/
+  nil/PING-inline/unknown/QUIT, `src/server/resp.cpp:525-592`),
+  `--port <n>` Dauerbetrieb (`ServeForever`, `594-600`).
+
+### 13.2 RLS-Syntax/Enforcement (`sql/parser.h`, `src/sql/parser.cpp`, `src/sql/executor.cpp`)
+
+- Syntax (`include/dbengine/sql/parser.h:183-202`): `CREATE POLICY name ON t
+  [FOR SELECT|INSERT|UPDATE|DELETE|ALL] [TO r] USING (cond)` (`command`
+  upper-kanonisch, Default `ALL`; `role` wie GRANT-Rolle, `"*"` = alle wenn
+  `TO` fehlt, `parser.h:189-196`); `ALTER TABLE t ENABLE|DISABLE ROW LEVEL
+  SECURITY` (Schalter, Default aus, `parser.h:198-202`,
+  `parser.cpp:3521-3533`).
+- `USING`-DNF über Zeilenwerte; statt Literal darf
+  `current_user/current_role/session_user` stehen (dynamisch = aktuelle Rolle,
+  `parser.h:123-135,183-185`); LHS/RHS current-Flags (`value/second/list/
+  lhs_is_current`), Spaltentausch normalisiert (`current_user OP col` → col-Vergleich,
+  ggf. Op invertiert); Subqueries in `USING` verboten
+  (`src/sql/parser.cpp:582-775,3361-3365`).
+- Enforcement In-Memory (`src/sql/parser.cpp:3357-3458,3579-3843`):
+  `rlsEnabled(norm)` (`3357-3359`), `rowPassesRls(t,row,norm,op)`
+  (`3454-3458`, `!enabled → true`); SELECT-Visibility Pre-Filter je Seite +
+  Single (`3792-3810,3836-3843`); INSERT/UPDATE WITH CHECK `42501`
+  (`3579-3583,3662-3664`); UPDATE/DELETE unsichtbar = skip
+  (`3655,3726-3727`); DROP löscht Policies mit (`3746`); nur Admin darf
+  `CREATE POLICY` (`3499`, `SQLSTATE 42501` via `3315-3321`).
+- Enforcement KV/MVCC-Executor (`src/sql/executor.cpp:594-632,658-710,
+  1766-1792,1949,2046,2129-2142,2283-2367,2580,2617,2699`): Registry-Spiegel
+  (`policies_/rls_on_`, `603-604`), Evaluator + WAL-Codec (`658-710`,
+  `U:/N:/I:/F:`-Felder), `SET ROLE/RESET` + `rbacRequireAdmin`
+  (`594-596,1519-1607`), RLS-Visibility vor Projektion/AGGR
+  (`1766-1792,1949,2358-2367`), Pushdown-Guard (RLS-Tabellen voll dekodieren,
+  `2283-2284`), Replay stellt Registry wieder her (`2617,2699`); Spiegel ist
+  KV-only (`989-992`).
+
+### 13.3 At-Rest — AES-256-GCM auf WAL (`storage/wal.h`, `src/storage/wal.cpp`)
+
+- Format opt-in (`include/dbengine/storage/wal.h:13-33`): Magic `WAL1`
+  unverändert; `len = stored | 0x80000000` (Top-Bit = GCM-Marker, plain nie
+  gesetzt da `stored = plain+16 <= 16 MiB+16 < 2^31`); `stored` = Cipher
+  (`== plain_len`) + 16 Tag-Bytes; `crc` über `lsn-LE + raw_len-LE (inkl.
+  Marker) + nonce[12] + blob[stored]` (Torn-Erkennung über Chiffre erhalten);
+  `nonce[12]` = LSN-LE (8B) + frischer Salt (4B) pro Record im Header;
+  `AAD` (nicht gespeichert) = `magic+lsn+len` (bindet Position).
+- Marker-Wahl begründet (`wal.h:28-33`): kein `flags`-u32 nach Magic (würde
+  Default-Bytes ändern); Default-Pfad byte-identisch zu V1, alte Files plain
+  lesbar, gemischte Files mit Schlüssel lesbar (plain passthrough + decrypt),
+  ohne Schlüssel Prefix bis erstem GCM-Record.
+- Key-Provisionierung Caller-Sache, Lib liest kein Env/loggt nie
+  (`wal.h:107-126`, `src/storage/wal.cpp:397-435`): `setEncryptionKey(Key32)`
+  / `setEncryptionKey(string_view raw32)` (exakt 32 Bytes sonst
+  `invalid_argument`, Stack-Kopie gewischt, `410-417`); `clearEncryptionKey`
+  (wischt Material, nur künftige appends plain, alte bleiben schlüsselpflichtig);
+  `encryption_enabled()` (nur dann GCM-Pfad); ohne `DBENGINE_WITH_TLS`-Build
+  wirft Setter `logic_error` (kein Fake-Crypto, keine eigene AES-Impl,
+  `404-406,420-422`); Build-Gate `CMakeLists.txt:80-104`
+  (`find_package(OpenSSL QUIET)` + `try_compile`, sonst STL-only-Fallback).
+- Fail-closed (`wal.h:193-205`, `src/storage/wal.cpp:541,572-596,694`):
+  `scan` meldet `need_key` (GCM ohne Schlüssel) / `auth_failed` (Tag-Fehlschlag
+  mit Schlüssel); Lesepfade liefern Prefix, mutierende Pfade
+  (`open/checkpoint`) verweigern statt zu kappen/droppen; `replay_file`
+  nutzt immer `nullptr` (Prefix bis erstem GCM, kappt nie).
+
+### 13.4 TPC-H-SF-Zahlen — Harness + Rematch (`tools/bench.cpp`, `docs/TPC-H-REMATCH.md`, `README.md`)
+
+- Harness (`tools/bench.cpp:12-16,128-129,184-208,331-336,361-416`):
+  `dbbench --tpch [N]` (Default `10000`, Seed `42u`, batched INSERTs à `500`,
+  `bench.cpp:129,207-208,374-389`); deterministische `lineitem`
+  (`orderkey/qty/price/disc/tax/rf/ls/shipdate`, `372-416`); je Query `kReps=5`
+  Scans, CSV `tpch_q1/tpch_q6` (rows/s, p95 ms/Scan), Summen/Ref/Hash nach
+  stderr (`bench.cpp:418,429-460,468-524`).
+- Queries byte-identisch (`bench.cpp:420-423,464-466`,
+  `docs/TPC-H-REMATCH.md:6-23,95-104`): Q6 `SELECT SUM(price*disc) WHERE disc
+  BETWEEN 0.05 AND 0.07 AND qty < 24 AND price >= 500 AND price < 5000 AND tax
+  <= 0.05 AND shipdate BETWEEN 19940101 AND 19951231` (5x AND/Range,
+  rel-Check `1e-9`); Q1-Kern `SELECT rf, ls, SUM(qty), SUM(price),
+  SUM(price*disc), AVG(disc), COUNT(*) ... GROUP BY rf, ls ORDER BY rf, ls`
+  (Hash-Agg, FNV-1a64 über `valueToString`-Keys).
+- SF-Stufen gemessen (alle `/tmp` = tmpfs, je 2 Läufe à 5 Reps, p95/Scan):
+  100k + 1M Rematch `docs/TPC-H-REMATCH.md:45-56,117-129` — Q6-Summe 1M
+  `1783190,382600` überall, Q1 6 Gruppen/`counted=1000000`; 1M dbengine Q6
+  `1034,67/1015,39 ms` vs. SQLite `72,50/73,21 ms` vs. DuckDB `3,13/2,95 ms`,
+  Q1 `1768,74/1847,54 ms` vs. `793,38/790,11 ms` vs. `3,34/3,48 ms`
+  (`docs/TPC-H-REMATCH.md:148-154`, `README.md:61-69`); 100k dbengine Q6
+  `102,92/104,45 ms`, Q1 `163,43/154,39 ms` (`docs/TPC-H-REMATCH.md:156-162`,
+  `README.md:65-66`); s84-Delta nur Run-Rauschen (`164-173`, `README.md:68-69`).
+- Urteil übernommen (kein Extrapolieren): kein belegbarer Replika-vorher/
+  nachher (Pre-1M undokumentiert), Q1-Nähe zu SQLite plausibel Replika-Effekt,
+  Q6/DuckDB-Abstand bleibt (`docs/TPC-H-REMATCH.md:58-86,179-189`).
+
+### 13.5 Multi-Prozess-Raft — 3 Prozesse via fork+TCP (`tools/raft_cluster.cpp`)
+
+- Echter 3-Prozess-Cluster (`tools/raft_cluster.cpp:1-10`,
+  `CMakeLists.txt:337-344`): je Kindprozess eigener Term/Log/State (kein
+  zweites Consensus-Protokoll, nur RequestVote/AppendEntries-RPCs, Framing via
+  `SendWire/RecvWire` + `Encode/DecodeEntryWire` aus `raft/shard.h`,
+  `raft_cluster.cpp:32-37,241-266`); Wahl-Timeouts gestaffelt wie
+  `RaftGroup::election_timeout_for` (`199`), Heartbeats `40 ms` vom Leader
+  (`42,315,533-534`); RPC = frische Loopback-Verbindung pro Call
+  (`111-130`), Node-Loop `select` 10-ms-Takt (`495-541`).
+- Nachrichten (`224-231,232-493`): `V/v` RV-Req/Rep (term/cand/lastIdx/lastTerm),
+  `A/a` AE-Req/Rep (term/leader/prev/commit + genau ein Entry-Wire),
+  `C/c` ClientPut (`klen/key/vlen/val` → `ok/index/leaderHint`, Leader
+  repliziert synchron bis ~4 s, `433-464`), `G/g` ClientGet auf appliziertem
+  State (`466-483`), `S/s` Status (term/leader/commit/logsize/isLeader,
+  `485-493`), `X/x` Shutdown.
+- Selfcheck (`708-822`, `826-830`: nur `--selfcheck`): 3× `ListenOnLoopback`
+  (ephemeral) + `fork` (`709-747`); stabiler Leader (isLeader + Fremd-Bestätigung
+  × 2 Runden, `650-683`); Client-Put an Leader + Mehrheit liest `key==val`
+  (`685-701,760-768`); Follower-Kill (kleinste Id ≠ Leader, `SIGKILL` + `waitpid`,
+  `770-792`) + weiter committen mit 2/3 (`794-800`); Shutdown + `ALL
+  RAFT_CLUSTER SELFCHECK PASSED` (`802-822`).
+
+### 13.6 OTLP — HTTP-Export handgerollt (`server/metrics.h`, `src/server/metrics.cpp`)
+
+- API (`include/dbengine/server/metrics.h:79-116`): `OtlpSpan{name, trace_id
+  (Hex 32), span_id (Hex 16), start/end_ns, attributes}`, `OtlpExporter::
+  configure(host,port,path=/v1/traces)` (Default `127.0.0.1:4318`,
+  `113-115,349-357`), `exportSpans(batch)` (Batch-Ack genau bei 2xx,
+  leer = No-Op `true` ohne Netzwerk, `99-101,404-405`), `buildJson`
+  (enthält `resourceSpans`/`traceId`, Escaping → nie werfend ausser bad_alloc,
+  `103-105,374-402`).
+- Wire (`src/server/metrics.cpp:404-466`): `POST <path> HTTP/1.0` mit
+  `Content-Length` + `Connection: close` (`418-420`), eigener TCP-Client via
+  `getaddrinfo` (Host-Namen gehen, `422-441`), Response-Status-Parse
+  (`parseHttpStatus`, `332-345`), `true` gdw. `200<=code<300` (`464-465`);
+  JSON-Shape `resourceSpans→scopeSpans→spans` mit OTLP-kanonischen Keys
+  (`traceId/spanId/startTimeUnixNano/...`, `375-401`).
+- Selfcheck im `dbmetrics`-Selfcheck (`591-730,755-758`): Fake-Kollektor auf
+  ephemeral Port (ein POST, `Content-Length`-Body nachlesen, `200 {}` +
+  Raw-Request speichern, `623-692`), Test-Span mit fixen Hex-IDs
+  (`695-705`), Asserts `POST` + `resourceSpans` + `traceId` + 2xx-Ack
+  (`709-729`).
+
+### 13.7 Slow-Log — session-lokal, cap 64 (`sql/executor.h`, `src/sql/executor.cpp`)
+
+- Sammlung nur, kein stderr/Metrics-Export/QueryStat-Umbau
+  (`include/dbengine/sql/executor.h:62-83`): pro normalisiertem Query-Text
+  (identisch `normalizeQuery`) ein Eintrag `{calls (slow-Ausführungen inkl.
+  Fehler), max_ms, last_ms, rows_out (Summe slow, Fehler = 0)}`.
+- API (`executor.h:109-117`, `src/sql/executor.cpp:1329-1402`):
+  `setSlowLogThresholdMs(ms)` (`>0` an, `<=0`/NaN = aus, Default aus,
+  `1331`); Aufzeichnung in `execute()` gdw. `threshold>0 && ms>=threshold`
+  (Grenze inklusiv, Erfolg + Fehler mit rows 0, `1341-1342,1428,1442`);
+  `slowQueries(top_n)` sortiert `max_ms` desc (Tie: calls desc, query asc),
+  `limit==0` = alle (max Cap); `clearSlowLog()` (tastet `pgstat_` nicht an).
+- Schranke `kSlowLogCap = 64` (`executor.h:111`): Update bestehender Keys
+  immer (`max=max`, `last=ms`, `1343-1351`); neuer Key bei voller Map nur wenn
+  `ms` strikt grösser als kleinstes `max_ms` (genau dieser schnellste wird
+  verdrängt, O(Cap)-Scan, `1352-1377`); Lock = `pgstat_mu_` (ein Lock pro
+  `execute()`, Overhead bei aus = ein double-Vergleich).
+
+### 13.8 S3-Sidecar — Stub + Doku (`columnar/store.h`, `docs/RUNBOOK.md`, `k8s/statefulset.yaml`)
+
+- Ehrlicher Stand unverändert: **kein echter S3-Upload im Code**.
+  `ColumnarStore::StageToS3(bucket,prefix)` bildet nur deterministisch die
+  Ziel-URI (`include/dbengine/columnar/store.h:209-212`,
+  `docs/RUNBOOK.md:203-222`, `k8s/statefulset.yaml:80-83`).
+- URI-Format (`src/columnar/store.cpp:884-887` via `docs/RUNBOOK.md:212-222`):
+  `s3://<bucket>/<prefix-mit-trailing-/>columnar-<N>parts/` mit
+  `N = parts_.size()` (sealed Parts; aktive Replika zählt nicht, Replika wird
+  von Save/Load nicht persistiert, `store.h:224`); Beispiel
+  `tests/test_columnar.cpp:144`: `StageToS3("my-bucket","tier1")` →
+  `s3://my-bucket/tier1/columnar-1parts/`.
+- Was der Sidecar synct (`docs/RUNBOOK.md:224-272`): Quelle
+  `ColumnarStore::Save(dir)` (`store.cpp:734`); Inhalt je sealed Part
+  `part-<id>.col` (+ ggf. genau ein `part-<id>-active.col`), `manifest.txt`
+  **zuletzt** atomar (`tmp+rename+fsync`, `store.cpp:743-784`); Manifest
+  Zeile 1 `<n>`, dann `<id> <fname> <rows> <active 0/1>`
+  (`store.cpp:761-770`); `Load` prüft Manifest zuerst, lehnt `>1` aktiv ab,
+  verifiziert `size==rows && id==id`, weist Pfad-Traversal ab
+  (`store.cpp:787-849,818-827`).
+- Operator-Prinzip + K8s-Skizze (nicht deployed):
+  `rclone sync /data/columnar remote:my-bucket/tier1 --checksum` /
+  `mc mirror ...` (`docs/RUNBOOK.md:245-272`); Secret/Sidecar nur auskommentiert
+  (`k8s/statefulset.yaml:84-102`, `rclone/rclone:stable`-Platzhalter,
+  Credentials in `dbengine-s3`-Secret, Restore = sync zurück + `Load` + WAL-Tail).
+
+### 13.9 README-Links (`README.md`)
+
+- Produkt-Quickstart (`README.md:8-22`): CMake ≥ 3.20 + C++20, `cmake -S .
+  -B build && cmake --build build -j4 && ctest`, `dbengine foo.db --exec
+  "CREATE/INSERT/SELECT"`, REPL/`.quit`, `--help/--version (0.1.0)`; Dateien
+  `foo.db` (Container 41 038 B, keine Rows) + `foo.db.wal` (Wahrheit) +
+  `foo.db.btree` (Spiegel, tolerant).
+- Feature-Matrix (`README.md:23-36`): SQL-Basis/JOIN, Filter/Aggregate/Subqueries,
+  MVCC/TSO-HLC, WAL/Pager/BTreeKV/COL2, CLI/Mirror, Columnar/Replika/Par-Scan,
+  HNSW/PQ-N/IVF/DiskANN/BM25, PGWire/Metrics/Backup/Prodsim/pg_stat,
+  Cluster/Raft-Sim, Persistenz-ohne-WAL — mit 🟢/🟡/🔴-Ehrlichkeit (kein HA/2PC).
+- Benchmarks nur gemessen (`README.md:38-74`, Quellen `docs/PHASE0-DUELL.md`,
+  `docs/TPC-H-REMATCH.md`): 10k/1M-Duell (Insert `~6,7 s` vs. `~75,3 s`,
+  Restart `~6,2 s` vs. `~0,05 s`, Bytes `41 KB + 53,7 MB` vs. `14,3 MB`),
+  TPC-H 100k/1M Q6/Q1 vs. SQLite/DuckDB (s. 13.4), Caveats tmpfs/`5e+11`-Display.
+- Docs-Index (`README.md:76-83`): `docs/ARCH.md` (Schichten, WAL/MVCC/Shard,
+  Kap. 1–13), `docs/PHASE0-DUELL.md`, `docs/TPC-H-REMATCH.md`,
+  `docs/RUNBOOK.md` (u. a. TLS-Sidecar Kap. 7, S3 Kap. 11), `docs/PRODSIM.md`,
+  `docs/SBOM.md`; Lizenz Apache-2.0 (`README.md:85-87`).
+
+### 13.10 Stale-Korrekturen zu Kap. 7/4/9/10/12 + README (mit Code-Beleg Datei:Zeile)
+
+- Kap. 7 „RESP/Arrow-Flight/REST offen (F6.2)" stale → korrekt: RESP2
+  `GET/SET/DEL/EXISTS/KEYS/PING/QUIT` auf KV vorhanden (Inline + Multibulk,
+  `$-1`-nil, `ERR unknown command`); Arrow-Flight/REST weiter offen
+  (Beleg: `include/dbengine/server/resp.h:9`,
+  `src/server/resp.cpp:220-302`, `CMakeLists.txt:331-335`).
+- Kap. 4 „Raft 3er-Sim, kein Netzwerk / kein Raft-over-TCP" teilweise stale →
+  korrekt: daneben echter 3-Prozess-Cluster via `fork()` + TCP-Loopback
+  (RequestVote/AppendEntries mit Wire-Codec, Wahl + Replikation + Follower-Kill
+  im Selfcheck); Sim/Timer/TCP-Codec bleiben, weiter kein k8s-HA/Membership
+  (Beleg: `tools/raft_cluster.cpp:1-10,111-130,232-266,708-822`,
+  `CMakeLists.txt:337-344`).
+- Kap. 9.10/12.15 „nur Sidecar-TLS, kein At-Rest" stale → korrekt: opt-in
+  AES-256-GCM auf WAL (`kEncFlag`-Top-Bit, Nonce LSN-LE+Salt, AAD magic+lsn+len),
+  Key via `setEncryptionKey(32B)` (Caller/Env, Lib liest kein Env), nur mit
+  `DBENGINE_WITH_TLS`-Build, sonst `logic_error`; Default plain byte-identisch
+  (Beleg: `include/dbengine/storage/wal.h:13-33,94-126`,
+  `src/storage/wal.cpp:397-435`, `CMakeLists.txt:80-104`).
+- Kap. 10.5/12.13 „TPC-H nur 10k-Harness / s84-Zahlen" stale → korrekt:
+  Harness Default `10000` + `--tpch N`, gemessen 100k + 1M (je 2 Läufe à 5 Reps,
+  Seed 42, Batches à 500), Zahlen + Urteil s. 13.4 (kein Replika-vorher/nachher
+  belegbar, Run-Rauschen statt Sprung)
+  (Beleg: `tools/bench.cpp:129,207-208,361-423,464-466`,
+  `docs/TPC-H-REMATCH.md:117-129,164-173`, `README.md:61-69`).
+- Kap. 11.4/12.10 „S3 nur Pfad-Stub ohne Doku" unvollständig → korrekt: Code
+  weiter Stub (nur URI), aber Sidecar-Doku vollständig (Save-Verzeichnis,
+  Manifest-Format, `rclone`/`mc`-Prinzip, K8s-Skizze, Restore-Reihenfolge)
+  (Beleg: `include/dbengine/columnar/store.h:209-212`,
+  `docs/RUNBOOK.md:203-272`, `k8s/statefulset.yaml:80-102`).
+- `README.md:78` „Kap. 1–12" stale → korrekt: Kap. 1–13 (dieses Kapitel)
+  (Beleg: diese Datei, Kap. 13).
+
+### 13.11 Runbook-Ops (Welle 18–19)
+
+- RESP: `./build/dbresp --selfcheck` (ephemeral + Asserts,
+  `src/server/resp.cpp:525-592`); Dauerbetrieb `./build/dbresp --port 6379`
+  (`594-600,604-635`); Redis-Client gegen `127.0.0.1:<port>` (Inline oder
+  Multibulk, `KEYS <prefix>` für Scan).
+- RLS: `CREATE POLICY p ON t [FOR ...] [TO r] USING (...)` +
+  `ALTER TABLE t ENABLE ROW LEVEL SECURITY` (`parser.h:183-202`); Test via
+  `SET ROLE r` / `RESET ROLE` (Session-lokal, kein WAL); Verstoß → `42501`.
+- At-Rest: nur mit `-DDBENGINE_WITH_TLS=ON` + nutzbarem OpenSSL bauen
+  (`CMakeLists.txt:80-104`); Key (32 B, z. B. aus Env) **vor** `open()` via
+  `setEncryptionKey` setzen (`wal.h:107-120`, `wal.cpp:397-417`); ohne Key nur
+  Prefix bis erstem GCM-Record, `open/checkpoint` fail-closed.
+- TPC-H: `./build/dbbench --tpch 100000` (Probe ~2 s) → `./build/dbbench
+  --tpch 1000000` (je Query 5 Reps, CSV `tpch_q1/tpch_q6`, Summen/Hash stderr,
+  `tools/bench.cpp:331-363,418-524`).
+- Multi-Prozess-Raft: `./build/raft_cluster --selfcheck`
+  (`tools/raft_cluster.cpp:826-830`); erwartet `cluster/3-started`,
+  `leader-elected`, `put-k1-committed`, `replication-majority`,
+  `follower-killed`, `put-k2-after-kill`, `commit-majority-after-kill`.
+- OTLP: `OtlpExporter::configure(host,port,path)` (Default `127.0.0.1:4318`
+  `/v1/traces`, `metrics.h:93-115`); geprüft via `dbmetrics --selfcheck`
+  (Fake-Kollektor + `resourceSpans`/`traceId`-Asserts,
+  `src/server/metrics.cpp:596-730,755-758`).
+- Slow-Log: `ex.setSlowLogThresholdMs(ms)` (0 = aus),
+  `ex.slowQueries(n)` (Top nach `max_ms`), `ex.clearSlowLog()`
+  (`executor.h:109-117`); Cap 64, Grenze inklusiv, session-lokal/Restart-leer.
+- S3-Sidecar: erst `ColumnarStore::Save(/data/columnar)`, dann Sidecar sync
+  (`rclone sync /data/columnar remote:my-bucket/tier1 --checksum`),
+  Restore sync zurück + `Load` + WAL-Tail (`docs/RUNBOOK.md:245-272`,
+  `k8s/statefulset.yaml:80-102`); `StageToS3` nur URI-Vorlage, kein Upload.
+- README: Einstieg über `README.md:8-22`, Zahlen nur aus `README.md:38-74`
+  zitieren (tmpfs-Caveats beachten), Architektur via `docs/ARCH.md` Kap. 1–13.

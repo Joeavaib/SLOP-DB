@@ -5,6 +5,7 @@
 #include "dbengine/server/pgserver.h"
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -12,7 +13,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -589,6 +593,134 @@ bool isSelectOne(const std::string& q) {
   return u == "SELECT 1";
 }
 
+// ScopeGuard: ruft f() im Destruktor (fuer Trace-Emit an allen Q/E-Exits,
+// inkl. break/continue). Überhead bei inaktivem Trace: 1 Branch in f().
+template <typename F>
+struct ScopeGuard {
+  F f;
+  ~ScopeGuard() { f(); }
+};
+template <typename F>
+ScopeGuard(F) -> ScopeGuard<F>;
+
+// Statement-Kuerzung fuer Span-Attribut (256 Zeichen, keine Wire-Aenderung).
+std::string truncateStmt(const std::string& s) {
+  constexpr std::size_t kMax = 256;
+  if (s.size() <= kMax) return s;
+  return s.substr(0, kMax);
+}
+
+uint64_t nowNsSystem() {
+  using namespace std::chrono;
+  return static_cast<uint64_t>(
+      duration_cast<nanoseconds>(system_clock::now().time_since_epoch())
+          .count());
+}
+
+// Minimaler OTLP/HTTP-Export (STL/POSIX, kein SDK, keine metrics-Abhaengigkeit).
+// Gleiches JSON-Shape wie OtlpExporter::buildJson (resourceSpans/traceId/...),
+// damit Fake-Kollektoren matchen. BEGRUENDUNG: OtlpExporter lebt in
+// src/server/metrics.cpp (dbmetrics-Executable mit main, keine Lib) und kann
+// von pgserver nicht gelinkt werden.
+std::string traceEscapeJson(const std::string& s) {
+  std::string o;
+  o.reserve(s.size() + 2);
+  for (char c : s) {
+    switch (c) {
+      case '"': o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\b': o += "\\b"; break;
+      case '\f': o += "\\f"; break;
+      case '\n': o += "\\n"; break;
+      case '\r': o += "\\r"; break;
+      case '\t': o += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char tmp[7];
+          std::snprintf(tmp, sizeof(tmp), "\\u%04x",
+                        static_cast<unsigned int>(static_cast<unsigned char>(c)));
+          o += tmp;
+        } else {
+          o += c;
+        }
+        break;
+    }
+  }
+  return o;
+}
+
+std::string traceBuildJson(const std::string& name, const std::string& traceId,
+                           const std::string& spanId, uint64_t startNs,
+                           uint64_t endNs, const std::string& stmt,
+                           const std::string& rows, const std::string& isErr) {
+  std::string j;
+  j.reserve(512);
+  j += "{\"resourceSpans\":[{\"resource\":{},\"scopeSpans\":[{\"scope\":{\"name\":\"dbengine\"},";
+  j += "\"spans\":[{\"traceId\":\"" + traceEscapeJson(traceId) + "\"";
+  j += ",\"spanId\":\"" + traceEscapeJson(spanId) + "\"";
+  j += ",\"name\":\"" + traceEscapeJson(name) + "\"";
+  j += ",\"startTimeUnixNano\":\"" + std::to_string(startNs) + "\"";
+  j += ",\"endTimeUnixNano\":\"" + std::to_string(endNs) + "\"";
+  j += ",\"attributes\":[";
+  j += "{\"key\":\"db.statement\",\"value\":{\"stringValue\":\"" + traceEscapeJson(stmt) + "\"}},";
+  j += "{\"key\":\"rows\",\"value\":{\"stringValue\":\"" + traceEscapeJson(rows) + "\"}},";
+  j += "{\"key\":\"error\",\"value\":{\"stringValue\":\"" + traceEscapeJson(isErr) + "\"}}";
+  j += "],\"status\":{}}]}]}]}";
+  return j;
+}
+
+bool tracePost(const std::string& host, int port, const std::string& path,
+               const std::string& body) {
+  std::string req = "POST " + path + " HTTP/1.0\r\nHost: " + host +
+                    "\r\nContent-Type: application/json\r\nContent-Length: " +
+                    std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* list = nullptr;
+  std::string portStr = std::to_string(port);
+  if (::getaddrinfo(host.c_str(), portStr.c_str(), &hints, &list) != 0) return false;
+  int fd = -1;
+  for (addrinfo* ai = list; ai != nullptr; ai = ai->ai_next) {
+    int tmp = ::socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (tmp < 0) continue;
+    if (::connect(tmp, ai->ai_addr, ai->ai_addrlen) == 0) {
+      fd = tmp;
+      break;
+    }
+    ::close(tmp);
+  }
+  ::freeaddrinfo(list);
+  if (fd < 0) return false;
+  std::size_t off = 0;
+  while (off < req.size()) {
+    ssize_t n = ::send(fd, req.data() + off, req.size() - off, MSG_NOSIGNAL);
+    if (n <= 0) {
+      if (n < 0 && errno == EINTR) continue;
+      ::close(fd);
+      return false;
+    }
+    off += static_cast<std::size_t>(n);
+  }
+  // Response-Status lesen (reicht fuer Best-Effort; 2xx vs egal).
+  std::string resp;
+  resp.reserve(512);
+  char buf[1024];
+  while (resp.size() < 64 * 1024) {
+    ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+    if (n == 0) break;
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      ::close(fd);
+      return false;
+    }
+    resp.append(buf, static_cast<std::size_t>(n));
+    if (resp.find("\r\n\r\n") != std::string::npos) break;
+  }
+  ::close(fd);
+  return true;
+}
+
 void putCString(std::vector<uint8_t>& out, const std::string& s) {
   out.insert(out.end(), s.begin(), s.end());
   out.push_back(0);
@@ -1153,6 +1285,73 @@ void PgServer::setTlsCert(const std::string& keyPath,
 #endif
 }
 
+void PgServer::setTraceSampleRate(double rate) {
+  if (!(rate > 0.0)) {  // faengt 0, negativ und NaN ab
+    traceSamplePerMillion_.store(0, std::memory_order_relaxed);
+    return;
+  }
+  if (!(rate < 1.0)) {  // >= 1 (inf eingeschlossen) = alles
+    traceSamplePerMillion_.store(1000000, std::memory_order_relaxed);
+    return;
+  }
+  uint32_t ppm =
+      static_cast<uint32_t>(std::llround(rate * 1000000.0));
+  if (ppm > 1000000) ppm = 1000000;
+  traceSamplePerMillion_.store(ppm, std::memory_order_relaxed);
+}
+
+void PgServer::setTraceEndpoint(const std::string& host, int port) {
+  std::lock_guard<std::mutex> lk(traceCfgMu_);
+  traceHost_ = host.empty() ? "127.0.0.1" : host;
+  tracePort_ = port;
+  traceExportConfigured_.store(true, std::memory_order_relaxed);
+}
+
+bool PgServer::traceStart(uint64_t& startNs, uint64_t& seq) {
+  uint32_t ppm = traceSamplePerMillion_.load(std::memory_order_relaxed);
+  if (ppm == 0) return false;  // Hot-Path aus: genau dieser Branch
+  uint64_t c = traceCounter_.fetch_add(1, std::memory_order_relaxed);
+  if (ppm < 1000000 && (c % 1000000) >= ppm) return false;
+  seq = c;
+  startNs = nowNsSystem();
+  return true;
+}
+
+void PgServer::traceFinish(const char* name, const std::string& stmt,
+                           uint64_t rows, bool isError, uint64_t startNs,
+                           uint64_t seq) {
+  // No-Throw-Garantie: wird aus ScopeGuard-Destruktor gerufen (throw ->
+  // terminate). Darum ist der gesamte Body gewrapped, nicht nur der Export.
+  try {
+    if (!traceExportConfigured_.load(std::memory_order_relaxed)) return;
+    uint64_t endNs = nowNsSystem();
+    std::string host;
+    int port = 0;
+    {
+      std::lock_guard<std::mutex> lk(traceCfgMu_);
+      host = traceHost_;
+      port = tracePort_;
+    }
+    if (port < 0 || port > 65535) return;
+    char traceId[33] = {0};
+    char spanId[17] = {0};
+    // trace_id: 32 Hex (high=startNs, low=seq+1, nie all-zero);
+    // span_id: 16 Hex (seq+1, nie all-zero).
+    std::snprintf(traceId, sizeof(traceId), "%016llx%016llx",
+                  static_cast<unsigned long long>(startNs),
+                  static_cast<unsigned long long>(seq + 1));
+    std::snprintf(spanId, sizeof(spanId), "%016llx",
+                  static_cast<unsigned long long>(seq + 1));
+    std::string body = traceBuildJson(
+        name ? name : "pg.query", traceId, spanId, startNs, endNs,
+        truncateStmt(stmt), std::to_string(rows), isError ? "true" : "false");
+    // Best-Effort: Fehler (kein Kollektor, Timeout, ...) werden ignoriert.
+    (void)tracePost(host, port, "/v1/traces", body);
+  } catch (...) {
+    // Best-Effort: Tracing darf den Query-Pfad nie brechen.
+  }
+}
+
 bool PgServer::running() const { return running_.load(); }
 
 void PgServer::start() {
@@ -1524,16 +1723,27 @@ void PgServer::handleConn(int fd) {
     if (!readTypedMessage(conn, type, msg)) break;
     if (type == 'X') break;  // Terminate
     if (type == 'Q') {
+      uint64_t tStart = 0, tSeq = 0;
+      bool tActive = traceStart(tStart, tSeq);
+      std::string tStmt;
+      uint64_t tRows = 0;
+      bool tErr = false;
+      ScopeGuard tGuard{[&] {
+        if (tActive)
+          traceFinish("pg.query", tStmt, tRows, tErr, tStart, tSeq);
+      }};
       std::optional<std::string> q;
       try {
         q = dbengine::pgwire::parseQueryMessage(msg);
       } catch (const std::exception& e) {
+        tErr = true;
         auto err = dbengine::pgwire::encodeError("ERROR", "42601", e.what());
         if (!connSend(conn, err)) break;
         if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
         continue;
       }
       if (!q.has_value()) {
+        tErr = true;
         auto err = dbengine::pgwire::encodeError(
             "ERROR", "0A000", "nur Simple Protocol (Q) in V1");
         if (!connSend(conn, err)) break;
@@ -1541,7 +1751,9 @@ void PgServer::handleConn(int fd) {
         continue;
       }
       // Sonderpfad: byte-identisch T(?column?)/D("1")/C(SELECT 1).
+      if (tActive) tStmt = *q;
       if (isSelectOne(*q)) {
+        tRows = 1;
         auto t = dbengine::pgwire::encodeRowDescription({"?column?"});
         auto d = dbengine::pgwire::encodeDataRow({"1"});
         auto c = dbengine::pgwire::encodeCommandComplete("SELECT 1");
@@ -1562,16 +1774,19 @@ void PgServer::handleConn(int fd) {
         oids = resolveOids(res, *q, executor_);
         tag = res.message;
       } catch (const dbengine::sql::SqlError& e) {
+        tErr = true;
         auto err = dbengine::pgwire::encodeError("ERROR", "42601", e.what());
         if (!connSend(conn, err)) break;
         if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
         continue;
       } catch (const std::exception& e) {
+        tErr = true;
         auto err = dbengine::pgwire::encodeError("ERROR", "0A000", e.what());
         if (!connSend(conn, err)) break;
         if (!connSend(conn, dbengine::pgwire::encodeReadyForQuery('I'))) break;
         continue;
       }
+      tRows = static_cast<uint64_t>(res.rows.size());
       if (!res.columns.empty()) {
         auto t = encodeRowDescriptionTyped(res.columns, oids);
         if (!connSend(conn, t)) break;
@@ -1742,16 +1957,28 @@ void PgServer::handleConn(int fd) {
     }
     if (type == 'E') {  // Execute: portal\0 i32 maxRows -> T/D/C wie Q-Pfad
       bool brk = false;
+      uint64_t tStart = 0, tSeq = 0;
+      bool tActive = traceStart(tStart, tSeq);
+      std::string tStmt;
+      uint64_t tRows = 0;
+      bool tErr = false;
+      ScopeGuard tGuard{[&] {
+        if (tActive)
+          traceFinish("pg.execute", tStmt, tRows, tErr, tStart, tSeq);
+      }};
       try {
         ExecuteMsg em = parseExecuteMsg(msg);
         auto it = portals.find(em.portal);
         if (it == portals.end()) {
+          tErr = true;
           if (!sendExtError("42601", "unknown portal", brk)) break;
           if (brk) break;
           continue;
         }
         std::string q = it->second;
+        if (tActive) tStmt = q;
         if (containsDollarParam(q)) {
+          tErr = true;
           if (!sendExtError("0A000",
                             "extended mit Parametern nicht unterstuetzt",
                             brk)) {
@@ -1761,6 +1988,7 @@ void PgServer::handleConn(int fd) {
           continue;
         }
         if (isSelectOne(q)) {
+          tRows = 1;
           auto t = dbengine::pgwire::encodeRowDescription({"?column?"});
           auto d = dbengine::pgwire::encodeDataRow({"1"});
           auto c = dbengine::pgwire::encodeCommandComplete("SELECT 1");
@@ -1780,14 +2008,17 @@ void PgServer::handleConn(int fd) {
           oids = resolveOids(res, q, executor_);
           tag = res.message;
         } catch (const dbengine::sql::SqlError& e) {
+          tErr = true;
           if (!sendExtError("42601", e.what(), brk)) break;
           if (brk) break;
           continue;
         } catch (const std::exception& e) {
+          tErr = true;
           if (!sendExtError("0A000", e.what(), brk)) break;
           if (brk) break;
           continue;
         }
+        tRows = static_cast<uint64_t>(res.rows.size());
         if (!res.columns.empty()) {
           auto t = encodeRowDescriptionTyped(res.columns, oids);
           if (!connSend(conn, t)) break;
@@ -1811,6 +2042,7 @@ void PgServer::handleConn(int fd) {
         extNeedSync = true;
         extErrZ = false;
       } catch (const std::exception& e) {
+        tErr = true;
         if (!sendExtError("42601", e.what(), brk)) break;
         if (brk) break;
       }

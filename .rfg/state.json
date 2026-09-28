@@ -96,7 +96,10 @@
     "s92-otlp",
     "s93-slowlog",
     "s94-s3sidecar",
-    "s95-readme"
+    "s95-readme",
+    "s96-raftbind",
+    "s97-vacuum",
+    "s98-trace"
   ],
   "verified": [
     "s07-index",
@@ -195,16 +198,19 @@
     "s92-otlp",
     "s93-slowlog",
     "s94-s3sidecar",
-    "s95-readme"
+    "s95-readme",
+    "s96-raftbind",
+    "s97-vacuum",
+    "s98-trace"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s95-readme-1790526680",
-    "step_id": "s95-readme",
-    "commit": "5abbc7be347807c3bd7933da251d5d80ae96135e",
+    "id": "cp-s98-trace-1790606719",
+    "step_id": "s98-trace",
+    "commit": "8e2bf6ecc2f0becbfc07f70a8b8a898f81ceea56",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-27T16:31:20.287284+00:00"
+    "created_at": "2026-09-28T14:45:19.497144+00:00"
   },
   "checkpoints": [
     {
@@ -843,13 +849,37 @@
       "commit": "5abbc7be347807c3bd7933da251d5d80ae96135e",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-27T16:31:20.287284+00:00"
+    },
+    {
+      "id": "cp-s96-raftbind-1790604214",
+      "step_id": "s96-raftbind",
+      "commit": "e442a9f8c1ae302d9bb861f597e6201e3eabbcbc",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T14:03:34.103569+00:00"
+    },
+    {
+      "id": "cp-s97-vacuum-1790604475",
+      "step_id": "s97-vacuum",
+      "commit": "cdc91405cc5ea6d91c083da552ac9f4cfa1d694e",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T14:07:55.865226+00:00"
+    },
+    {
+      "id": "cp-s98-trace-1790606719",
+      "step_id": "s98-trace",
+      "commit": "8e2bf6ecc2f0becbfc07f70a8b8a898f81ceea56",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T14:45:19.497144+00:00"
     }
   ],
   "claim_step": "",
   "claim_agent": "",
   "applies_used": 0,
   "started": [
-    "s10-columnar"
+    "s10-columnar",
+    "s96-raftbind",
+    "s97-vacuum",
+    "s98-trace"
   ],
   "claims": {}
 }

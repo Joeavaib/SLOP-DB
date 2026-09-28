@@ -23,6 +23,7 @@
 //       Startup/Auth-Flow ueber TLS (R0/R3/28P01 unveraendert).
 
 #include <atomic>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <string>
@@ -98,7 +99,26 @@ class PgServer {
   //   -DDBENGINE_WITH_TLS=ON mit gefundenem OpenSSL.
   void setTlsCert(const std::string& keyPath, const std::string& certPath);
 
+  // Query-Tracing (opt-in, Default aus). Spans um jeden Q- und
+  // Extended-Execute mit Start/Ende, Name "pg.query"/"pg.execute",
+  // Attribute db.statement (gekuerzt 256), rows, error.
+  //   setTraceSampleRate(0..1): 0=aus (Default), 1=alles; dazwischen
+  //     deterministisch per Counter-Modulo (kein RNG im Hot-Path).
+  //   setTraceEndpoint(host,port): OTLP/HTTP-Export (handgerollt, STL/POSIX,
+  //     POST /v1/traces, JSON-Shape wie OtlpExporter::buildJson) an den
+  //     Kollektor (Default: nicht konfiguriert = kein Export, verworfen).
+  // Overhead bei aus: 1 Branch (ppm-Load+Compare, kein fetch_add, keine Zeit).
+  void setTraceSampleRate(double rate);
+  void setTraceEndpoint(const std::string& host, int port);
+
  private:
+  // Tracing-Helfer (hot-path-arm). traceStart: false = nicht samplen
+  // (kein Export); true = startNs/seq gueltig. traceFinish: No-Throw,
+  // Best-Effort-Export genau eines Spans (ein-element Batch).
+  bool traceStart(uint64_t& startNs, uint64_t& seq);
+  void traceFinish(const char* name, const std::string& stmt, uint64_t rows,
+                   bool isError, uint64_t startNs, uint64_t seq);
+
   void acceptLoop();
   void handleConn(int fd);
 
@@ -128,6 +148,19 @@ class PgServer {
   std::string tlsKeyPath_;
   std::string tlsCertPath_;
   bool tlsEnabled_ = false;
+  // Query-Tracing (Default aus): ppm 0=aus/1000000=alles, Counter fuer
+  // deterministisches Modulo-Sampling + Span-IDs, Endpoint-Config + Flag.
+  // BEGRUENDUNG keine OtlpExporter-Abhaengigkeit: OtlpExporter ist in
+  // src/server/metrics.cpp implementiert, das als dbmetrics-Executable mit
+  // main() gebaut wird (keine Lib) -> pgserver kann es nicht linken
+  // (undefined reference). Darum minimaler eigener OTLP/HTTP-Export in
+  // pgserver.cpp (gleiches JSON-Shape), ohne metrics-Abhaengigkeit.
+  std::atomic<uint32_t> traceSamplePerMillion_{0};
+  std::atomic<uint64_t> traceCounter_{0};
+  std::mutex traceCfgMu_;
+  std::string traceHost_ = "127.0.0.1";
+  int tracePort_ = 4318;
+  std::atomic<bool> traceExportConfigured_{false};
 };
 
 }  // namespace dbengine::pgserver

@@ -5,7 +5,7 @@ hypothesis:
   statement: ""
 goal:
   id: g1
-  statement: "C++ DB Engine Welle 19: Multi-Prozess-Raft (3 Prozesse, TCP, Wahl+Replikation), OTLP-HTTP-Export, Slow-Query-Log, S3-Sidecar-Doku, README-Overhaul. Alles verifiziert."
+  statement: "C++ DB Engine Welle 20: Raft-Bind/Membership, VACUUM, Query-Tracing, TPC-H-SF10, Doku. Alles verifiziert."
   profile: feature
 oracles:
   - kind: test
@@ -807,3 +807,26 @@ steps:
     verify: cmake --build build -j4 && ctest --test-dir build -R docs --output-on-failure
     engine: implement
     want: "README-Overhaul: Produkt-Quickstart (foo.db, Benchmarks ehrlich, Architektur-Links), keine erfundenen Zahlen"
+  - id: s96-raftbind
+    title: s96-raftbind
+    paths:
+      - tools/raft_cluster.cpp
+    verify: cmake --build build -j4 && ./build/raft_cluster --selfcheck
+    engine: implement
+    want: "Raft-Bind/Membership: --bind-Adresse + --join-Mehrknoten-Config (Datei), Selfcheck mit 2 Konfigurationen gruen"
+  - id: s97-vacuum
+    title: s97-vacuum
+    paths:
+      - src/sql/executor.cpp
+      - include/dbengine/sql/executor.h
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|mvcc\" --output-on-failure"
+    engine: implement
+    want: "VACUUM-Verdrahtung: MVCC-Purge nach DELETE/UPDATE-Batches + VACUUM-Statement, Kettenwachstum begrenzt, Tests gruene"
+  - id: s98-trace
+    title: s98-trace
+    paths:
+      - src/server/pgserver.cpp
+      - include/dbengine/server/pgserver.h
+    verify: cmake --build build -j4 && ctest --test-dir build -R pgserver --output-on-failure
+    engine: implement
+    want: "Query-Tracing: Spans um Q/Extended-Executes mit OTLP-Export, Sampling-Rate konfigurierbar, alte Tests gruene"

@@ -28,6 +28,72 @@ std::string toLower(std::string s) {
   return s;
 }
 
+// VACUUM-Prefix-Parse (ohne Parser-Umbau): "VACUUM [VERBOSE] [ANALYZE]
+// [tabelle]" case-insensitiv, ein optionales ';'. true = VACUUM-Statement.
+bool tryParseVacuum(const std::string& sql, std::string& tableOut,
+                    bool& hasTable) {
+  std::size_t b = 0;
+  while (b < sql.size() &&
+         std::isspace(static_cast<unsigned char>(sql[b])))
+    ++b;
+  std::size_t e = sql.size();
+  while (e > b && std::isspace(static_cast<unsigned char>(sql[e - 1])))
+    --e;
+  if (e > b && sql[e - 1] == ';') {
+    --e;
+    while (e > b && std::isspace(static_cast<unsigned char>(sql[e - 1])))
+      --e;
+  }
+  if (e <= b) return false;
+  std::string body = sql.substr(b, e - b);
+  std::istringstream is(body);
+  std::string w;
+  if (!(is >> w)) return false;
+  if (toLower(w) != "vacuum") return false;
+  tableOut.clear();
+  hasTable = false;
+  std::string tok;
+  // Optionale PG-Keywords ueberspringen (VERBOSE, ANALYZE, FULL, FREEZE).
+  while (is >> tok) {
+    std::string l = toLower(tok);
+    // Tabellenname in "..." kann Leerzeichen enthalten -> Rest ab Original.
+    if (!tok.empty() && tok[0] == '"') break;
+    if (l == "verbose" || l == "analyze" || l == "full" || l == "freeze")
+      continue;
+    break;
+  }
+  if (tok.empty()) return true;  // globales VACUUM
+  std::string table;
+  if (!tok.empty() && tok[0] == '"') {
+    // Quoted Ident: ab Original-Body rekonstruieren (Position suchen).
+    std::size_t q = body.find('"');
+    if (q == std::string::npos) throw SqlError("VACUUM: Syntaxfehler");
+    std::size_t q2 = body.find('"', q + 1);
+    if (q2 == std::string::npos) throw SqlError("VACUUM: Syntaxfehler");
+    table = body.substr(q + 1, q2 - q - 1);
+    std::string rest = body.substr(q2 + 1);
+    std::istringstream rs(rest);
+    std::string extra;
+    if (rs >> extra) throw SqlError("VACUUM: Syntaxfehler");
+  } else {
+    table = tok;
+    std::string extra;
+    if (is >> extra) throw SqlError("VACUUM: Syntaxfehler");
+    if (table.empty() ||
+        !(std::isalpha(static_cast<unsigned char>(table[0])) ||
+          table[0] == '_'))
+      throw SqlError("VACUUM: Syntaxfehler");
+    for (char c : table) {
+      if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_' ||
+            c == '$'))
+        throw SqlError("VACUUM: Syntaxfehler");
+    }
+  }
+  tableOut = table;
+  hasTable = true;
+  return true;
+}
+
 int schemaColIndex(const std::vector<ColumnDef>& cols, const std::string& name) {
   const std::string f = toLower(name);
   for (std::size_t i = 0; i < cols.size(); ++i) {
@@ -1446,6 +1512,16 @@ Result Executor::execute(const std::string& sql) {
 }
 
 Result Executor::executeInner(const std::string& sql) {
+  // VACUUM als Prefix-Statement (kein Parser-Umbau noetig): global oder pro
+  // Tabelle (Existenz-Guard via vacuum(table), Effekt global per MVCC-API).
+  {
+    std::string vtable;
+    bool vhas = false;
+    if (tryParseVacuum(sql, vtable, vhas)) {
+      const std::size_t freed = vhas ? vacuum(vtable) : vacuum();
+      return {{}, {}, "VACUUM " + std::to_string(freed), freed};
+    }
+  }
   Statement st = parseStatement(sql);
   // ---- RBAC: GRANT/REVOKE/SET-Handling + Enforcement vor jeder
   // KV/MVCC/WAL-Seiteneffekt (fail fast, keine Halb-Writes bei 42501).
@@ -1837,6 +1913,9 @@ Result Executor::executeInner(const std::string& sql) {
         for (const auto& [k, enc] : hits) mirrorUpsertOne(norm, k, enc, cts);
       }
     }
+    // Auto-Purge: jede UPDATE-Zeile obsoletiert genau eine alte Version
+    // (trx_end geschlossen). NACH Commit+Spiegel, best-effort (nie werfend).
+    maybeAutoPurge(hits.size());
     return {{},
             {},
             "UPDATE " + std::to_string(hits.size()),
@@ -1991,6 +2070,9 @@ Result Executor::executeInner(const std::string& sql) {
         for (const auto& k : keys) mirrorEraseOne(norm, k, cts);
       }
     }
+    // Auto-Purge: jede DELETE-Zeile erzeugt einen Tombstone (+ Historie).
+    // NACH Commit+Spiegel, best-effort (Purge respektiert aktive Snapshots).
+    maybeAutoPurge(keys.size());
     return {{},
             {},
             "DELETE " + std::to_string(keys.size()),
@@ -2045,6 +2127,8 @@ Result Executor::executeInner(const std::string& sql) {
     rbacFor(this).grants.erase(norm);  // Rechte fallen mit der Tabelle (PG)
     rbacFor(this).policies.erase(norm);  // RLS-Policies fallen mit (PG)
     rbacFor(this).rls_on.erase(norm);
+    // Auto-Purge: DROP hinterlaesst je Row einen Tombstone in MVCC.
+    maybeAutoPurge(keys.size());
     return {{}, {}, "DROP TABLE", 0};
   }
   return execSelect(std::get<SelectStmt>(st));
@@ -2464,6 +2548,42 @@ void Executor::rebuildReplicaForTable(const std::string& norm) {
     fresh.ReplicaAppend(k, newest.value, newest.trx_begin);
   }
   replica_[norm] = std::move(fresh);
+}
+
+std::size_t Executor::vacuum() {
+  // Globales Undo-GC via MVCC-API (aktive Snapshots respektiert die API
+  // selbst; Executor waehlt keine Versionen). Best-effort: nie werfend.
+  try {
+    const std::size_t freed = mvcc_.Purge();
+    last_purge_freed_ = freed;
+    auto_purge_pending_ = 0;
+    return freed;
+  } catch (...) {
+    return 0;
+  }
+}
+
+std::size_t Executor::vacuum(const std::string& table) {
+  // Per-Tabelle nur als Existenz-Guard: MvccStore bietet kein
+  // Prefix-/Pro-Tabelle-Purge (nur globales Purge()), daher ist der Effekt
+  // global; dokumentiert in executor.h. Unbekannt -> SqlError wie DML.
+  const std::string norm = normalizeTable(table);
+  if (tables_.find(norm) == tables_.end())
+    throw SqlError("Tabelle unbekannt: " + table);
+  return vacuum();
+}
+
+void Executor::maybeAutoPurge(std::size_t newly_obsoleted) noexcept {
+  try {
+    auto_purge_pending_ += newly_obsoleted;
+    if (auto_purge_threshold_ == 0) return;  // aus (pending laeuft weiter)
+    if (auto_purge_pending_ < auto_purge_threshold_) return;
+    last_purge_freed_ = mvcc_.Purge();  // respektiert aktive Snapshots selbst
+    auto_purge_pending_ = 0;
+  } catch (...) {
+    // Best-effort: DML-Pfad darf nie an der GC scheitern; pending bleibt
+    // erhalten -> Retry beim naechsten DML/vacuum().
+  }
 }
 
 std::size_t Executor::recover() {

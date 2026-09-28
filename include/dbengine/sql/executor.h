@@ -141,6 +141,34 @@ class Executor {
   std::size_t recover_skipped() const { return recover_skipped_; }
   std::size_t recover_applied() const { return recover_applied_; }
 
+  // ---- MVCC-Purge / VACUUM (Undo-GC, Executor-seitig) -----------------------
+  // MvccStore::Purge() (s. txn/mvcc.h: `std::size_t Purge()`) entfernt pro Key
+  // alte Versionen, die fuer kein aktives Snapshot mehr sichtbar sein koennen,
+  // und fasst die neueste Version nie an (kein Heap-Bloat, da Single-Version
+  // in der Primary-Kette + Undo-Historie). Korrektheit wird VOLL an die
+  // Purge-API delegiert: der Executor filtert/waehlt selbst keine Versionen,
+  // daher kann Auto-Purge/VACUUM niemals eine Version entfernen, die ein
+  // aktives Snapshot noch braucht (Purge prueft die active_-Map intern).
+  // Best-effort: Purge wirft nie in den DML-Pfad (Fehler -> 0, kein Throw).
+  //
+  // vacuum(): globales Purge ueber alle Keys (Rueckgabe = befreite Versionen).
+  // vacuum(tabelle): validiert Existenz (unbekannt -> SqlError wie
+  // UPDATE/DELETE), ruft danach mangels per-Key-Purge in der MVCC-API
+  // ebenfalls das globale Purge (Effekt ggf. tabellenuebergreifend).
+  // Tabellenname PG-gefoldet (normalizeTable).
+  // SQL: "VACUUM [VERBOSE|ANALYZE] [tabelle][;]" (Prefix in executeInner,
+  // ohne Parser-Umbau; Rueckgabe-Message "VACUUM <freed>", affected=freed).
+  // Auto-Purge: nach jedem erfolgreichen UPDATE/DELETE/DROP wird die Zahl
+  // obsoletierter Versionen (affected) auf auto_purge_pending_ akkumuliert;
+  // erreicht sie auto_purge_threshold_ (Default 1000), laeuft genau ein
+  // Purge() und der Zaehler wird zurueckgesetzt. Schwelle 0 = aus.
+  std::size_t vacuum();
+  std::size_t vacuum(const std::string& table);
+  void setAutoPurgeThreshold(std::size_t n) { auto_purge_threshold_ = n; }
+  std::size_t autoPurgeThreshold() const { return auto_purge_threshold_; }
+  std::size_t autoPurgePending() const { return auto_purge_pending_; }
+  std::size_t lastPurgeFreed() const { return last_purge_freed_; }
+
   bool hasTable(const std::string& name) const;
   const TableSchema* schemaOf(const std::string& name) const;
 
@@ -194,6 +222,17 @@ class Executor {
   // Batch-Variante: wendet gerade geschriebene Payloads direkt an (ohne
   // WAL-Re-Read; O(Batch) statt O(WAL)). Nullptr = Vollscan wie oben.
   void syncMirrorBatch(const std::vector<std::string>* batch);
+
+  // Auto-Purge-Helfer: akkumuliert obsoletierte Versionen und purgt bei
+  // erreichter Schwelle genau einmal (best-effort, nie werfend). Muss NACH
+  // erfolgreichem MVCC-Commit + Replika-Spiegelung aufgerufen werden.
+  void maybeAutoPurge(std::size_t newly_obsoleted) noexcept;
+
+  // Auto-Purge-State: pending = seit letztem Purge akkumulierte
+  // obsoletierte Versionen (UPDATE/DELETE/DROP-affected); threshold = 0 aus.
+  std::size_t auto_purge_pending_ = 0;
+  std::size_t auto_purge_threshold_ = 1000;
+  std::size_t last_purge_freed_ = 0;
 
   kv::KVStore& kv_;
   txn::MvccStore& mvcc_;
