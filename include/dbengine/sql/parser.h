@@ -205,7 +205,7 @@ struct AlterTableRlsStmt {
 // binaer links-assoziativ mit Precedence (*,/ vor +,-), Klammern erlaubt.
 // Auswertung in DOUBLE, NULL propagiert (Zeile wird geskippt).
 struct AggExpr {
-  enum class Kind { Column, Literal, Binary };
+  enum class Kind { Column, Literal, Binary, Case };
   Kind kind = Kind::Column;
   std::string column;                    // Kind::Column (lower-gefoldet,
                                          // ggf. "t.c" bei JOIN)
@@ -214,6 +214,14 @@ struct AggExpr {
   std::shared_ptr<AggExpr> left;
   std::shared_ptr<AggExpr> right;
   std::string display;  // kanonisch ohne Spaces, z.B. "price*(1-disc)"
+  // Kind::Case: WHEN-DNF (OR von AND-Konjunktionen aus Condition, wie
+  // WHERE) mit THEN-Zweig; else_ nullopt = ohne ELSE (NULL).
+  struct CaseWhen {
+    std::vector<std::vector<Condition>> dnf;
+    std::shared_ptr<AggExpr> then;
+  };
+  std::vector<CaseWhen> whens;
+  std::shared_ptr<AggExpr> else_;
 };
 
 struct Aggregate {

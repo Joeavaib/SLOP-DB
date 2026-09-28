@@ -75,7 +75,40 @@ int main() {
   auto r6 = db.execute("SeLeCT * FrOm T WhErE A = 2");
   CHECK(r6.rows.size() == 1);
 
-  // ---- s126: kein stilles Falsches ----
+  // ---- s127: CASE-WHEN in Aggregat-Argumenten (q12/q14-Kerne) ----
+  auto rc = db.execute("CREATE TABLE c (p TEXT, x DOUBLE)");
+  CHECK(rc.message == "CREATE TABLE");
+  auto rci = db.execute(
+      "INSERT INTO c VALUES ('1-URGENT', 10), ('2-HIGH', 20), ('3-LOW', 30)");
+  CHECK(rci.affected == 3);
+  // OR im WHEN, THEN 1 ELSE 0 (q12-Kern).
+  auto rq12 = db.execute(
+      "SELECT SUM(CASE WHEN p = '1-URGENT' OR p = '2-HIGH' THEN 1 ELSE 0 END) "
+      "AS hi FROM c");
+  CHECK(rq12.rows.size() == 1);
+  CHECK(valueToString(rq12.rows[0][0]) == "2");
+  auto rq12b = db.execute(
+      "SELECT SUM(CASE WHEN p <> '1-URGENT' AND p <> '2-HIGH' THEN 1 ELSE 0 END) "
+      "AS lo FROM c");
+  CHECK(valueToString(rq12b.rows[0][0]) == "1");
+  // LIKE im WHEN + Spalten-THEN (q14-Kern).
+  auto rq14 = db.execute(
+      "SELECT SUM(CASE WHEN p LIKE '1-%' THEN x ELSE 0 END) AS s FROM c");
+  CHECK(valueToString(rq14.rows[0][0]) == "10");
+  // Ohne ELSE -> NULL (SUM skippt NULL).
+  auto rqN = db.execute("SELECT SUM(CASE WHEN p = 'zzz' THEN x END) AS s FROM c");
+  CHECK(valueToString(rqN.rows[0][0]) == "NULL");
+  // Fehler: CASE ohne WHEN / ohne END werfen laut.
+  for (const char* bad :
+       {"SELECT SUM(CASE x END) FROM c", "SELECT SUM(CASE WHEN p = 'a' THEN 1 FROM c"}) {
+    bool t = false;
+    try {
+      db.execute(bad);
+    } catch (...) {
+      t = true;
+    }
+    CHECK(t);
+  }
   // Komma-Join muss LAUT scheitern (frueher: nur erste Tabelle gelesen,
   // Rest inkl. WHERE still verworfen).
   bool threw = false;

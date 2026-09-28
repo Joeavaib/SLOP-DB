@@ -1249,7 +1249,48 @@ class Parser {
     return parseAggPrimary();
   }
 
+  // s127: CASE WHEN <cond> [AND ...] [OR ...] THEN <expr>
+  //   [WHEN ...] [ELSE <expr>] END (THEN/ELSE = volle AggExpr, rekursiv).
+  // WHEN ohne THEN / fehlendes END werfen laut; Subqueries in WHEN evaluieren
+  // zur Laufzeit laut (kein Kontext), nie still.
+  std::shared_ptr<AggExpr> parseAggCase() {
+    (void)next();  // CASE
+    auto n = std::make_shared<AggExpr>();
+    n->kind = AggExpr::Kind::Case;
+    std::string disp = "case";
+    if (!peekKeyword("WHEN")) throw SqlError("CASE braucht WHEN");
+    while (peekKeyword("WHEN")) {
+      ++pos_;
+      AggExpr::CaseWhen w;
+      // DNF: AND-Konjunktionen, OR-getrennt (wie WHERE).
+      while (true) {
+        std::vector<Condition> conj;
+        conj.push_back(parseCondition());
+        while (matchKeyword("AND")) conj.push_back(parseCondition());
+        w.dnf.push_back(std::move(conj));
+        if (matchKeyword("OR")) continue;
+        break;
+      }
+      expectKeyword("THEN");
+      w.then = parseAggAddSub();
+      disp += "when" + w.then->display;
+      n->whens.push_back(std::move(w));
+    }
+    if (peekKeyword("ELSE")) {
+      ++pos_;
+      n->else_ = parseAggAddSub();
+      disp += "else" + n->else_->display;
+    }
+    expectKeyword("END");
+    disp += "end";
+    n->display = disp;
+    return n;
+  }
+
   std::shared_ptr<AggExpr> parseAggPrimary() {
+    // s127: CASE-WHEN in Aggregat-Argumenten (TPC-H q12/q14).
+    if (peek().kind == TokKind::Ident && toUpper(peek().text) == "CASE")
+      return parseAggCase();
     const Token& t = peek();
     if (t.kind == TokKind::Symbol && t.text == "(") {
       ++pos_;
@@ -2092,6 +2133,28 @@ Value evalAggExprNode(const Table& t, const std::vector<Value>& row,
       }
       throw SqlError("Unbekannter Operator in Aggregat");
     }
+    case AggExpr::Kind::Case: {
+      // s127 Slow-Path (Fast-Path: evalResolvedAgg): erstes WHEN gewinnt.
+      for (const auto& w : e.whens) {
+        bool matched = false;
+        for (const auto& conj : w.dnf) {
+          bool ok = true;
+          for (const auto& c : conj) {
+            if (!evalCondition(t, row, c)) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) {
+            matched = true;
+            break;
+          }
+        }
+        if (matched) return evalAggExprNode(t, row, *w.then);
+      }
+      if (e.else_) return evalAggExprNode(t, row, *e.else_);
+      return Value{std::monostate{}};
+    }
   }
   throw SqlError("Ungueltiger Aggregat-Ausdruck");
 }
@@ -2107,6 +2170,14 @@ struct ResolvedAgg {
   char op = 0;  // nur Kind::Binary
   std::unique_ptr<ResolvedAgg> left;
   std::unique_ptr<ResolvedAgg> right;
+  // nur Kind::Case: WHEN-DNF mit aufgeloesten Spaltenindizes pro Condition.
+  struct ResolvedWhen {
+    // parallel zu dnf: pro Condition (Condition, Spaltenindex).
+    std::vector<std::vector<std::pair<Condition, int>>> dnf;
+    std::unique_ptr<ResolvedAgg> then;
+  };
+  std::vector<ResolvedWhen> whens;
+  std::unique_ptr<ResolvedAgg> else_;
 };
 
 std::unique_ptr<ResolvedAgg> resolveAggExpr(const Table& t, const AggExpr& e) {
@@ -2122,19 +2193,37 @@ std::unique_ptr<ResolvedAgg> resolveAggExpr(const Table& t, const AggExpr& e) {
     if (!e.left || !e.right) throw SqlError("Ungueltiger Aggregat-Ausdruck");
     r->left = resolveAggExpr(t, *e.left);
     r->right = resolveAggExpr(t, *e.right);
+  } else if (e.kind == AggExpr::Kind::Case) {
+    for (const auto& w : e.whens) {
+      ResolvedAgg::ResolvedWhen rw;
+      for (const auto& conj : w.dnf) {
+        std::vector<std::pair<Condition, int>> rc;
+        for (const auto& c : conj) {
+          int idx = t.colIndex(c.column);
+          if (idx < 0) throw SqlError("Unbekannte Spalte in WHERE: " + c.column);
+          rc.emplace_back(c, idx);
+        }
+        rw.dnf.push_back(std::move(rc));
+      }
+      if (!w.then) throw SqlError("Ungueltiger Aggregat-Ausdruck");
+      rw.then = resolveAggExpr(t, *w.then);
+      r->whens.push_back(std::move(rw));
+    }
+    if (e.else_) r->else_ = resolveAggExpr(t, *e.else_);
   }
   return r;
 }
 
-Value evalResolvedAgg(const std::vector<Value>& row, const ResolvedAgg& r) {
+Value evalResolvedAgg(const Table& t, const std::vector<Value>& row,
+                        const ResolvedAgg& r) {
   switch (r.kind) {
     case AggExpr::Kind::Column:
       return row[static_cast<std::size_t>(r.idx)];
     case AggExpr::Kind::Literal:
       return r.literal;
     case AggExpr::Kind::Binary: {
-      Value lv = evalResolvedAgg(row, *r.left);
-      Value rv = evalResolvedAgg(row, *r.right);
+      Value lv = evalResolvedAgg(t, row, *r.left);
+      Value rv = evalResolvedAgg(t, row, *r.right);
       if (valueIsNull(lv) || valueIsNull(rv))
         return Value{std::monostate{}};
       if (std::holds_alternative<std::string>(lv) ||
@@ -2158,6 +2247,29 @@ Value evalResolvedAgg(const std::vector<Value>& row, const ResolvedAgg& r) {
           break;
       }
       throw SqlError("Unbekannter Operator in Aggregat");
+    }
+    case AggExpr::Kind::Case: {
+      // s127: erstes passendes WHEN gewinnt (Index-Variante); ohne Treffer
+      // ELSE bzw. NULL.
+      for (const auto& w : r.whens) {
+        bool matched = false;
+        for (const auto& conj : w.dnf) {
+          bool ok = true;
+          for (const auto& [c, idx] : conj) {
+            if (!evalConditionIdx(t, row, c, idx)) {
+              ok = false;
+              break;
+            }
+          }
+          if (ok) {
+            matched = true;
+            break;
+          }
+        }
+        if (matched) return evalResolvedAgg(t, row, *w.then);
+      }
+      if (r.else_) return evalResolvedAgg(t, row, *r.else_);
+      return Value{std::monostate{}};
     }
   }
   throw SqlError("Ungueltiger Aggregat-Ausdruck");
@@ -2184,7 +2296,7 @@ Value computeAggregate(const Table& t,
   std::unique_ptr<ResolvedAgg> rarg;
   if (!rows.empty()) rarg = resolveAggExpr(t, *a.arg);
   auto argVal = [&](const std::vector<Value>* rp) -> Value {
-    if (rarg) return evalResolvedAgg(*rp, *rarg);
+    if (rarg) return evalResolvedAgg(t, *rp, *rarg);
     return evalAggExprNode(t, *rp, *a.arg);
   };
   if (a.func == "COUNT") {

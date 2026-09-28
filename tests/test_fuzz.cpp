@@ -706,6 +706,45 @@ bool FuzzSql(unsigned seed) {
       }
       exists = false;
       tab.clear();
+    } else if (r < 94) {
+      // s127: CASE-SUM gegen Modell (THEN val ELSE 0 ueber id-Schwelle).
+      const int64_t cut = val_d(rng) % 200;
+      Result got;
+      if (!exec_ok("SELECT SUM(CASE WHEN id >= " + std::to_string(cut) +
+                       " THEN val ELSE 0 END) FROM t",
+                   &got)) {
+        std::cout << "FAIL fuzz-sql/case step=" << step << "\n";
+        return false;
+      }
+      int64_t want = 0;
+      for (auto& [id, v] : tab)
+        if (id >= cut) want += v;
+      if (got.rows.size() != 1 || got.rows[0].size() != 1) {
+        std::cout << "FAIL fuzz-sql/case-shape step=" << step << "\n";
+        return false;
+      }
+      const Value& cv = got.rows[0][0];
+      if (tab.empty()) {
+        if (!dbengine::sql::valueIsNull(cv)) {
+          std::cout << "FAIL fuzz-sql/case-empty step=" << step << "\n";
+          return false;
+        }
+      } else {
+        int64_t gsum = 0;
+        if (auto* iv = std::get_if<int64_t>(&cv)) {
+          gsum = *iv;
+        } else if (auto* dv = std::get_if<double>(&cv)) {
+          gsum = static_cast<int64_t>(std::llround(*dv));
+        } else {
+          std::cout << "FAIL fuzz-sql/case-type step=" << step << "\n";
+          return false;
+        }
+        if (gsum != want) {
+          std::cout << "FAIL fuzz-sql/case-sum step=" << step << " got=" << gsum
+                    << " want=" << want << "\n";
+          return false;
+        }
+      }
     } else if (r < 96) {
       if (!exec_ok("VACUUM")) {
         std::cout << "FAIL fuzz-sql/vacuum step=" << step << "\n";

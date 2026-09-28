@@ -451,6 +451,17 @@ void needAggArg(NeededMap& need, const ScopeSchemas& scope,
   if (e->kind == AggExpr::Kind::Binary) {
     needAggArg(need, scope, e->left);
     needAggArg(need, scope, e->right);
+    return;
+  }
+  if (e->kind == AggExpr::Kind::Case) {
+    // s127: WHEN-Bedingungsspalten + THEN/ELSE-Zweige werden benoetigt —
+    // sonst wuerden sie NULL-dekodiert und WHEN nie wahr (stille 0).
+    for (const auto& w : e->whens) {
+      for (const auto& conj : w.dnf)
+        for (const auto& c : conj) needAddRef(need, scope, c.column);
+      needAggArg(need, scope, w.then);
+    }
+    needAggArg(need, scope, e->else_);
   }
 }
 

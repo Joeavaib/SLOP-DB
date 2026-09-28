@@ -1051,3 +1051,13 @@ steps:
     verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
     engine: implement
     want: "Kein stilles Falsches mehr: Komma-Join nach FROM wirft laut, SELECT verlangt Dateiende (Trailing-Garbage wirft), Tests in test_sql gruen"
+  - id: s127-caseagg
+    title: s127-caseagg
+    paths:
+      - src/sql/parser.cpp
+      - include/dbengine/sql/parser.h
+      - tests/test_sql.cpp
+      - src/sql/executor.cpp
+    verify: "cmake --build build -j4 && ctest --test-dir build -R \"sql|executor|pgserver\" --output-on-failure"
+    engine: implement
+    want: "CASE-WHEN in Aggregat-Argumenten: WHEN-DNF via Condition-Eval, THEN/ELSE rekursiv, Index-Aufloesung + Pushdown-Verdrahtung, Tests in test_sql gruen"

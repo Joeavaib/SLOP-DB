@@ -127,7 +127,8 @@
     "s123-tpchmatrix",
     "s124-datelit",
     "s126-silentdrop",
-    "s125-tpchvalid"
+    "s125-tpchvalid",
+    "s127-caseagg"
   ],
   "verified": [
     "s07-index",
@@ -257,16 +258,17 @@
     "s123-tpchmatrix",
     "s124-datelit",
     "s126-silentdrop",
-    "s125-tpchvalid"
+    "s125-tpchvalid",
+    "s127-caseagg"
   ],
   "failed": [],
   "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
   "last_checkpoint": {
-    "id": "cp-s125-tpchvalid-1790631712",
-    "step_id": "s125-tpchvalid",
-    "commit": "9ebdee1e366ce69c7cf959d50e805cb29b7ccbcc",
+    "id": "cp-s127-caseagg-1790632622",
+    "step_id": "s127-caseagg",
+    "commit": "6c1275862aa5d67910b51ca803eff4b14a4f8c01",
     "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
-    "created_at": "2026-09-28T21:41:52.438904+00:00"
+    "created_at": "2026-09-28T21:57:02.476854+00:00"
   },
   "checkpoints": [
     {
@@ -1129,6 +1131,13 @@
       "commit": "9ebdee1e366ce69c7cf959d50e805cb29b7ccbcc",
       "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
       "created_at": "2026-09-28T21:41:52.438904+00:00"
+    },
+    {
+      "id": "cp-s127-caseagg-1790632622",
+      "step_id": "s127-caseagg",
+      "commit": "6c1275862aa5d67910b51ca803eff4b14a4f8c01",
+      "worktree": "/home/joe/Dokumente/test/dbengine/.rfg/worktree",
+      "created_at": "2026-09-28T21:57:02.476854+00:00"
     }
   ],
   "claim_step": "",
@@ -1166,7 +1175,8 @@
     "s123-tpchmatrix",
     "s124-datelit",
     "s125-tpchvalid",
-    "s126-silentdrop"
+    "s126-silentdrop",
+    "s127-caseagg"
   ],
   "claims": {}
 }
